@@ -11,7 +11,7 @@ set -e
 # ==============================================================================
 # VERSION & PATHS
 # ==============================================================================
-VERSION="3.0.0"
+VERSION="3.1.0"
 SCRIPT_NAME="t-pgsql"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -191,6 +191,206 @@ log_to_file() {
     if [ -n "$LOG_FILE" ]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2" >> "$LOG_FILE"
     fi
+}
+
+# ==============================================================================
+# NOTIFICATIONS
+# ==============================================================================
+send_notification() {
+    local status="$1"      # success, failed, error
+    local message="$2"     # Main message
+    local details="$3"     # Additional details (optional)
+
+    [ ${#NOTIFY[@]} -eq 0 ] && return 0
+    [ "$QUIET" = true ] && return 0
+
+    # Only notify on error if --notify-on-error is set
+    if [ "$NOTIFY_ON_ERROR" = true ] && [ "$status" = "success" ]; then
+        return 0
+    fi
+
+    local emoji="✅"
+    [ "$status" = "failed" ] || [ "$status" = "error" ] && emoji="❌"
+    [ "$status" = "warning" ] && emoji="⚠️"
+
+    local hostname=$(hostname)
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    for channel in "${NOTIFY[@]}"; do
+        case "$channel" in
+            telegram:*) notify_telegram "$channel" "$emoji" "$message" "$details" "$timestamp" "$hostname" ;;
+            webhook:*)  notify_webhook "$channel" "$status" "$message" "$details" "$timestamp" ;;
+            slack:*)    notify_slack "$channel" "$emoji" "$message" "$details" "$timestamp" "$hostname" ;;
+            email:*)    notify_email "$channel" "$status" "$message" "$details" ;;
+            *)          log_warn "Unknown notification channel: $channel" ;;
+        esac
+    done
+}
+
+notify_telegram() {
+    local channel="$1"
+    local emoji="$2"
+    local message="$3"
+    local details="$4"
+    local timestamp="$5"
+    local hostname="$6"
+
+    # Parse telegram:BOT_ID:BOT_SECRET:CHAT_ID
+    # Token format: BOT_ID:BOT_SECRET (contains colon)
+    local token=$(echo "$channel" | cut -d: -f2-3)
+    local chat_id=$(echo "$channel" | cut -d: -f4-)
+
+    if [ -z "$token" ] || [ -z "$chat_id" ]; then
+        log_warn "Invalid Telegram config. Use: telegram:TOKEN:CHAT_ID"
+        return 1
+    fi
+
+    local text="${emoji} ${message}
+
+${details}
+🕐 ${timestamp}"
+
+    local response=$(curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+        -d "chat_id=${chat_id}" \
+        -d "text=${text}" \
+        -d "parse_mode=Markdown" \
+        -d "disable_web_page_preview=true" 2>&1)
+
+    if echo "$response" | grep -q '"ok":true'; then
+        log_debug "Telegram notification sent"
+    else
+        log_warn "Telegram notification failed: $response"
+    fi
+}
+
+notify_webhook() {
+    local channel="$1"
+    local status="$2"
+    local message="$3"
+    local details="$4"
+    local timestamp="$5"
+
+    local url="${channel#webhook:}"
+
+    local payload=$(cat <<EOF
+{
+    "status": "$status",
+    "message": "$message",
+    "details": "$details",
+    "timestamp": "$timestamp",
+    "tool": "t-pgsql",
+    "version": "$VERSION"
+}
+EOF
+)
+
+    local response=$(curl -s -X POST "$url" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>&1)
+
+    log_debug "Webhook response: $response"
+}
+
+notify_slack() {
+    local channel="$1"
+    local emoji="$2"
+    local message="$3"
+    local details="$4"
+    local timestamp="$5"
+    local hostname="$6"
+
+    local webhook_url="${channel#slack:}"
+
+    local color="good"
+    [[ "$emoji" == "❌" ]] && color="danger"
+    [[ "$emoji" == "⚠️" ]] && color="warning"
+
+    local payload=$(cat <<EOF
+{
+    "attachments": [{
+        "color": "$color",
+        "title": "$emoji t-pgsql: $message",
+        "text": "$details",
+        "footer": "Host: $hostname | $timestamp"
+    }]
+}
+EOF
+)
+
+    curl -s -X POST "$webhook_url" \
+        -H "Content-Type: application/json" \
+        -d "$payload" >/dev/null 2>&1
+
+    log_debug "Slack notification sent"
+}
+
+notify_email() {
+    local channel="$1"
+    local status="$2"
+    local message="$3"
+    local details="$4"
+
+    local email="${channel#email:}"
+
+    if command -v mail &>/dev/null; then
+        echo -e "Status: $status\n\n$message\n\nDetails:\n$details" | \
+            mail -s "[t-pgsql] $status: $message" "$email"
+        log_debug "Email notification sent to $email"
+    else
+        log_warn "mail command not found, skipping email notification"
+    fi
+}
+
+# Build notification details for operations
+build_notify_details() {
+    local operation="$1"
+    local status="$2"
+    local elapsed="$3"
+    local size="${4:-}"
+
+    local details=""
+
+    # Source info
+    if [ -n "$FROM_DATABASE" ]; then
+        local src_host="${FROM_SSH_HOST:-${FROM_DB_HOST}}"
+        details+="📤 \`${src_host}\`/\`${FROM_DATABASE}\`\n"
+    fi
+
+    # Target info
+    if [ -n "$TO_DATABASE" ]; then
+        local tgt_host="${TO_SSH_HOST:-${TO_DB_HOST}}"
+        details+="📥 \`${tgt_host}\`/\`${TO_DATABASE}\`\n"
+    fi
+
+    # Size and duration on same line if both exist
+    local metrics=""
+    [ -n "$size" ] && metrics+="📦 ${size}"
+    [ -n "$elapsed" ] && [ -n "$metrics" ] && metrics+="  •  "
+    [ -n "$elapsed" ] && metrics+="⏱ ${elapsed}"
+    [ -n "$metrics" ] && details+="${metrics}\n"
+
+    # Exclusions
+    local exclusions=""
+    [ -n "$EXCLUDE_TABLES" ] && exclusions+="tables: ${EXCLUDE_TABLES}, "
+    [ -n "$EXCLUDE_DATA" ] && exclusions+="data: ${EXCLUDE_DATA}, "
+    [ -n "$EXCLUDE_SCHEMAS" ] && exclusions+="schemas: ${EXCLUDE_SCHEMAS}, "
+    if [ -n "$exclusions" ]; then
+        exclusions="${exclusions%, }"  # Remove trailing comma
+        details+="🚫 ${exclusions}\n"
+    fi
+
+    # Retention info
+    local retention=""
+    [ "$FROM_KEEP" -eq 0 ] && retention+="source: none, "
+    [ "$FROM_KEEP" -gt 0 ] && retention+="source: ${FROM_KEEP}, "
+    [ "$KEEP" -eq 0 ] && retention+="local: none"
+    [ "$KEEP" -gt 0 ] && retention+="local: ${KEEP}"
+    if [ -n "$retention" ] && [ "$retention" != "source: 1, local: -1" ]; then
+        retention="${retention%, }"  # Remove trailing comma
+        details+="💾 keep: ${retention}\n"
+    fi
+
+    echo -e "$details"
 }
 
 # ==============================================================================
@@ -877,6 +1077,7 @@ cmd_dump() {
 
     if [ $result -eq 0 ]; then
         local size=$(ls -lh "$dump_file" | awk '{print $5}')
+        local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
         log_success "Dump complete: $dump_file ($size)"
 
         # External compression
@@ -890,11 +1091,21 @@ cmd_dump() {
         # Cleanup
         cleanup_old_dumps
 
+        # Send notification
+        local details=$(build_notify_details "DUMP" "Success" "$elapsed" "$size")
+        send_notification "success" "Dump completed: ${FROM_DATABASE}" "$details"
+
         echo "DUMP_FILE=$dump_file"
         echo "DUMP_SIZE=$size"
     else
         log_error "Dump failed: $result"
         meta_write "$dump_file" "failed" $result
+
+        # Send notification
+        local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+        local details=$(build_notify_details "DUMP" "Failed" "$elapsed")
+        send_notification "failed" "Dump failed: ${FROM_DATABASE}" "$details"
+
         return 1
     fi
 }
@@ -953,13 +1164,27 @@ cmd_restore() {
     esac
 
     local idx=0
+    local restore_failed=0
     for conn in "${TO_CONNECTIONS[@]}"; do
-        restore_to "$conn" "$restore_file" "$idx"
+        restore_to "$conn" "$restore_file" "$idx" || restore_failed=1
         ((idx++))
     done
 
     # Cleanup temp dir if created
     [ "$cleanup_temp" = true ] && rm -rf "$temp_dir"
+
+    # Send notification (only for standalone restore, not when called from clone)
+    if [ "$COMMAND" = "restore" ]; then
+        if [ $restore_failed -eq 0 ]; then
+            local details=$(build_notify_details "RESTORE" "Success" "")
+            send_notification "success" "Restore completed: ${TO_DATABASE}" "$details"
+        else
+            local details=$(build_notify_details "RESTORE" "Failed" "")
+            send_notification "failed" "Restore failed: ${TO_DATABASE}" "$details"
+        fi
+    fi
+
+    return $restore_failed
 }
 
 restore_to() {
@@ -1191,7 +1416,17 @@ cmd_clone() {
     # Cleanup
     [ "$KEEP" -eq 0 ] && rm -f "$latest"
 
-    [ $r -eq 0 ] && log_success "Clone complete" || return 1
+    # Send notification
+    local total_elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+    if [ $r -eq 0 ]; then
+        log_success "Clone complete"
+        local details=$(build_notify_details "CLONE" "Success" "$total_elapsed")
+        send_notification "success" "Clone completed: ${FROM_DATABASE} → ${TO_DATABASE}" "$details"
+    else
+        local details=$(build_notify_details "CLONE" "Failed" "$total_elapsed")
+        send_notification "failed" "Clone failed: ${FROM_DATABASE} → ${TO_DATABASE}" "$details"
+        return 1
+    fi
 }
 
 # ==============================================================================
