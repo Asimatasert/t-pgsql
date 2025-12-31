@@ -1,0 +1,13 @@
+t-pgsql (1.0.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * Features:
+    - Dump: Backup from local or remote database
+    - Restore: Restore backup to local or remote database
+    - Clone: Single command dump + restore
+    - Fetch: Download existing dump from remote
+    - Batch: Run multiple jobs sequentially
+    - SSH tunnel support
+    - Password file support
+
+ -- Asim Atasert <asimatasert@outlook.com>  Tue, 31 Dec 2024 12:00:00 +0300

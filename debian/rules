@@ -1,0 +1,7 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	install -D -m 0755 t-pgsql $(DESTDIR)/usr/bin/t-pgsql

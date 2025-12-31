@@ -1,0 +1,23 @@
+Source: t-pgsql
+Section: database
+Priority: optional
+Maintainer: Asim Atasert <asimatasert@outlook.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.0
+Homepage: https://github.com/Asimatasert/t-pgsql
+Vcs-Browser: https://github.com/Asimatasert/t-pgsql
+Vcs-Git: https://github.com/Asimatasert/t-pgsql.git
+Rules-Requires-Root: no
+
+Package: t-pgsql
+Architecture: all
+Depends: ${misc:Depends}, postgresql-client, openssh-client, bash (>= 4.0)
+Description: PostgreSQL database sync and clone tool
+ Advanced CLI tool for backing up, restoring, and synchronizing
+ PostgreSQL databases. Features include:
+  - Dump: Backup from local or remote database
+  - Restore: Restore backup to local or remote database
+  - Clone: Single command dump + restore (full sync)
+  - Fetch: Download existing dump from remote server
+  - Batch: Run multiple jobs sequentially
+  - SSH Support: Access remote servers via SSH tunnel

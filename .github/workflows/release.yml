@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Build Debian package
+        run: |
+          mkdir -p build/deb/DEBIAN
+          mkdir -p build/deb/usr/bin
+          cp t-pgsql build/deb/usr/bin/
+          chmod 755 build/deb/usr/bin/t-pgsql
+          cat > build/deb/DEBIAN/control << EOF
+          Package: t-pgsql
+          Version: ${{ steps.version.outputs.VERSION }}
+          Section: database
+          Priority: optional
+          Architecture: all
+          Depends: postgresql-client, openssh-client, bash (>= 4.0)
+          Maintainer: Asim Atasert <asimatasert@outlook.com>
+          Description: PostgreSQL database sync and clone tool
+           Advanced CLI tool for backing up, restoring, and synchronizing
+           PostgreSQL databases with SSH tunnel support.
+          EOF
+          dpkg-deb --build build/deb t-pgsql_${{ steps.version.outputs.VERSION }}_all.deb
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist
+          cp t-pgsql dist/
+          cd dist
+          tar -czf t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz t-pgsql
+          sha256sum t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz > t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz.sha256
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            t-pgsql
+            t-pgsql_${{ steps.version.outputs.VERSION }}_all.deb
+            dist/t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz
+            dist/t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version and SHA
+        id: info
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          SHA=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/v${VERSION}.tar.gz" | sha256sum | cut -d' ' -f1)
+          echo "SHA256=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Update Formula
+        run: |
+          sed -i "s|REPLACE_WITH_ACTUAL_SHA256|${{ steps.info.outputs.SHA256 }}|g" Formula/t-pgsql.rb
+          sed -i "s|v1.0.0|v${{ steps.info.outputs.VERSION }}|g" Formula/t-pgsql.rb
+
+      - name: Commit Formula update
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add Formula/t-pgsql.rb
+          git commit -m "Update Homebrew formula to v${{ steps.info.outputs.VERSION }}" || true
+          git push || true
