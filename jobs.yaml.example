@@ -1,0 +1,238 @@
+# ==============================================================================
+# t-pgsql - Example Jobs Configuration
+# ==============================================================================
+#
+# This file contains example job definitions.
+# To use: cp jobs.yaml.example jobs.yaml
+#
+# Commands:
+#   ./t-pgsql jobs              - List all jobs
+#   ./t-pgsql --batch <name>    - Run single job
+#   ./t-pgsql --batch all       - Run all jobs
+#
+# ==============================================================================
+
+jobs:
+  # ============================================================================
+  # PRODUCTION -> LOCAL SYNC
+  # ============================================================================
+
+  # Sync from production to local dev environment
+  prod_to_dev:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --to 'postgres@localhost/development' --from-password-file '.secrets/prod.pass' --to-password-file '.secrets/local.pass' --exclude-table 'logs,sessions,audit_trail' --force
+
+  # Sync from production to staging
+  prod_to_staging:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --to 'ssh://deploy@staging.example.com/postgres@localhost/staging' --from-password-file '.secrets/prod.pass' --to-password-file '.secrets/staging.pass' --force
+
+  # ============================================================================
+  # MULTI-TARGET SYNC (Multiple targets at once)
+  # ============================================================================
+
+  # Sync from production to all dev environments (single password)
+  prod_to_all_devs:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --to 'postgres@localhost/dev1' --to 'postgres@localhost/dev2' --to 'postgres@localhost/dev3' --from-password-file '.secrets/prod.pass' --to-password-file '.secrets/local.pass' --exclude-table 'logs,sessions' --force
+
+  # Sync from production to different servers (different passwords)
+  prod_to_multi_servers:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --to 'ssh://user@server1/postgres@localhost/app' --to-password-file '.secrets/server1.pass' --to 'ssh://user@server2/postgres@localhost/app' --to-password-file '.secrets/server2.pass' --to 'postgres@localhost/local_copy' --to-password-file '.secrets/local.pass' --from-password-file '.secrets/prod.pass' --force
+
+  # ============================================================================
+  # DAILY BACKUPS
+  # ============================================================================
+
+  # Production daily backup
+  daily_prod_backup:
+    command: dump
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --from-password-file '.secrets/prod.pass' --output '/backups/daily' --keep 7 --from-keep 1
+
+  # Staging daily backup
+  daily_staging_backup:
+    command: dump
+    args: --from 'ssh://deploy@staging.example.com/postgres@localhost/staging' --from-password-file '.secrets/staging.pass' --output '/backups/staging' --keep 14
+
+  # Local development backup
+  daily_local_backup:
+    command: dump
+    args: --from 'postgres@localhost/development' --password-file '.secrets/local.pass' --output './backups/local' --keep 3
+
+  # ============================================================================
+  # WEEKLY BACKUPS
+  # ============================================================================
+
+  # Weekly full backup (all tables)
+  weekly_full_backup:
+    command: dump
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --from-password-file '.secrets/prod.pass' --output '/backups/weekly' --keep 4 --from-keep 1
+
+  # ============================================================================
+  # SPECIFIC DATABASE SYNC
+  # ============================================================================
+
+  # RFTT template sync
+  rftt_sync:
+    command: clone
+    args: --from 'ssh://awsm3@100.64.1.30/postgres@localhost/rftt-template' --to 'asimatasert@localhost/test123' --from-password-file '.secrets/from.pass' --to-password-file '.secrets/to.pass' --force
+
+  # Workarea database sync
+  workarea_sync:
+    command: clone
+    args: --from 'ssh://awsm3@100.64.1.30/postgres@localhost/workarea' --to 'postgres@localhost/workarea_local' --from-password-file '.secrets/from.pass' --to-password-file '.secrets/to.pass' --force
+
+  # ============================================================================
+  # FILTERED SYNC (Specific tables)
+  # ============================================================================
+
+  # Only users and orders tables
+  sync_users_orders:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/ecommerce' --to 'postgres@localhost/ecommerce_dev' --from-password-file '.secrets/prod.pass' --to-password-file '.secrets/local.pass' --only-table 'users,orders,order_items,products' --force
+
+  # Exclude log tables
+  sync_without_logs:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/app' --to 'postgres@localhost/app_dev' --from-password-file '.secrets/prod.pass' --to-password-file '.secrets/local.pass' --exclude-table 'logs,audit_logs,access_logs,error_logs' --force
+
+  # Large tables structure only (no data)
+  sync_structure_only:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/analytics' --to 'postgres@localhost/analytics_dev' --from-password-file '.secrets/prod.pass' --to-password-file '.secrets/local.pass' --exclude-data 'events,page_views,click_stream,raw_data' --force
+
+  # ============================================================================
+  # SCHEMA BASED SYNC
+  # ============================================================================
+
+  # Only public schema
+  sync_public_schema:
+    command: clone
+    args: --from 'postgres@localhost/multidb' --to 'postgres@localhost/multidb_copy' --password-file '.secrets/local.pass' --only-schema 'public' --force
+
+  # Exclude audit schema
+  sync_without_audit:
+    command: clone
+    args: --from 'postgres@localhost/enterprise' --to 'postgres@localhost/enterprise_dev' --password-file '.secrets/local.pass' --exclude-schema 'audit,logs,temp' --force
+
+  # ============================================================================
+  # FETCH OPERATIONS (Download existing dump)
+  # ============================================================================
+
+  # Fetch latest dump
+  fetch_latest_prod:
+    command: fetch
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --from-file --output './dumps'
+
+  # Fetch with specific pattern
+  fetch_specific:
+    command: fetch
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --from-file 'production_202501*.tar.gz' --output './dumps'
+
+  # ============================================================================
+  # RESTORE OPERATIONS
+  # ============================================================================
+
+  # Restore latest backup
+  restore_latest:
+    command: restore
+    args: --to 'postgres@localhost/restored_db' --to-password-file '.secrets/local.pass' --output './dumps' --force
+
+  # Restore specific file
+  restore_specific:
+    command: restore
+    args: --file './dumps/production_20250101_120000.tar.gz' --to 'postgres@localhost/prod_copy' --to-password-file '.secrets/local.pass' --force
+
+  # Restore to multiple targets
+  restore_to_multiple:
+    command: restore
+    args: --file './dumps/template.tar.gz' --to 'postgres@localhost/client1_db' --to 'postgres@localhost/client2_db' --to 'postgres@localhost/client3_db' --to-password-file '.secrets/local.pass' --force
+
+  # ============================================================================
+  # LOCAL OPERATIONS
+  # ============================================================================
+
+  # Copy local database
+  copy_local_db:
+    command: clone
+    args: --from 'postgres@localhost/original' --to 'postgres@localhost/copy' --password-file '.secrets/local.pass' --force
+
+  # Create multiple test databases from template
+  create_test_dbs:
+    command: clone
+    args: --from 'postgres@localhost/template_db' --to 'postgres@localhost/test_db_1' --to 'postgres@localhost/test_db_2' --to 'postgres@localhost/test_db_3' --password-file '.secrets/local.pass' --force
+
+  # ============================================================================
+  # PUSH TO REMOTE (Local -> Remote)
+  # ============================================================================
+
+  # Push local to staging
+  push_to_staging:
+    command: clone
+    args: --from 'postgres@localhost/development' --to 'ssh://deploy@staging.example.com/postgres@localhost/staging' --from-password-file '.secrets/local.pass' --to-password-file '.secrets/staging.pass' --force
+
+  # Push to multiple test servers
+  push_to_test_servers:
+    command: clone
+    args: --from 'postgres@localhost/development' --to 'ssh://tester@test1.example.com/postgres@localhost/app' --to-password-file '.secrets/test1.pass' --to 'ssh://tester@test2.example.com/postgres@localhost/app' --to-password-file '.secrets/test2.pass' --from-password-file '.secrets/local.pass' --force
+
+  # ============================================================================
+  # CLEANUP OPERATIONS
+  # ============================================================================
+
+  # Clean old local dumps
+  cleanup_local_dumps:
+    command: clean
+    args: --output './dumps' --keep 5
+
+  # Clean backup directory
+  cleanup_backups:
+    command: clean
+    args: --output '/backups/daily' --keep 7
+
+  # ============================================================================
+  # VERBOSE / DEBUG JOBS
+  # ============================================================================
+
+  # Sync with detailed output
+  verbose_sync:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --to 'postgres@localhost/development' --from-password-file '.secrets/prod.pass' --to-password-file '.secrets/local.pass' --force --verbose
+
+  # Dry-run (show what would be done)
+  dry_run_sync:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/production' --to 'postgres@localhost/development' --from-password-file '.secrets/prod.pass' --to-password-file '.secrets/local.pass' --force --dry-run
+
+# ==============================================================================
+# USAGE EXAMPLES
+# ==============================================================================
+#
+# Run single job:
+#   ./t-pgsql --batch prod_to_dev
+#   ./t-pgsql --batch daily_prod_backup
+#   ./t-pgsql --batch rftt_sync
+#
+# Run all jobs:
+#   ./t-pgsql --batch all
+#
+# Continue on error:
+#   ./t-pgsql --batch all --continue-on-error
+#
+# List jobs:
+#   ./t-pgsql jobs
+#
+# ==============================================================================
+# NOTES
+# ==============================================================================
+#
+# 1. Password files should be stored in .secrets/ directory
+# 2. Set permissions with: chmod 600 .secrets/*.pass
+# 3. Add .secrets/ to .gitignore
+# 4. Using --force will DROP the target database!
+# 5. When using multiple --to:
+#    - Single --to-password-file: Same password for all targets
+#    - Multiple --to-password-file: Sequential matching (1st file -> 1st target)
+#
+# ==============================================================================

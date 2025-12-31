@@ -1,0 +1,11 @@
+# Secrets and passwords
+.secrets/
+
+# Dump files
+dumps/
+
+# Active jobs config (contains credentials)
+jobs.yaml
+
+# OS files
+.DS_Store

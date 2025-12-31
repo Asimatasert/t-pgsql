@@ -1,0 +1,1588 @@
+#!/bin/bash
+#
+# t-pgsql - PostgreSQL Database Sync & Clone Tool
+# https://github.com/Asimatasert/sync_database
+#
+# Usage: t-pgsql <command> [options]
+#
+
+set -e
+
+# ==============================================================================
+# VERSION & PATHS
+# ==============================================================================
+VERSION="3.0.0"
+SCRIPT_NAME="t-pgsql"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ==============================================================================
+# COLORS
+# ==============================================================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ==============================================================================
+# DEFAULT VALUES
+# ==============================================================================
+
+# Command
+COMMAND=""
+
+# Connection
+FROM_CONNECTION=""
+TO_CONNECTIONS=()
+
+# Password
+FROM_PASSWORD=""
+TO_PASSWORD=""
+PASSWORD=""
+FROM_PASSWORD_FILE=""
+TO_PASSWORD_FILES=()
+PASSWORD_FILE=""
+
+# Config
+CONFIG_FILE=""
+
+# Filtering
+EXCLUDE_TABLES=""
+EXCLUDE_SCHEMAS=""
+EXCLUDE_DATA=""
+ONLY_TABLES=""
+ONLY_SCHEMAS=""
+
+# Compression
+COMPRESS="gzip"
+COMPRESS_LEVEL=6
+PG_COMPRESS_LEVEL=6
+
+# Storage
+OUTPUT_DIR="${SCRIPT_DIR}/../data/dumps"
+KEEP=-1
+FROM_KEEP=1  # 0=delete, N=keep last N, -1=keep all (default: 1)
+
+# Retention (GFS)
+RETENTION=false
+RETENTION_DAILY=7
+RETENTION_WEEKLY=4
+RETENTION_MONTHLY=12
+RETENTION_YEARLY=3
+
+# Health Check
+HEALTH_CHECK=true
+HEALTH_CHECK_AFTER=false
+HEALTH_CHECK_FAIL=false
+
+# Notifications
+NOTIFY=()
+NOTIFY_ON_ERROR=false
+
+# Masking
+MASK=false
+MASK_RULES=""
+MASK_TABLES=""
+
+# Streaming
+STREAM=false
+STREAM_BUFFER=64
+
+# Sudo
+SUDO=false
+
+# Batch
+PARALLEL=1
+CONTINUE_ON_ERROR=false
+ONLY_JOBS=""
+EXCLUDE_JOBS=""
+NOTIFY_SUMMARY=false
+SAVE_JOB=""
+BATCH_JOB=""
+JOBS_FILE="${SCRIPT_DIR}/jobs.yaml"
+
+# General
+VERBOSE=false
+QUIET=false
+DRY_RUN=false
+YES=false
+FORCE=false
+LOG_FILE=""
+LOG_LEVEL="info"
+
+# Restore
+FILE=""
+
+# Fetch (existing dump from source)
+FROM_FILE=""
+
+# Metadata & Timing
+META_ENABLED=true
+META_START_TIME=""
+META_START_EPOCH=""
+META_STATUS="unknown"
+META_EXIT_CODE=0
+
+# ==============================================================================
+# PARSED CONNECTION VARIABLES
+# ==============================================================================
+FROM_TYPE=""
+FROM_SSH_USER=""
+FROM_SSH_HOST=""
+FROM_SSH_PORT="22"
+FROM_DB_USER="postgres"
+FROM_DB_HOST="localhost"
+FROM_DB_PORT="5432"
+FROM_DB_PASSWORD=""
+FROM_DATABASE=""
+
+TO_TYPE=""
+TO_SSH_USER=""
+TO_SSH_HOST=""
+TO_SSH_PORT="22"
+TO_DB_USER="postgres"
+TO_DB_HOST="localhost"
+TO_DB_PORT="5432"
+TO_DB_PASSWORD=""
+TO_DATABASE=""
+
+# ==============================================================================
+# SOURCE MODULES
+# ==============================================================================
+source_module() {
+    local module="$1"
+    local module_path="${SCRIPT_DIR}/modules/${module}.sh"
+    if [ -f "$module_path" ]; then
+        source "$module_path"
+    fi
+}
+
+# ==============================================================================
+# LOGGING
+# ==============================================================================
+log_info() {
+    [ "$QUIET" != true ] && echo -e "${GREEN}[INFO]${NC} $1"
+    log_to_file "INFO" "$1"
+}
+
+log_warn() {
+    [ "$QUIET" != true ] && echo -e "${YELLOW}[WARN]${NC} $1"
+    log_to_file "WARN" "$1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+    log_to_file "ERROR" "$1"
+}
+
+log_success() {
+    [ "$QUIET" != true ] && echo -e "${GREEN}[OK]${NC} $1"
+    log_to_file "OK" "$1"
+}
+
+log_debug() {
+    [ "$VERBOSE" = true ] && echo -e "${CYAN}[DEBUG]${NC} $1"
+    log_to_file "DEBUG" "$1"
+}
+
+log_to_file() {
+    if [ -n "$LOG_FILE" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2" >> "$LOG_FILE"
+    fi
+}
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+meta_start() {
+    META_START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    META_START_EPOCH=$(date +%s)
+    META_STATUS="running"
+}
+
+meta_write() {
+    local dump_file="$1"
+    local status="${2:-success}"
+    local exit_code="${3:-0}"
+
+    [ "$META_ENABLED" != true ] && return 0
+    [ -z "$dump_file" ] && return 0
+    [ ! -f "$dump_file" ] && return 0
+
+    local dump_dir=$(dirname "$dump_file")
+    local dump_name=$(basename "$dump_file")
+    local base_name="${dump_name%.dump}"
+    local meta_file="${dump_dir}/metadata.yaml"
+    local tar_file="${dump_dir}/${base_name}.tar.gz"
+
+    local end_time=$(date '+%Y-%m-%d %H:%M:%S')
+    local end_epoch=$(date +%s)
+    local elapsed_sec=$((end_epoch - META_START_EPOCH))
+    local elapsed=$(format_elapsed $elapsed_sec)
+    local dump_size=$(ls -lh "$dump_file" 2>/dev/null | awk '{print $5}')
+
+    # Create metadata.yaml
+    cat > "$meta_file" << EOF
+# t-pgsql metadata
+# Generated: ${end_time}
+
+timing:
+  started_at: "${META_START_TIME}"
+  finished_at: "${end_time}"
+  elapsed: "${elapsed}"
+  elapsed_seconds: ${elapsed_sec}
+
+source:
+  type: ${FROM_TYPE}
+  host: ${FROM_SSH_HOST:-${FROM_DB_HOST}}
+  port: ${FROM_DB_PORT}
+  database: ${FROM_DATABASE}
+  user: ${FROM_DB_USER}
+
+file:
+  name: ${dump_name}
+  size: "${dump_size:-unknown}"
+  compression: ${COMPRESS}
+  compress_level: ${PG_COMPRESS_LEVEL}
+
+operation:
+  command: ${COMMAND}
+  status: ${status}
+  exit_code: ${exit_code}
+
+environment:
+  script_version: "${VERSION}"
+  executed_by: $(whoami)
+  executed_on: $(hostname)
+  working_dir: $(pwd)
+EOF
+
+    # Filter bilgisi varsa ekle
+    if [ -n "$EXCLUDE_TABLES" ] || [ -n "$EXCLUDE_SCHEMAS" ]; then
+        cat >> "$meta_file" << EOF
+
+filter:
+  exclude_tables: "${EXCLUDE_TABLES}"
+  exclude_schemas: "${EXCLUDE_SCHEMAS}"
+  exclude_data: "${EXCLUDE_DATA}"
+  only_tables: "${ONLY_TABLES}"
+  only_schemas: "${ONLY_SCHEMAS}"
+EOF
+    fi
+
+    # Create tar.gz archive
+    log_debug "Creating archive: $tar_file"
+    (cd "$dump_dir" && tar -czf "$(basename "$tar_file")" "$dump_name" "metadata.yaml")
+
+    if [ $? -eq 0 ]; then
+        # Remove original files
+        rm -f "$dump_file" "$meta_file"
+        log_debug "Archive created: $tar_file"
+
+        # Return the tar file path (for use by caller)
+        echo "TAR_FILE=$tar_file"
+    else
+        log_warn "Failed to create archive, keeping separate files"
+    fi
+}
+
+meta_update_target() {
+    local tar_file="$1"
+    local restore_status="${2:-success}"
+    local restore_elapsed="${3:-0}"
+
+    [ "$META_ENABLED" != true ] && return 0
+    [ -z "$tar_file" ] && return 0
+    [ ! -f "$tar_file" ] && return 0
+
+    local temp_dir=$(mktemp -d)
+
+    # Extract everything from tar
+    tar -xzf "$tar_file" -C "$temp_dir" 2>/dev/null || { rm -rf "$temp_dir"; return 0; }
+
+    # Find the dump file
+    local dump_name=$(ls "$temp_dir"/*.dump 2>/dev/null | head -1 | xargs basename)
+    [ -z "$dump_name" ] && { rm -rf "$temp_dir"; return 0; }
+
+    # Append target and restore info to metadata
+    cat >> "$temp_dir/metadata.yaml" << EOF
+
+target:
+  type: ${TO_TYPE}
+  host: ${TO_SSH_HOST:-${TO_DB_HOST}}
+  port: ${TO_DB_PORT}
+  database: ${TO_DATABASE}
+  user: ${TO_DB_USER}
+
+restore:
+  status: ${restore_status}
+  elapsed: "$(format_elapsed $restore_elapsed)"
+  total_elapsed: "$(format_elapsed $(($(date +%s) - META_START_EPOCH)))"
+EOF
+
+    # Recreate tar with updated metadata
+    (cd "$temp_dir" && tar -czf "$tar_file" "$dump_name" metadata.yaml 2>/dev/null)
+
+    rm -rf "$temp_dir"
+    log_debug "Metadata updated with target info"
+}
+
+# Extract dump from tar archive, returns path to extracted dump
+extract_dump() {
+    local file="$1"
+    local extract_dir="${2:-$(mktemp -d)}"
+
+    if [[ "$file" == *.tar.gz ]]; then
+        local dump_name=$(tar -tzf "$file" 2>/dev/null | grep -E '\.dump$' | head -1)
+        if [ -n "$dump_name" ]; then
+            tar -xzf "$file" -C "$extract_dir" "$dump_name" 2>/dev/null
+            echo "${extract_dir}/${dump_name}"
+        fi
+    elif [[ "$file" == *.dump ]]; then
+        echo "$file"
+    fi
+}
+
+# Show metadata from tar archive
+show_meta() {
+    local file="$1"
+
+    if [[ "$file" == *.tar.gz ]]; then
+        tar -xzf "$file" -O metadata.yaml 2>/dev/null
+    elif [[ -f "${file}.meta" ]]; then
+        cat "${file}.meta"
+    fi
+}
+
+format_elapsed() {
+    local sec=$1
+    local min=$((sec / 60))
+    local hrs=$((min / 60))
+    sec=$((sec % 60))
+    min=$((min % 60))
+
+    if [ $hrs -gt 0 ]; then
+        printf "%dh %dm %ds" $hrs $min $sec
+    elif [ $min -gt 0 ]; then
+        printf "%dm %ds" $min $sec
+    else
+        printf "%ds" $sec
+    fi
+}
+
+# ==============================================================================
+# HELP
+# ==============================================================================
+show_help() {
+    cat << 'EOF'
+t-pgsql - PostgreSQL Database Sync & Clone Tool
+
+USAGE:
+    t-pgsql <command> [options]
+
+COMMANDS:
+    dump        Create database backup
+    restore     Restore backup to database
+    clone       Dump + Restore (full sync)
+    fetch       Fetch existing dump from remote (no new dump)
+    batch       Run multiple jobs from config
+    list        List dump files
+    meta        Show metadata from archive
+    clean       Clean old dumps
+    version     Show version
+
+CONNECTION:
+    --from <connection>           Source connection
+    --to <connection>             Target connection (repeatable)
+
+    Format:
+      Local:  [user@]host[:port]/database
+      Remote: ssh://[ssh_user@]host[:port]/[db_user@]host[:port]/database
+
+    Examples:
+      localhost/mydb
+      postgres@localhost:5432/mydb
+      ssh://ubuntu@192.168.1.100/mydb
+      ssh://ubuntu@192.168.1.100:22/postgres@localhost:5432/mydb
+
+PASSWORD:
+    --password <pass>             Password for both connections
+    --from-password <pass>        Source password
+    --to-password <pass>          Target password
+    --password-file <file>        Read password from file
+    --from-password-file <file>   Source password file
+    --to-password-file <file>     Target password file (repeatable for multiple targets)
+    --config <file>               Config file with credentials
+
+    Env vars: T_PGSQL_PASSWORD, T_PGSQL_FROM_PASSWORD, T_PGSQL_TO_PASSWORD
+
+FILTER:
+    --exclude-table <t1,t2>       Exclude tables
+    --exclude-schema <s1,s2>      Exclude schemas
+    --exclude-data <t1,t2>        Exclude data only (keep structure)
+    --only-table <t1,t2>          Include only these tables
+    --only-schema <s1,s2>         Include only these schemas
+
+COMPRESSION:
+    --compress <type>             gzip|zstd|xz|bzip2|none (default: gzip)
+    --compress-level <1-9>        Compression level (default: 6)
+    --pg-compress-level <0-9>     pg_dump compression (default: 6)
+
+STORAGE:
+    --output <dir>                Output directory
+    --keep <N>                    Keep last N local dumps (-1=all, 0=none)
+    --from-keep <N>               Keep N dumps on source (default: 1, -1=all, 0=delete)
+    --from-file [pattern]         Fetch existing dump (for fetch command)
+                                  No value = latest dump for database
+                                  Pattern: filename or glob (e.g., mydb_*.dump)
+
+RETENTION (GFS):
+    --retention                   Enable GFS retention
+    --retention-daily <N>         Daily backups (default: 7)
+    --retention-weekly <N>        Weekly backups (default: 4)
+    --retention-monthly <N>       Monthly backups (default: 12)
+    --retention-yearly <N>        Yearly backups (default: 3)
+
+HEALTH CHECK:
+    --health-check                Check before operation (default)
+    --health-check-after          Check after operation
+    --no-health-check             Disable checks
+    --health-check-fail           Abort on check failure
+
+NOTIFY:
+    --notify <channel>            Notification channel (repeatable)
+                                  telegram|telegram:TOKEN:CHAT
+                                  webhook:URL|email:ADDR|slack:URL
+    --notify-on-error             Only notify on error
+    --quiet                       No notifications
+
+MASKING:
+    --mask                        Enable data masking
+    --mask-rules <file>           Masking rules JSON
+    --mask-tables <t1,t2>         Tables to mask
+
+STREAMING:
+    --stream                      Stream without temp files
+    --stream-buffer <MB>          Buffer size (default: 64)
+
+BATCH:
+    --parallel <N>                Parallel jobs (default: 1)
+    --continue-on-error           Don't stop on error
+    --only <jobs>                 Run only these jobs
+    --exclude <jobs>              Skip these jobs
+    --notify-summary              Summary notification
+
+RESTORE:
+    --file <path>                 Dump file to restore
+
+GENERAL:
+    --log <file>                  Log file
+    --log-level <level>           debug|info|warn|error
+    -v, --verbose                 Verbose output
+    -q, --quiet                   Minimal output
+    -y, --yes                     Skip confirmations
+    --dry-run                     Show actions without executing
+    --no-meta                     Don't write .meta files
+    -h, --help                    Show help
+    --version                     Show version
+
+EXAMPLES:
+    # Remote to local
+    t-pgsql clone \
+      --from ssh://ubuntu@192.168.1.100/prod_db \
+      --to localhost/dev_db \
+      --from-password-file ~/.secrets/prod.pass \
+      --to-password-file ~/.secrets/local.pass
+
+    # Local to remote (push)
+    t-pgsql clone \
+      --from localhost/mydb \
+      --to ssh://ubuntu@192.168.1.100/backup_db \
+      --password-file ~/.secrets/db.pass
+
+    # Dump with retention
+    t-pgsql dump \
+      --from ssh://ubuntu@192.168.1.100/prod \
+      --from-password-file ~/.secrets/prod.pass \
+      --compress zstd \
+      --retention
+
+    # Restore
+    t-pgsql restore \
+      --file ./dumps/prod_20250130.dump \
+      --to localhost/test_db \
+      --to-password-file ~/.secrets/local.pass
+
+    # Batch
+    t-pgsql batch --config jobs.yaml --parallel 2
+
+    # Fetch latest dump for database (auto-find)
+    t-pgsql fetch --from ssh://ubuntu@192.168.1.100/prod --from-file
+
+    # Fetch with specific pattern
+    t-pgsql fetch \
+      --from ssh://ubuntu@192.168.1.100/prod \
+      --from-file "prod_20250130*.dump"
+
+More info: https://github.com/Asimatasert/sync_database
+EOF
+}
+
+show_version() {
+    echo "${SCRIPT_NAME} v${VERSION}"
+}
+
+# ==============================================================================
+# CONNECTION PARSER
+# ==============================================================================
+parse_connection() {
+    local conn="$1"
+    local prefix="$2"
+
+    log_debug "Parsing: $conn -> $prefix"
+
+    if [[ "$conn" == ssh://* ]]; then
+        parse_ssh_connection "$conn" "$prefix"
+    else
+        parse_local_connection "$conn" "$prefix"
+    fi
+}
+
+parse_local_connection() {
+    local conn="$1"
+    local prefix="$2"
+
+    local user="postgres"
+    local host="localhost"
+    local port="5432"
+    local db=""
+
+    # Format: user@host[:port]/[db_user@]database
+    # Examples:
+    #   asimatasert@localhost/test           -> user=asimatasert, db=test
+    #   asimatasert@localhost/postgres@test  -> user=postgres, db=test
+    #   asimatasert@localhost:5432/test      -> with port
+    #   postgres@test                        -> simple format, localhost
+
+    if [[ "$conn" == */* ]]; then
+        # Has slash: user@host/database or user@host:port/database
+        local db_part="${conn##*/}"
+        conn="${conn%/*}"
+
+        # Check if db_part has user@ prefix (db_user@database)
+        if [[ "$db_part" == *@* ]]; then
+            user="${db_part%%@*}"
+            db="${db_part#*@}"
+        else
+            db="$db_part"
+            # user comes from left side of @
+            if [[ "$conn" == *@* ]]; then
+                user="${conn%%@*}"
+            fi
+        fi
+
+        # Parse host part: user@host or user@host:port
+        if [[ "$conn" == *@* ]]; then
+            conn="${conn#*@}"
+        fi
+
+        # host:port or just host
+        if [[ "$conn" == *:* ]]; then
+            host="${conn%%:*}"
+            port="${conn##*:}"
+        else
+            host="$conn"
+        fi
+    elif [[ "$conn" == *@* ]]; then
+        # Simple format: user@database (localhost assumed)
+        user="${conn%%@*}"
+        db="${conn#*@}"
+        host="localhost"
+    else
+        # Just database name
+        db="$conn"
+        host="localhost"
+    fi
+
+    [ -z "$db" ] && { log_error "Missing database: $1"; return 1; }
+
+    eval "${prefix}_TYPE='local'"
+    eval "${prefix}_DB_USER='$user'"
+    eval "${prefix}_DB_HOST='$host'"
+    eval "${prefix}_DB_PORT='$port'"
+    eval "${prefix}_DATABASE='$db'"
+
+    log_debug "$prefix: local $user@$host:$port/$db"
+}
+
+parse_ssh_connection() {
+    local conn="$1"
+    local prefix="$2"
+
+    conn="${conn#ssh://}"
+
+    local ssh_user=""
+    local ssh_host=""
+    local ssh_port="22"
+    local db_user=""
+    local db_host="localhost"
+    local db_port="5432"
+    local db=""
+
+    # Format: ssh_user@ssh_host[:ssh_port]/db_user@db_host[:db_port]/database
+    # Examples:
+    #   awesome@10.10.1.30/postgres@localhost/workarea
+    #   awesome@10.10.1.30:2222/postgres@localhost:5433/workarea
+
+    # Extract database name (last /)
+    if [[ "$conn" == */* ]]; then
+        db="${conn##*/}"
+        conn="${conn%/*}"
+    else
+        log_error "Missing database in SSH connection"
+        return 1
+    fi
+
+    # Check if there's still a / (means db_user@db_host part exists)
+    if [[ "$conn" == */* ]]; then
+        # Has db connection part
+        local db_part="${conn##*/}"
+        conn="${conn%/*}"
+
+        # Parse db_part: user@host[:port]
+        if [[ "$db_part" == *@* ]]; then
+            db_user="${db_part%%@*}"
+            local db_host_port="${db_part#*@}"
+
+            if [[ "$db_host_port" == *:* ]]; then
+                db_host="${db_host_port%%:*}"
+                db_port="${db_host_port##*:}"
+            else
+                db_host="$db_host_port"
+            fi
+        else
+            # Just host or host:port
+            if [[ "$db_part" == *:* ]]; then
+                db_host="${db_part%%:*}"
+                db_port="${db_part##*:}"
+            else
+                db_host="$db_part"
+            fi
+        fi
+    fi
+
+    # SSH part: [user@]host[:port]
+    if [[ "$conn" == *@* ]]; then
+        ssh_user="${conn%%@*}"
+        conn="${conn#*@}"
+    else
+        ssh_user="$(whoami)"
+    fi
+
+    if [[ "$conn" == *:* ]]; then
+        ssh_host="${conn%%:*}"
+        ssh_port="${conn##*:}"
+    else
+        ssh_host="$conn"
+    fi
+
+    # If db_user not specified, use "postgres" as default
+    [ -z "$db_user" ] && db_user="postgres"
+
+    eval "${prefix}_TYPE='ssh'"
+    eval "${prefix}_SSH_USER='$ssh_user'"
+    eval "${prefix}_SSH_HOST='$ssh_host'"
+    eval "${prefix}_SSH_PORT='$ssh_port'"
+    eval "${prefix}_DB_USER='$db_user'"
+    eval "${prefix}_DB_HOST='$db_host'"
+    eval "${prefix}_DB_PORT='$db_port'"
+    eval "${prefix}_DATABASE='$db'"
+
+    log_debug "$prefix: ssh $ssh_user@$ssh_host:$ssh_port -> $db_user@$db_host:$db_port/$db"
+}
+
+# ==============================================================================
+# PASSWORD HANDLER
+# ==============================================================================
+get_password() {
+    local prefix="$1"
+    local index="${2:-0}"  # Optional index for multiple targets
+    local pass=""
+
+    # 1. Direct parameter
+    if [ "$prefix" = "FROM" ] && [ -n "$FROM_PASSWORD" ]; then
+        pass="$FROM_PASSWORD"
+    elif [ "$prefix" = "TO" ] && [ -n "$TO_PASSWORD" ]; then
+        pass="$TO_PASSWORD"
+    elif [ -n "$PASSWORD" ]; then
+        pass="$PASSWORD"
+    fi
+
+    # 2. Environment variable
+    if [ -z "$pass" ]; then
+        if [ "$prefix" = "FROM" ] && [ -n "$T_PGSQL_FROM_PASSWORD" ]; then
+            pass="$T_PGSQL_FROM_PASSWORD"
+        elif [ "$prefix" = "TO" ] && [ -n "$T_PGSQL_TO_PASSWORD" ]; then
+            pass="$T_PGSQL_TO_PASSWORD"
+        elif [ -n "$T_PGSQL_PASSWORD" ]; then
+            pass="$T_PGSQL_PASSWORD"
+        fi
+    fi
+
+    # 3. Password file
+    if [ -z "$pass" ]; then
+        local pf=""
+        if [ "$prefix" = "FROM" ] && [ -n "$FROM_PASSWORD_FILE" ]; then
+            pf="$FROM_PASSWORD_FILE"
+        elif [ "$prefix" = "TO" ] && [ ${#TO_PASSWORD_FILES[@]} -gt 0 ]; then
+            # Multiple targets: use indexed password file or fallback to first one
+            if [ ${#TO_PASSWORD_FILES[@]} -gt 1 ] && [ -n "${TO_PASSWORD_FILES[$index]}" ]; then
+                pf="${TO_PASSWORD_FILES[$index]}"
+            else
+                # Single password file for all targets
+                pf="${TO_PASSWORD_FILES[0]}"
+            fi
+        elif [ -n "$PASSWORD_FILE" ]; then
+            pf="$PASSWORD_FILE"
+        fi
+
+        if [ -n "$pf" ] && [ -f "$pf" ]; then
+            pass=$(cat "$pf" | tr -d '\n')
+            log_debug "Password from file: $pf"
+        fi
+    fi
+
+    # 4. Interactive prompt
+    if [ -z "$pass" ] && [ -t 0 ] && [ "$YES" != true ]; then
+        read -s -p "$prefix password: " pass
+        echo ""
+    fi
+
+    # Sudo mode doesn't need password for FROM
+    if [ -z "$pass" ] && [ "$prefix" = "FROM" ] && [ "$SUDO" = true ]; then
+        log_debug "Sudo mode: skipping FROM password"
+        eval "${prefix}_DB_PASSWORD=''"
+        return 0
+    fi
+
+    if [ -z "$pass" ]; then
+        log_error "No password for $prefix"
+        return 1
+    fi
+
+    eval "${prefix}_DB_PASSWORD='$pass'"
+}
+
+# ==============================================================================
+# DUMP
+# ==============================================================================
+cmd_dump() {
+    meta_start
+    log_info "Starting dump..."
+
+    if [ -z "$FROM_CONNECTION" ]; then
+        log_error "--from required"
+        return 1
+    fi
+
+    parse_connection "$FROM_CONNECTION" "FROM"
+    get_password "FROM"
+
+    mkdir -p "$OUTPUT_DIR"
+
+    local ts=$(date '+%Y%m%d_%H%M%S')
+    local dump_file="${OUTPUT_DIR}/${FROM_DATABASE}_${ts}.dump"
+
+    log_info "From: ${FROM_DB_USER}@${FROM_DB_HOST}:${FROM_DB_PORT}/${FROM_DATABASE}"
+    log_info "To: ${dump_file}"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] Would dump to: $dump_file"
+        return 0
+    fi
+
+    # Build exclude options
+    local exclude_opts=""
+    if [ -n "$EXCLUDE_TABLES" ]; then
+        IFS=',' read -ra arr <<< "$EXCLUDE_TABLES"
+        for t in "${arr[@]}"; do
+            exclude_opts="$exclude_opts --exclude-table='$(echo $t | xargs)'"
+        done
+    fi
+    if [ -n "$EXCLUDE_SCHEMAS" ]; then
+        IFS=',' read -ra arr <<< "$EXCLUDE_SCHEMAS"
+        for s in "${arr[@]}"; do
+            exclude_opts="$exclude_opts --exclude-schema='$(echo $s | xargs)'"
+        done
+    fi
+    if [ -n "$EXCLUDE_DATA" ]; then
+        IFS=',' read -ra arr <<< "$EXCLUDE_DATA"
+        for t in "${arr[@]}"; do
+            exclude_opts="$exclude_opts --exclude-table-data='$(echo $t | xargs)'"
+        done
+    fi
+
+    local result=0
+
+    if [ "$FROM_TYPE" = "ssh" ]; then
+        log_info "Dumping via SSH..."
+        local remote_file="/tmp/${FROM_DATABASE}_${ts}.dump"
+
+        local cmd=""
+        if [ "$SUDO" = true ]; then
+            # Use sudo -u postgres (peer auth)
+            cmd="sudo -u $FROM_DB_USER pg_dump"
+            cmd="$cmd -h $FROM_DB_HOST -p $FROM_DB_PORT"
+        else
+            # Use password auth
+            cmd="PGPASSWORD='$FROM_DB_PASSWORD' pg_dump"
+            cmd="$cmd -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT"
+        fi
+        cmd="$cmd -Fc -Z${PG_COMPRESS_LEVEL} -v $exclude_opts"
+        cmd="$cmd -f '$remote_file' $FROM_DATABASE"
+
+        ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cmd"
+        result=$?
+
+        if [ $result -eq 0 ]; then
+            log_info "Transferring..."
+            scp -P "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}:${remote_file}" "$dump_file"
+
+            # Cleanup based on FROM_KEEP
+            if [ "$FROM_KEEP" -eq 0 ]; then
+                log_info "Cleaning source dump..."
+                ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "rm -f '$remote_file'"
+            elif [ "$FROM_KEEP" -gt 0 ]; then
+                log_info "Keeping last $FROM_KEEP dump(s) on source..."
+                local cleanup_cmd="cd /tmp && ls -t ${FROM_DATABASE}_*.dump 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
+                ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
+            else
+                log_info "Keeping source dump (--from-keep -1)"
+            fi
+        fi
+    else
+        log_info "Dumping locally..."
+        export PGPASSWORD="$FROM_DB_PASSWORD"
+
+        local cmd="pg_dump -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT"
+        cmd="$cmd -Fc -Z${PG_COMPRESS_LEVEL} -v $exclude_opts"
+        cmd="$cmd -f '$dump_file' $FROM_DATABASE"
+
+        eval "$cmd"
+        result=$?
+        unset PGPASSWORD
+    fi
+
+    if [ $result -eq 0 ]; then
+        local size=$(ls -lh "$dump_file" | awk '{print $5}')
+        log_success "Dump complete: $dump_file ($size)"
+
+        # External compression
+        if [ "$COMPRESS" != "gzip" ] && [ "$COMPRESS" != "none" ]; then
+            compress_file "$dump_file"
+        fi
+
+        # Write metadata
+        meta_write "$dump_file" "success" 0
+
+        # Cleanup
+        cleanup_old_dumps
+
+        echo "DUMP_FILE=$dump_file"
+        echo "DUMP_SIZE=$size"
+    else
+        log_error "Dump failed: $result"
+        meta_write "$dump_file" "failed" $result
+        return 1
+    fi
+}
+
+# ==============================================================================
+# RESTORE
+# ==============================================================================
+cmd_restore() {
+    log_info "Starting restore..."
+
+    # Auto-find latest dump if no file specified
+    if [ -z "$FILE" ]; then
+        local norm_dir=$(cd "$OUTPUT_DIR" 2>/dev/null && pwd)
+        FILE=$(ls -t "${norm_dir}/"*.tar.gz 2>/dev/null | head -1)
+        [ -z "$FILE" ] && FILE=$(ls -t "${norm_dir}/"*.dump 2>/dev/null | head -1)
+
+        if [ -z "$FILE" ]; then
+            log_error "No dump file found. Use --file <path>"
+            return 1
+        fi
+        log_info "Using latest: $(basename "$FILE")"
+    fi
+
+    if [ ! -f "$FILE" ]; then
+        log_error "File not found: $FILE"
+        return 1
+    fi
+
+    if [ ${#TO_CONNECTIONS[@]} -eq 0 ]; then
+        log_error "--to required"
+        return 1
+    fi
+
+    local restore_file="$FILE"
+    local temp_dir=""
+    local cleanup_temp=false
+
+    # Handle different archive types
+    case "$restore_file" in
+        *.tar.gz)
+            # Extract dump from tar archive
+            temp_dir=$(mktemp -d)
+            cleanup_temp=true
+            log_info "Extracting from archive..."
+            restore_file=$(extract_dump "$FILE" "$temp_dir")
+            if [ -z "$restore_file" ] || [ ! -f "$restore_file" ]; then
+                log_error "Failed to extract dump from archive"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            ;;
+        *.gz)  gunzip -k "$restore_file"; restore_file="${restore_file%.gz}" ;;
+        *.xz)  unxz -k "$restore_file"; restore_file="${restore_file%.xz}" ;;
+        *.bz2) bunzip2 -k "$restore_file"; restore_file="${restore_file%.bz2}" ;;
+        *.zst) zstd -dk "$restore_file"; restore_file="${restore_file%.zst}" ;;
+    esac
+
+    local idx=0
+    for conn in "${TO_CONNECTIONS[@]}"; do
+        restore_to "$conn" "$restore_file" "$idx"
+        ((idx++))
+    done
+
+    # Cleanup temp dir if created
+    [ "$cleanup_temp" = true ] && rm -rf "$temp_dir"
+}
+
+restore_to() {
+    local conn="$1"
+    local dump="$2"
+    local index="${3:-0}"
+
+    parse_connection "$conn" "TO"
+    get_password "TO" "$index"
+
+    log_info "To: ${TO_DB_USER}@${TO_DB_HOST}:${TO_DB_PORT}/${TO_DATABASE}"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] Would restore to: $conn"
+        return 0
+    fi
+
+    if [ "$TO_TYPE" = "ssh" ]; then
+        restore_ssh "$dump"
+    else
+        restore_local "$dump"
+    fi
+}
+
+restore_local() {
+    local dump="$1"
+
+    export PGPASSWORD="$TO_DB_PASSWORD"
+
+    # Check exists
+    local exists=$(psql -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" \
+        -tAc "SELECT 1 FROM pg_database WHERE datname='$TO_DATABASE'" postgres 2>/dev/null)
+
+    if [ "$exists" = "1" ]; then
+        if [ "$FORCE" = true ]; then
+            log_warn "Database '$TO_DATABASE' exists, dropping (--force)..."
+            psql -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" \
+                -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$TO_DATABASE' AND pid<>pg_backend_pid();" postgres >/dev/null 2>&1
+            dropdb -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" "$TO_DATABASE" 2>/dev/null
+        else
+            log_error "Database '$TO_DATABASE' already exists. Use --force to overwrite."
+            unset PGPASSWORD
+            return 1
+        fi
+    fi
+
+    log_info "Creating database..."
+    createdb -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" "$TO_DATABASE"
+
+    log_info "Restoring..."
+    pg_restore --verbose --no-owner --no-privileges --clean --if-exists \
+        -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" \
+        -d "$TO_DATABASE" "$dump" 2>&1
+
+    local r=$?
+    unset PGPASSWORD
+
+    [ $r -eq 0 ] && log_success "Restore complete" || log_warn "Restore done with warnings"
+}
+
+restore_ssh() {
+    local dump="$1"
+    local remote="/tmp/$(basename $dump)"
+
+    # Check if DB exists on remote
+    local check_cmd="PGPASSWORD='$TO_DB_PASSWORD' psql -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -tAc \"SELECT 1 FROM pg_database WHERE datname='$TO_DATABASE'\" postgres 2>/dev/null"
+    local exists=$(ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$check_cmd")
+
+    if [ "$exists" = "1" ]; then
+        if [ "$FORCE" = true ]; then
+            log_warn "Remote database '$TO_DATABASE' exists, will drop (--force)..."
+        else
+            log_error "Remote database '$TO_DATABASE' already exists. Use --force to overwrite."
+            return 1
+        fi
+    fi
+
+    log_info "Uploading dump..."
+    scp -P "$TO_SSH_PORT" "$dump" "${TO_SSH_USER}@${TO_SSH_HOST}:${remote}"
+
+    log_info "Restoring on remote..."
+    local cmd="export PGPASSWORD='$TO_DB_PASSWORD';"
+    if [ "$FORCE" = true ]; then
+        cmd+="psql -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$TO_DATABASE' AND pid<>pg_backend_pid();\" postgres 2>/dev/null;"
+        cmd+="dropdb -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT --if-exists $TO_DATABASE 2>/dev/null;"
+    fi
+    cmd+="createdb -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT $TO_DATABASE 2>/dev/null || true;"
+    cmd+="pg_restore --verbose --no-owner --no-privileges --clean --if-exists -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -d $TO_DATABASE '$remote';"
+    cmd+="rm -f '$remote'"
+
+    ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$cmd"
+
+    [ $? -eq 0 ] && log_success "Remote restore complete" || log_warn "Remote restore done with warnings"
+}
+
+# ==============================================================================
+# FETCH (existing dump from source)
+# ==============================================================================
+cmd_fetch() {
+    meta_start
+    log_info "Fetching existing dump..."
+
+    if [ -z "$FROM_CONNECTION" ]; then
+        log_error "--from required"
+        return 1
+    fi
+
+    parse_connection "$FROM_CONNECTION" "FROM"
+
+    if [ "$FROM_TYPE" != "ssh" ]; then
+        log_error "fetch command requires SSH connection (ssh://...)"
+        return 1
+    fi
+
+    mkdir -p "$OUTPUT_DIR"
+
+    # Determine which file to fetch
+    local remote_file=""
+
+    if [ -n "$FROM_FILE" ] && [ "$FROM_FILE" != "latest" ]; then
+        # User specified file/pattern
+        if [[ "$FROM_FILE" == *"*"* ]]; then
+            # Glob pattern - find latest matching
+            log_info "Finding latest match for: $FROM_FILE"
+            remote_file=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+                "ls -t /tmp/$FROM_FILE 2>/dev/null | head -1")
+        else
+            # Exact filename - check if it has path
+            if [[ "$FROM_FILE" == /* ]]; then
+                remote_file="$FROM_FILE"
+            else
+                remote_file="/tmp/$FROM_FILE"
+            fi
+        fi
+    else
+        # Auto-find latest dump for database (--from-file or --from-file latest)
+        log_info "Finding latest dump for: $FROM_DATABASE"
+        remote_file=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+            "ls -t /tmp/${FROM_DATABASE}_*.dump 2>/dev/null | head -1")
+    fi
+
+    if [ -z "$remote_file" ]; then
+        log_error "No dump file found on source"
+        return 1
+    fi
+
+    # Check file exists
+    local exists=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+        "[ -f '$remote_file' ] && echo 'yes' || echo 'no'")
+
+    if [ "$exists" != "yes" ]; then
+        log_error "File not found: $remote_file"
+        return 1
+    fi
+
+    log_info "Found: $remote_file"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] Would fetch: $remote_file"
+        return 0
+    fi
+
+    local local_file="${OUTPUT_DIR}/$(basename $remote_file)"
+
+    log_info "Downloading..."
+    scp -P "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}:${remote_file}" "$local_file"
+
+    if [ $? -eq 0 ]; then
+        local size=$(ls -lh "$local_file" | awk '{print $5}')
+        log_success "Fetched: $local_file ($size)"
+        meta_write "$local_file" "success" 0
+        echo "DUMP_FILE=$local_file"
+        echo "DUMP_SIZE=$size"
+    else
+        log_error "Fetch failed"
+        meta_write "$local_file" "failed" 1
+        return 1
+    fi
+}
+
+# ==============================================================================
+# CLONE
+# ==============================================================================
+cmd_clone() {
+    log_info "Starting clone..."
+
+    # Validate connections first
+    if [ -z "$FROM_CONNECTION" ]; then
+        log_error "--from required"
+        return 1
+    fi
+
+    if [ ${#TO_CONNECTIONS[@]} -eq 0 ]; then
+        log_error "--to required"
+        return 1
+    fi
+
+    # Dry-run mode
+    if [ "$DRY_RUN" = true ]; then
+        parse_connection "$FROM_CONNECTION" "FROM"
+        get_password "FROM"
+        log_info "[DRY-RUN] Would dump from: $FROM_CONNECTION"
+        for conn in "${TO_CONNECTIONS[@]}"; do
+            log_info "[DRY-RUN] Would restore to: $conn"
+        done
+        return 0
+    fi
+
+    cmd_dump
+    [ $? -ne 0 ] && return 1
+
+    # Find latest archive (normalize path first)
+    local norm_output_dir=$(cd "$OUTPUT_DIR" && pwd)
+    local latest=$(ls -t "${norm_output_dir}/${FROM_DATABASE}_"*.tar.gz 2>/dev/null | head -1)
+
+    # Fallback to .dump if no tar.gz
+    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${FROM_DATABASE}_"*.dump 2>/dev/null | head -1)
+    [ -z "$latest" ] && { log_error "Dump not found"; return 1; }
+
+    FILE="$latest"
+    local restore_start=$(date +%s)
+    cmd_restore
+    local r=$?
+    local restore_elapsed=$(($(date +%s) - restore_start))
+
+    # Update metadata with target info
+    meta_update_target "$latest" $([ $r -eq 0 ] && echo "success" || echo "failed") $restore_elapsed
+
+    # Cleanup
+    [ "$KEEP" -eq 0 ] && rm -f "$latest"
+
+    [ $r -eq 0 ] && log_success "Clone complete" || return 1
+}
+
+# ==============================================================================
+# LIST
+# ==============================================================================
+cmd_list() {
+    local norm_dir=$(cd "$OUTPUT_DIR" 2>/dev/null && pwd)
+    log_info "Dumps in: $norm_dir"
+    echo ""
+
+    [ ! -d "$OUTPUT_DIR" ] && { log_warn "Directory not found"; return 0; }
+
+    printf "%-50s %8s %s\n" "FILE" "SIZE" "DATE"
+    printf "%s\n" "$(printf '%.0s-' {1..75})"
+
+    # List both .tar.gz and .dump files
+    find "$norm_dir" \( -name "*.tar.gz" -o -name "*.dump" \) -type f -print0 2>/dev/null | \
+        xargs -0 stat -f "%m %z %N" 2>/dev/null | \
+        sort -rn | \
+        while read -r mtime size filepath; do
+            local fname=$(basename "$filepath")
+            local hsize=$(numfmt --to=iec-i --suffix=B $size 2>/dev/null || echo "${size}B")
+            local fdate=$(date -r "$mtime" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
+            printf "%-50s %8s %s\n" "$fname" "$hsize" "$fdate"
+        done
+    echo ""
+}
+
+# ==============================================================================
+# META (show metadata)
+# ==============================================================================
+cmd_meta() {
+    if [ -z "$FILE" ]; then
+        # Show latest
+        local norm_output_dir=$(cd "$OUTPUT_DIR" 2>/dev/null && pwd)
+        FILE=$(ls -t "${norm_output_dir}/"*.tar.gz 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+        log_error "No archive found. Use --file <path>"
+        return 1
+    fi
+
+    log_info "Metadata: $(basename "$FILE")"
+    echo ""
+    show_meta "$FILE"
+}
+
+# ==============================================================================
+# CLEAN
+# ==============================================================================
+cmd_clean() {
+    log_info "Cleaning dumps..."
+    [ "$DRY_RUN" = true ] && { log_info "[DRY-RUN] Would clean"; return 0; }
+    cleanup_old_dumps
+    log_success "Done"
+}
+
+# ==============================================================================
+# BATCH SYSTEM
+# ==============================================================================
+save_job() {
+    local job_name="$1"
+    shift
+    local job_command="$1"
+
+    [ -z "$job_name" ] && { log_error "Job name required"; return 1; }
+    [ -z "$job_command" ] && { log_error "Command required"; return 1; }
+
+    # Build args string from current settings (use single quotes for values with special chars)
+    local args=""
+    [ -n "$FROM_CONNECTION" ] && args="$args --from '$FROM_CONNECTION'"
+    for to in "${TO_CONNECTIONS[@]}"; do
+        args="$args --to '$to'"
+    done
+    [ -n "$FROM_PASSWORD_FILE" ] && args="$args --from-password-file '$FROM_PASSWORD_FILE'"
+    for pf in "${TO_PASSWORD_FILES[@]}"; do
+        args="$args --to-password-file '$pf'"
+    done
+    [ -n "$PASSWORD_FILE" ] && args="$args --password-file '$PASSWORD_FILE'"
+    [ -n "$OUTPUT_DIR" ] && args="$args --output '$OUTPUT_DIR'"
+    [ "$KEEP" -ge 0 ] && args="$args --keep $KEEP"
+    [ "$FROM_KEEP" -gt 0 ] && args="$args --from-keep $FROM_KEEP"
+    [ -n "$EXCLUDE_TABLES" ] && args="$args --exclude-table '$EXCLUDE_TABLES'"
+    [ -n "$EXCLUDE_SCHEMAS" ] && args="$args --exclude-schema '$EXCLUDE_SCHEMAS'"
+    [ -n "$ONLY_TABLES" ] && args="$args --only-table '$ONLY_TABLES'"
+    [ -n "$ONLY_SCHEMAS" ] && args="$args --only-schema '$ONLY_SCHEMAS'"
+    [ "$FORCE" = true ] && args="$args --force"
+    [ "$VERBOSE" = true ] && args="$args --verbose"
+
+    # Create jobs file if not exists
+    [ ! -f "$JOBS_FILE" ] && echo "jobs:" > "$JOBS_FILE"
+
+    # Check if job exists
+    if grep -q "^  $job_name:" "$JOBS_FILE" 2>/dev/null; then
+        # Update existing job
+        local tmp_file=$(mktemp)
+        awk -v name="$job_name" -v cmd="$job_command" -v args="$args" '
+        BEGIN { skip=0 }
+        /^  [a-zA-Z0-9_-]+:/ {
+            if ($1 == name":") {
+                skip=1
+                print "  " name ":"
+                print "    command: " cmd
+                print "    args: \"" args "\""
+                next
+            } else {
+                skip=0
+            }
+        }
+        skip==0 { print }
+        skip==1 && /^  [a-zA-Z0-9_-]+:/ { skip=0; print }
+        ' "$JOBS_FILE" > "$tmp_file"
+        mv "$tmp_file" "$JOBS_FILE"
+        log_success "Updated job: $job_name"
+    else
+        # Add new job
+        cat >> "$JOBS_FILE" << EOF
+  $job_name:
+    command: $job_command
+    args:$args
+EOF
+        log_success "Saved job: $job_name"
+    fi
+
+    log_info "Jobs file: $JOBS_FILE"
+}
+
+list_jobs() {
+    if [ ! -f "$JOBS_FILE" ]; then
+        log_warn "No jobs file found: $JOBS_FILE"
+        return 1
+    fi
+
+    echo ""
+    echo "Available jobs:"
+    echo "==============="
+    grep "^  [a-zA-Z0-9_-]*:" "$JOBS_FILE" | sed 's/://g; s/^  /  • /'
+    echo ""
+}
+
+run_job() {
+    local job_name="$1"
+
+    if [ ! -f "$JOBS_FILE" ]; then
+        log_error "Jobs file not found: $JOBS_FILE"
+        return 1
+    fi
+
+    # Extract job info using awk
+    local job_cmd=$(awk -v name="$job_name" '
+        /^  [a-zA-Z0-9_-]+:/ { current = $1; gsub(/:/, "", current) }
+        current == name && /command:/ { gsub(/.*command: */, ""); print; exit }
+    ' "$JOBS_FILE")
+
+    local job_args=$(awk -v name="$job_name" '
+        /^  [a-zA-Z0-9_-]+:/ { current = $1; gsub(/:/, "", current) }
+        current == name && /args:/ { gsub(/.*args:/, ""); print; exit }
+    ' "$JOBS_FILE")
+
+    if [ -z "$job_cmd" ]; then
+        log_error "Job not found: $job_name"
+        return 1
+    fi
+
+    log_info "Running job: $job_name"
+    log_debug "Command: $job_cmd $job_args"
+
+    # Execute the job using bash -c to properly handle quotes
+    bash -c "'$0' $job_cmd $job_args"
+}
+
+cmd_batch() {
+    local target="$1"
+
+    if [ -z "$target" ]; then
+        list_jobs
+        return 0
+    fi
+
+    if [ "$target" = "all" ]; then
+        if [ ! -f "$JOBS_FILE" ]; then
+            log_error "Jobs file not found: $JOBS_FILE"
+            return 1
+        fi
+
+        log_info "Running all jobs..."
+        echo ""
+
+        local jobs=$(grep "^  [a-zA-Z0-9_-]*:" "$JOBS_FILE" | sed 's/://g; s/^  //')
+        local total=$(echo "$jobs" | wc -l | tr -d ' ')
+        local current=0
+        local failed=0
+
+        for job in $jobs; do
+            current=$((current + 1))
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_info "[$current/$total] Job: $job"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            if run_job "$job"; then
+                log_success "[$current/$total] Completed: $job"
+            else
+                log_error "[$current/$total] Failed: $job"
+                failed=$((failed + 1))
+                [ "$CONTINUE_ON_ERROR" != true ] && { log_error "Stopping (use --continue-on-error to continue)"; return 1; }
+            fi
+            echo ""
+        done
+
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        if [ $failed -eq 0 ]; then
+            log_success "All $total jobs completed successfully"
+        else
+            log_warn "$failed of $total jobs failed"
+        fi
+    else
+        run_job "$target"
+    fi
+}
+
+# ==============================================================================
+# UTILITIES
+# ==============================================================================
+compress_file() {
+    local file="$1"
+    log_info "Compressing ($COMPRESS)..."
+
+    case "$COMPRESS" in
+        zstd)  zstd -${COMPRESS_LEVEL} --rm "$file" ;;
+        xz)    xz -${COMPRESS_LEVEL} "$file" ;;
+        bzip2) bzip2 -${COMPRESS_LEVEL} "$file" ;;
+    esac
+
+    [ $? -eq 0 ] && log_success "Compressed" || log_error "Compression failed"
+}
+
+cleanup_old_dumps() {
+    [ "$KEEP" -le 0 ] && return 0
+    [ -z "$FROM_DATABASE" ] && return 0
+
+    local count=$(find "$OUTPUT_DIR" -name "${FROM_DATABASE}_*.dump*" -type f 2>/dev/null | wc -l)
+
+    if [ "$count" -gt "$KEEP" ]; then
+        local del=$((count - KEEP))
+        log_info "Deleting $del old dump(s)..."
+
+        find "$OUTPUT_DIR" -name "${FROM_DATABASE}_*.dump*" -type f -printf '%T+ %p\n' 2>/dev/null | \
+            sort | head -n "$del" | awk '{print $2}' | \
+            while read f; do
+                rm -f "$f"
+                log_debug "Deleted: $f"
+            done
+    fi
+}
+
+# ==============================================================================
+# ARGUMENT PARSER
+# ==============================================================================
+parse_args() {
+    [ $# -eq 0 ] && { show_help; exit 0; }
+
+    # Check if first arg is option or command
+    case "$1" in
+        -h|--help) show_help; exit 0 ;;
+        --version) show_version; exit 0 ;;
+        --batch) BATCH_JOB="$2"; shift 2 ;;
+        -*) log_error "Command required. Use --help for usage."; exit 1 ;;
+        *) COMMAND="$1"; shift ;;
+    esac
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --from) FROM_CONNECTION="$2"; shift 2 ;;
+            --to) TO_CONNECTIONS+=("$2"); shift 2 ;;
+
+            --password) PASSWORD="$2"; shift 2 ;;
+            --from-password) FROM_PASSWORD="$2"; shift 2 ;;
+            --to-password) TO_PASSWORD="$2"; shift 2 ;;
+            --password-file) PASSWORD_FILE="$2"; shift 2 ;;
+            --from-password-file) FROM_PASSWORD_FILE="$2"; shift 2 ;;
+            --to-password-file) TO_PASSWORD_FILES+=("$2"); shift 2 ;;
+            --config) CONFIG_FILE="$2"; shift 2 ;;
+
+            --exclude-table) EXCLUDE_TABLES="$2"; shift 2 ;;
+            --exclude-schema) EXCLUDE_SCHEMAS="$2"; shift 2 ;;
+            --exclude-data) EXCLUDE_DATA="$2"; shift 2 ;;
+            --only-table) ONLY_TABLES="$2"; shift 2 ;;
+            --only-schema) ONLY_SCHEMAS="$2"; shift 2 ;;
+
+            --compress) COMPRESS="$2"; shift 2 ;;
+            --compress-level) COMPRESS_LEVEL="$2"; shift 2 ;;
+            --pg-compress-level) PG_COMPRESS_LEVEL="$2"; shift 2 ;;
+
+            --output) OUTPUT_DIR="$2"; shift 2 ;;
+            --keep) KEEP="$2"; shift 2 ;;
+            --from-keep) FROM_KEEP="$2"; shift 2 ;;
+            --from-file)
+                # Optional value: --from-file or --from-file <pattern>
+                if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
+                    FROM_FILE="$2"
+                    shift 2
+                else
+                    FROM_FILE="latest"
+                    shift
+                fi
+                ;;
+
+            --retention) RETENTION=true; shift ;;
+            --retention-daily) RETENTION_DAILY="$2"; shift 2 ;;
+            --retention-weekly) RETENTION_WEEKLY="$2"; shift 2 ;;
+            --retention-monthly) RETENTION_MONTHLY="$2"; shift 2 ;;
+            --retention-yearly) RETENTION_YEARLY="$2"; shift 2 ;;
+
+            --health-check) HEALTH_CHECK=true; shift ;;
+            --health-check-after) HEALTH_CHECK_AFTER=true; shift ;;
+            --no-health-check) HEALTH_CHECK=false; shift ;;
+            --health-check-fail) HEALTH_CHECK_FAIL=true; shift ;;
+
+            --notify) NOTIFY+=("$2"); shift 2 ;;
+            --notify-on-error) NOTIFY_ON_ERROR=true; shift ;;
+
+            --mask) MASK=true; shift ;;
+            --mask-rules) MASK_RULES="$2"; shift 2 ;;
+            --mask-tables) MASK_TABLES="$2"; shift 2 ;;
+
+            --stream) STREAM=true; shift ;;
+            --stream-buffer) STREAM_BUFFER="$2"; shift 2 ;;
+
+            --sudo) SUDO=true; shift ;;
+
+            --parallel) PARALLEL="$2"; shift 2 ;;
+            --continue-on-error) CONTINUE_ON_ERROR=true; shift ;;
+            --only) ONLY_JOBS="$2"; shift 2 ;;
+            --exclude) EXCLUDE_JOBS="$2"; shift 2 ;;
+            --notify-summary) NOTIFY_SUMMARY=true; shift ;;
+            --save) SAVE_JOB="$2"; shift 2 ;;
+            --batch) BATCH_JOB="$2"; shift 2 ;;
+
+            --file) FILE="$2"; shift 2 ;;
+
+            --log) LOG_FILE="$2"; shift 2 ;;
+            --log-level) LOG_LEVEL="$2"; shift 2 ;;
+            -v|--verbose) VERBOSE=true; shift ;;
+            -q|--quiet) QUIET=true; shift ;;
+            -y|--yes) YES=true; shift ;;
+            -f|--force) FORCE=true; shift ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            --no-meta) META_ENABLED=false; shift ;;
+            -h|--help) show_help; exit 0 ;;
+            --version) show_version; exit 0 ;;
+
+            *) log_error "Unknown: $1"; exit 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+main() {
+    parse_args "$@"
+
+    [ -n "$LOG_FILE" ] && mkdir -p "$(dirname "$LOG_FILE")"
+
+    # Handle --save: save current command as a job
+    if [ -n "$SAVE_JOB" ]; then
+        save_job "$SAVE_JOB" "$COMMAND"
+        return 0
+    fi
+
+    # Handle batch with --batch argument (alternative to 'batch' command)
+    if [ -n "$BATCH_JOB" ]; then
+        cmd_batch "$BATCH_JOB"
+        return 0
+    fi
+
+    case "$COMMAND" in
+        dump)    cmd_dump ;;
+        restore) cmd_restore ;;
+        clone)   cmd_clone ;;
+        fetch)   cmd_fetch ;;
+        batch)   cmd_batch "$BATCH_JOB" ;;
+        list)    cmd_list ;;
+        meta)    cmd_meta ;;
+        clean)   cmd_clean ;;
+        jobs)    list_jobs ;;
+        version) show_version ;;
+        help)    show_help ;;
+        *)       log_error "Unknown command: $COMMAND"; exit 1 ;;
+    esac
+}
+
+main "$@"
