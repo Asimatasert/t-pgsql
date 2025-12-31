@@ -11,7 +11,7 @@ set -e
 # ==============================================================================
 # VERSION & PATHS
 # ==============================================================================
-VERSION="3.1.0"
+VERSION="3.2.0"
 SCRIPT_NAME="t-pgsql"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -102,6 +102,8 @@ NOTIFY_SUMMARY=false
 SAVE_JOB=""
 BATCH_JOB=""
 JOBS_FILE="${SCRIPT_DIR}/jobs.yaml"
+JOBS_ACTION=""
+JOBS_TARGET=""
 
 # General
 VERBOSE=false
@@ -588,6 +590,10 @@ COMMANDS:
     clone       Dump + Restore (full sync)
     fetch       Fetch existing dump from remote (no new dump)
     batch       Run multiple jobs from config
+    jobs        Manage saved jobs
+                  jobs              List all jobs
+                  jobs show <name>  Show job details
+                  jobs remove <name> Remove a job
     list        List dump files
     meta        Show metadata from archive
     clean       Clean old dumps
@@ -726,7 +732,7 @@ EXAMPLES:
       --from ssh://ubuntu@192.168.1.100/prod \
       --from-file "prod_20250130*.dump"
 
-More info: https://github.com/Asimatasert/sync_database
+More info: https://github.com/Asimatasert/t-pgsql
 EOF
 }
 
@@ -1566,6 +1572,89 @@ list_jobs() {
     echo "==============="
     grep "^  [a-zA-Z0-9_-]*:" "$JOBS_FILE" | sed 's/://g; s/^  /  • /'
     echo ""
+    echo "Usage: t-pgsql jobs [list|show|remove] <name>"
+    echo ""
+}
+
+show_job() {
+    local job_name="$1"
+
+    if [ -z "$job_name" ]; then
+        log_error "Job name required. Usage: t-pgsql jobs show <name>"
+        return 1
+    fi
+
+    if [ ! -f "$JOBS_FILE" ]; then
+        log_error "Jobs file not found: $JOBS_FILE"
+        return 1
+    fi
+
+    # Check if job exists
+    if ! grep -q "^  $job_name:" "$JOBS_FILE" 2>/dev/null; then
+        log_error "Job not found: $job_name"
+        return 1
+    fi
+
+    # Extract and display job info
+    local job_cmd=$(awk -v name="$job_name" '
+        /^  [a-zA-Z0-9_-]+:/ { current = $1; gsub(/:/, "", current) }
+        current == name && /command:/ { gsub(/.*command: */, ""); print; exit }
+    ' "$JOBS_FILE")
+
+    local job_args=$(awk -v name="$job_name" '
+        /^  [a-zA-Z0-9_-]+:/ { current = $1; gsub(/:/, "", current) }
+        current == name && /args:/ { gsub(/.*args: *"?/, ""); gsub(/"$/, ""); print; exit }
+    ' "$JOBS_FILE")
+
+    echo ""
+    echo -e "Job: ${BOLD}$job_name${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${CYAN}Command:${NC} $job_cmd"
+    echo -e "${CYAN}Arguments:${NC}"
+
+    # Parse and display args nicely (handle quoted values)
+    echo "$job_args" | sed "s/' --/'\n--/g" | while read -r arg; do
+        [ -n "$arg" ] && echo -e "  ${GREEN}${arg}${NC}"
+    done
+    echo ""
+}
+
+remove_job() {
+    local job_name="$1"
+
+    if [ -z "$job_name" ]; then
+        log_error "Job name required. Usage: t-pgsql jobs remove <name>"
+        return 1
+    fi
+
+    if [ ! -f "$JOBS_FILE" ]; then
+        log_error "Jobs file not found: $JOBS_FILE"
+        return 1
+    fi
+
+    # Check if job exists
+    if ! grep -q "^  $job_name:" "$JOBS_FILE" 2>/dev/null; then
+        log_error "Job not found: $job_name"
+        return 1
+    fi
+
+    # Remove job using awk
+    local tmp_file=$(mktemp)
+    awk -v name="$job_name" '
+    BEGIN { skip=0 }
+    /^  [a-zA-Z0-9_-]+:/ {
+        if ($1 == name":") {
+            skip=1
+            next
+        } else {
+            skip=0
+        }
+    }
+    skip==0 { print }
+    ' "$JOBS_FILE" > "$tmp_file"
+
+    mv "$tmp_file" "$JOBS_FILE"
+    log_success "Removed job: $job_name"
 }
 
 run_job() {
@@ -1698,6 +1787,26 @@ parse_args() {
         *) COMMAND="$1"; shift ;;
     esac
 
+    # Handle jobs subcommand (jobs list|show|remove <name>)
+    if [ "$COMMAND" = "jobs" ] && [ $# -gt 0 ]; then
+        case "$1" in
+            list|show|remove)
+                JOBS_ACTION="$1"
+                shift
+                [ $# -gt 0 ] && { JOBS_TARGET="$1"; shift; }
+                ;;
+            -*)
+                # It's an option, not a subcommand
+                ;;
+            *)
+                # Assume it's a job name for 'show' as default action
+                JOBS_ACTION="show"
+                JOBS_TARGET="$1"
+                shift
+                ;;
+        esac
+    fi
+
     while [[ $# -gt 0 ]]; do
         case $1 in
             --from) FROM_CONNECTION="$2"; shift 2 ;;
@@ -1813,7 +1922,13 @@ main() {
         list)    cmd_list ;;
         meta)    cmd_meta ;;
         clean)   cmd_clean ;;
-        jobs)    list_jobs ;;
+        jobs)
+            case "$JOBS_ACTION" in
+                show)   show_job "$JOBS_TARGET" ;;
+                remove) remove_job "$JOBS_TARGET" ;;
+                *)      list_jobs ;;
+            esac
+            ;;
         version) show_version ;;
         help)    show_help ;;
         *)       log_error "Unknown command: $COMMAND"; exit 1 ;;
