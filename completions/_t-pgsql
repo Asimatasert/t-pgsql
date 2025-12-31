@@ -4,109 +4,87 @@ _t-pgsql() {
     local curcontext="$curcontext" state line
     typeset -A opt_args
 
-    local -a commands
-    commands=(
-        'dump:Create database backup'
-        'restore:Restore backup to database'
-        'clone:Dump + Restore (full sync)'
-        'fetch:Fetch existing dump from remote'
-        'batch:Run multiple jobs from config'
-        'jobs:Manage saved jobs'
-        'list:List dump files'
-        'meta:Show metadata from archive'
-        'clean:Clean old dumps'
-        'version:Show version'
-        'help:Show help'
-    )
-
-    local -a jobs_subcommands
-    jobs_subcommands=(
-        'list:List all jobs'
-        'show:Show job details'
-        'remove:Remove a job'
-    )
-
-    local -a global_options
-    global_options=(
-        '--from[Source connection]:connection:'
-        '--to[Target connection]:connection:'
-        '--password[Password for both connections]:password:'
-        '--from-password[Source password]:password:'
-        '--to-password[Target password]:password:'
-        '--password-file[Read password from file]:file:_files'
-        '--from-password-file[Source password file]:file:_files'
-        '--to-password-file[Target password file]:file:_files'
-        '--config[Config file with credentials]:file:_files'
-        '--exclude-table[Exclude tables]:tables:'
-        '--exclude-schema[Exclude schemas]:schemas:'
-        '--exclude-data[Exclude data only]:tables:'
-        '--only-table[Include only these tables]:tables:'
-        '--only-schema[Include only these schemas]:schemas:'
-        '--compress[Compression type]:type:(gzip zstd xz bzip2 none)'
-        '--compress-level[Compression level]:level:(1 2 3 4 5 6 7 8 9)'
-        '--pg-compress-level[pg_dump compression]:level:(0 1 2 3 4 5 6 7 8 9)'
-        '--output[Output directory]:directory:_files -/'
-        '--keep[Keep last N local dumps]:number:'
-        '--from-keep[Keep N dumps on source]:number:'
-        '--from-file[Fetch existing dump pattern]:pattern:'
-        '--retention[Enable GFS retention]'
-        '--retention-daily[Daily backups]:number:'
-        '--retention-weekly[Weekly backups]:number:'
-        '--retention-monthly[Monthly backups]:number:'
-        '--retention-yearly[Yearly backups]:number:'
-        '--health-check[Check before operation]'
-        '--health-check-after[Check after operation]'
-        '--no-health-check[Disable checks]'
-        '--health-check-fail[Abort on check failure]'
-        '--notify[Notification channel]:channel:'
-        '--notify-on-error[Only notify on error]'
-        '--mask[Enable data masking]'
-        '--mask-rules[Masking rules JSON]:file:_files'
-        '--mask-tables[Tables to mask]:tables:'
-        '--stream[Stream without temp files]'
-        '--stream-buffer[Buffer size in MB]:size:'
-        '--sudo[Use sudo for pg_dump]'
-        '--parallel[Parallel jobs]:number:'
-        '--continue-on-error[Continue on error]'
-        '--only[Run only these jobs]:jobs:'
-        '--exclude[Skip these jobs]:jobs:'
-        '--notify-summary[Summary notification]'
-        '--save[Save as job]:name:'
-        '--batch[Run batch job]:job:'
-        '--file[Dump file to restore]:file:_files'
-        '--log[Log file]:file:_files'
-        '--log-level[Log level]:level:(debug info warn error)'
-        {-v,--verbose}'[Verbose output]'
-        {-q,--quiet}'[Minimal output]'
-        {-y,--yes}'[Skip confirmations]'
-        {-f,--force}'[Force overwrite]'
-        '--dry-run[Show actions without executing]'
-        '--no-meta[Do not write meta files]'
-        {-h,--help}'[Show help]'
-        '--version[Show version]'
-    )
-
     _arguments -C \
-        '1: :->command' \
-        '2: :->subcommand' \
-        '*:: :->options'
+        '1:command:->commands' \
+        '*:options:->options'
 
     case $state in
-        command)
+        commands)
+            local -a commands
+            commands=(
+                'dump:Create database backup'
+                'restore:Restore backup to database'
+                'clone:Dump + Restore (full sync)'
+                'fetch:Fetch existing dump from remote'
+                'batch:Run multiple jobs'
+                'jobs:Manage saved jobs'
+                'list:List dump files'
+                'meta:Show metadata'
+                'clean:Clean old dumps'
+                'version:Show version'
+                'help:Show help'
+            )
             _describe -t commands 'command' commands
             ;;
-        subcommand)
-            case $words[1] in
-                jobs)
-                    _describe -t subcommands 'jobs subcommand' jobs_subcommands
-                    ;;
-                *)
-                    _arguments $global_options
-                    ;;
-            esac
-            ;;
         options)
-            _arguments $global_options
+            local -a opts
+            opts=(
+                '--from[Source connection]'
+                '--to[Target connection]'
+                '--password[Password]'
+                '--from-password[Source password]'
+                '--to-password[Target password]'
+                '--password-file[Password file]:file:_files'
+                '--from-password-file[Source password file]:file:_files'
+                '--to-password-file[Target password file]:file:_files'
+                '--config[Config file]:file:_files'
+                '--exclude-table[Exclude tables]'
+                '--exclude-schema[Exclude schemas]'
+                '--exclude-data[Exclude data only]'
+                '--only-table[Only these tables]'
+                '--only-schema[Only these schemas]'
+                '--compress[Compression type]:type:(gzip zstd xz bzip2 none)'
+                '--compress-level[Compression level 1-9]'
+                '--pg-compress-level[pg_dump compression 0-9]'
+                '--output[Output directory]:dir:_files -/'
+                '--keep[Keep N local dumps]'
+                '--from-keep[Keep N on source]'
+                '--from-file[Fetch existing dump]'
+                '--retention[Enable GFS retention]'
+                '--retention-daily[Daily backups]'
+                '--retention-weekly[Weekly backups]'
+                '--retention-monthly[Monthly backups]'
+                '--retention-yearly[Yearly backups]'
+                '--health-check[Check before]'
+                '--health-check-after[Check after]'
+                '--no-health-check[Disable checks]'
+                '--notify[Notification channel]'
+                '--notify-on-error[Only on error]'
+                '--mask[Enable masking]'
+                '--mask-rules[Masking rules]:file:_files'
+                '--mask-tables[Tables to mask]'
+                '--stream[Stream mode]'
+                '--stream-buffer[Buffer size MB]'
+                '--sudo[Use sudo]'
+                '--parallel[Parallel jobs]'
+                '--continue-on-error[Continue on error]'
+                '--save[Save as job]'
+                '--batch[Run batch job]'
+                '--file[Dump file]:file:_files'
+                '--log[Log file]:file:_files'
+                '--log-level[Log level]:level:(debug info warn error)'
+                {-v,--verbose}'[Verbose output]'
+                {-q,--quiet}'[Quiet output]'
+                {-y,--yes}'[Skip confirmations]'
+                {-f,--force}'[Force overwrite]'
+                '--dry-run[Dry run]'
+                '--no-meta[No meta files]'
+                {-h,--help}'[Show help]'
+                '--version[Show version]'
+            )
+            _describe -t options 'option' opts
+            # Also allow _arguments style completion
+            _arguments -s $opts
             ;;
     esac
 }
