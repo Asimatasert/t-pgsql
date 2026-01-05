@@ -1035,7 +1035,9 @@ cmd_dump() {
 
     if [ "$FROM_TYPE" = "ssh" ]; then
         log_info "Dumping via SSH..."
-        local remote_file="/tmp/${FROM_DATABASE}_${ts}.dump"
+        local remote_dump_dir="/tmp/t-pgsql"
+        ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "mkdir -p '$remote_dump_dir'"
+        local remote_file="${remote_dump_dir}/${FROM_DATABASE}_${ts}.dump"
 
         local cmd=""
         if [ "$SUDO" = true ]; then
@@ -1063,7 +1065,7 @@ cmd_dump() {
                 ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "rm -f '$remote_file'"
             elif [ "$FROM_KEEP" -gt 0 ]; then
                 log_info "Keeping last $FROM_KEEP dump(s) on source..."
-                local cleanup_cmd="cd /tmp && ls -t ${FROM_DATABASE}_*.dump 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
+                local cleanup_cmd="cd /tmp/t-pgsql && ls -t ${FROM_DATABASE}_*.dump 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
                 ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
             else
                 log_info "Keeping source dump (--from-keep -1)"
@@ -1254,7 +1256,8 @@ restore_local() {
 
 restore_ssh() {
     local dump="$1"
-    local remote="/tmp/$(basename $dump)"
+    ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "mkdir -p /tmp/t-pgsql"
+    local remote="/tmp/t-pgsql/$(basename $dump)"
 
     # Check if DB exists on remote
     local check_cmd="PGPASSWORD='$TO_DB_PASSWORD' psql -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -tAc \"SELECT 1 FROM pg_database WHERE datname='$TO_DATABASE'\" postgres 2>/dev/null"
@@ -1317,20 +1320,20 @@ cmd_fetch() {
             # Glob pattern - find latest matching
             log_info "Finding latest match for: $FROM_FILE"
             remote_file=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-                "ls -t /tmp/$FROM_FILE 2>/dev/null | head -1")
+                "ls -t /tmp/t-pgsql/$FROM_FILE 2>/dev/null | head -1")
         else
             # Exact filename - check if it has path
             if [[ "$FROM_FILE" == /* ]]; then
                 remote_file="$FROM_FILE"
             else
-                remote_file="/tmp/$FROM_FILE"
+                remote_file="/tmp/t-pgsql/$FROM_FILE"
             fi
         fi
     else
         # Auto-find latest dump for database (--from-file or --from-file latest)
         log_info "Finding latest dump for: $FROM_DATABASE"
         remote_file=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-            "ls -t /tmp/${FROM_DATABASE}_*.dump 2>/dev/null | head -1")
+            "ls -t /tmp/t-pgsql/${FROM_DATABASE}_*.dump 2>/dev/null | head -1")
     fi
 
     if [ -z "$remote_file" ]; then
