@@ -628,7 +628,7 @@ PASSWORD:
 FILTER:
     --exclude-table <t1,t2>       Exclude tables
     --exclude-schema <s1,s2>      Exclude schemas
-    --exclude-data <t1,t2>        Exclude data only (keep structure)
+    --exclude-data <t1,t2>        Exclude data only (keep structure, supports schema.* wildcard)
     --only-table <t1,t2>          Include only these tables
     --only-schema <s1,s2>         Include only these schemas
 
@@ -1027,7 +1027,24 @@ cmd_dump() {
     if [ -n "$EXCLUDE_DATA" ]; then
         IFS=',' read -ra arr <<< "$EXCLUDE_DATA"
         for t in "${arr[@]}"; do
-            exclude_opts="$exclude_opts --exclude-table-data='$(echo $t | xargs)'"
+            t=$(echo $t | xargs)
+            # Check for wildcard pattern (e.g., "public.*" or "audit.*")
+            if [[ "$t" == *".*" ]]; then
+                local schema_name="${t%.*}"
+                log_info "Expanding wildcard: $t"
+                local tables=""
+                if [ "$FROM_TYPE" = "ssh" ]; then
+                    tables=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+                        "PGPASSWORD='$FROM_DB_PASSWORD' psql -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -d $FROM_DATABASE -tAc \"SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$schema_name'\"")
+                else
+                    tables=$(PGPASSWORD="$FROM_DB_PASSWORD" psql -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -d $FROM_DATABASE -tAc "SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$schema_name'")
+                fi
+                for tbl in $tables; do
+                    exclude_opts="$exclude_opts --exclude-table-data='$tbl'"
+                done
+            else
+                exclude_opts="$exclude_opts --exclude-table-data='$t'"
+            fi
         done
     fi
 
