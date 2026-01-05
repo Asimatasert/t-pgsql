@@ -1515,6 +1515,258 @@ cmd_clean() {
 # ==============================================================================
 # BATCH SYSTEM
 # ==============================================================================
+
+# Get a value from YAML file using awk
+# Usage: get_yaml_value "file" "section" "key"
+get_yaml_value() {
+    local file="$1"
+    local section="$2"
+    local key="$3"
+
+    awk -v section="$section" -v key="$key" '
+    BEGIN { in_section=0; indent=0 }
+    /^[a-zA-Z0-9_-]+:/ {
+        if ($1 == section":") { in_section=1; indent=0 }
+        else if (in_section && indent==0) { in_section=0 }
+    }
+    in_section && $1 == key":" {
+        gsub(/^[^:]+: */, "")
+        gsub(/^["'\'']|["'\'']$/, "")
+        print
+        exit
+    }
+    ' "$file"
+}
+
+# Get profile configuration from jobs.yaml
+# Usage: get_profile "profile_name" "key"
+get_profile_value() {
+    local profile="$1"
+    local key="$2"
+
+    awk -v profile="$profile" -v key="$key" '
+    BEGIN { in_profiles=0; in_profile=0; base_indent=0 }
+    /^profiles:/ { in_profiles=1; next }
+    /^[a-zA-Z]/ && !/^profiles:/ { in_profiles=0; in_profile=0 }
+    in_profiles && /^  [a-zA-Z0-9_-]+:/ {
+        gsub(/:.*/, "", $1)
+        if ($1 == profile) { in_profile=1 }
+        else { in_profile=0 }
+        next
+    }
+    in_profile && /^    [a-zA-Z0-9_-]+:/ {
+        gsub(/^ +/, "")
+        if ($1 == key":") {
+            gsub(/^[^:]+: */, "")
+            gsub(/^["'\'']|["'\'']$/, "")
+            print
+            exit
+        }
+    }
+    ' "$JOBS_FILE"
+}
+
+# Get job field value (supports nested fields like from.database)
+# Usage: get_job_field "job_name" "field" [subfield]
+get_job_field() {
+    local job="$1"
+    local field="$2"
+    local subfield="$3"
+
+    if [ -n "$subfield" ]; then
+        # Nested field (e.g., from.database)
+        awk -v job="$job" -v field="$field" -v subfield="$subfield" '
+        BEGIN { in_job=0; in_field=0 }
+        /^  [a-zA-Z0-9_-]+:/ {
+            gsub(/:.*/, "", $1)
+            if ($1 == job) { in_job=1 } else { in_job=0; in_field=0 }
+            next
+        }
+        in_job && /^    [a-zA-Z0-9_-]+:/ {
+            gsub(/^ +/, "")
+            current_field=$1; gsub(/:.*/, "", current_field)
+            if (current_field == field) {
+                # Check if value is on same line (string format)
+                val=$0; gsub(/^[^:]+: */, "", val)
+                if (val != "" && val !~ /^$/) {
+                    # Its a string value, not nested
+                    if (subfield == "_value_") {
+                        gsub(/^["'\'']|["'\'']$/, "", val)
+                        print val
+                        exit
+                    }
+                }
+                in_field=1
+            } else { in_field=0 }
+            next
+        }
+        in_job && in_field && /^      [a-zA-Z0-9_-]+:/ {
+            gsub(/^ +/, "")
+            if ($1 == subfield":") {
+                gsub(/^[^:]+: */, "")
+                gsub(/^["'\'']|["'\'']$/, "")
+                print
+                exit
+            }
+        }
+        ' "$JOBS_FILE"
+    else
+        # Simple field
+        awk -v job="$job" -v field="$field" '
+        BEGIN { in_job=0 }
+        /^  [a-zA-Z0-9_-]+:/ {
+            gsub(/:.*/, "", $1)
+            if ($1 == job) { in_job=1 } else { in_job=0 }
+            next
+        }
+        in_job && /^    [a-zA-Z0-9_-]+:/ {
+            gsub(/^ +/, "")
+            if ($1 == field":") {
+                gsub(/^[^:]+: */, "")
+                gsub(/^["'\'']|["'\'']$/, "")
+                print
+                exit
+            }
+        }
+        ' "$JOBS_FILE"
+    fi
+}
+
+# Build connection string from profile or inline config
+# Usage: build_connection "job_name" "from|to"
+build_connection() {
+    local job="$1"
+    local direction="$2"  # from or to
+
+    # First check if it's a simple string value
+    local conn_string=$(get_job_field "$job" "$direction" "_value_")
+    if [ -n "$conn_string" ]; then
+        echo "$conn_string"
+        return
+    fi
+
+    # Check for profile reference
+    local profile=$(get_job_field "$job" "$direction" "profile")
+
+    local type="" ssh_user="" ssh_host="" ssh_port=""
+    local db_user="" db_host="" db_port="" database=""
+
+    if [ -n "$profile" ]; then
+        # Load from profile
+        type=$(get_profile_value "$profile" "type")
+        ssh_user=$(get_profile_value "$profile" "ssh_user")
+        ssh_host=$(get_profile_value "$profile" "ssh_host")
+        ssh_port=$(get_profile_value "$profile" "ssh_port")
+        db_user=$(get_profile_value "$profile" "db_user")
+        db_host=$(get_profile_value "$profile" "db_host")
+        db_port=$(get_profile_value "$profile" "db_port")
+    fi
+
+    # Override with job-specific values
+    [ -n "$(get_job_field "$job" "$direction" "type")" ] && type=$(get_job_field "$job" "$direction" "type")
+    [ -n "$(get_job_field "$job" "$direction" "ssh_user")" ] && ssh_user=$(get_job_field "$job" "$direction" "ssh_user")
+    [ -n "$(get_job_field "$job" "$direction" "ssh_host")" ] && ssh_host=$(get_job_field "$job" "$direction" "ssh_host")
+    [ -n "$(get_job_field "$job" "$direction" "ssh_port")" ] && ssh_port=$(get_job_field "$job" "$direction" "ssh_port")
+    [ -n "$(get_job_field "$job" "$direction" "db_user")" ] && db_user=$(get_job_field "$job" "$direction" "db_user")
+    [ -n "$(get_job_field "$job" "$direction" "db_host")" ] && db_host=$(get_job_field "$job" "$direction" "db_host")
+    [ -n "$(get_job_field "$job" "$direction" "db_port")" ] && db_port=$(get_job_field "$job" "$direction" "db_port")
+    [ -n "$(get_job_field "$job" "$direction" "database")" ] && database=$(get_job_field "$job" "$direction" "database")
+
+    # Set defaults
+    [ -z "$db_user" ] && db_user="postgres"
+    [ -z "$db_host" ] && db_host="localhost"
+    [ -z "$db_port" ] && db_port="5432"
+    [ -z "$ssh_port" ] && ssh_port="22"
+
+    # Build connection string
+    if [ "$type" = "ssh" ]; then
+        local conn="ssh://"
+        conn+="${ssh_user}@${ssh_host}"
+        [ "$ssh_port" != "22" ] && conn+=":${ssh_port}"
+        conn+="/${db_user}@${db_host}"
+        [ "$db_port" != "5432" ] && conn+=":${db_port}"
+        conn+="/${database}"
+        echo "$conn"
+    else
+        # Local connection
+        local conn="${db_user}@${db_host}"
+        [ "$db_port" != "5432" ] && conn+=":${db_port}"
+        conn+="/${database}"
+        echo "$conn"
+    fi
+}
+
+# Get password file from profile or job config
+get_password_file() {
+    local job="$1"
+    local direction="$2"
+
+    # Check job-level password file first
+    local pw_file=$(get_job_field "$job" "${direction}_password_file")
+    if [ -n "$pw_file" ]; then
+        # Expand ~ to home directory
+        echo "${pw_file/#\~/$HOME}"
+        return
+    fi
+
+    # Check inside direction block
+    pw_file=$(get_job_field "$job" "$direction" "password_file")
+    if [ -n "$pw_file" ]; then
+        echo "${pw_file/#\~/$HOME}"
+        return
+    fi
+
+    # Check profile
+    local profile=$(get_job_field "$job" "$direction" "profile")
+    if [ -n "$profile" ]; then
+        pw_file=$(get_profile_value "$profile" "password_file")
+        if [ -n "$pw_file" ]; then
+            echo "${pw_file/#\~/$HOME}"
+            return
+        fi
+    fi
+}
+
+# Parse job and build command arguments
+# Usage: parse_job_to_args "job_name"
+parse_job_to_args() {
+    local job="$1"
+    local args=""
+
+    # Check if job has old-style args
+    local old_args=$(get_job_field "$job" "args")
+    if [ -n "$old_args" ]; then
+        echo "$old_args"
+        return
+    fi
+
+    # Build from new format
+    local from_conn=$(build_connection "$job" "from")
+    local to_conn=$(build_connection "$job" "to")
+
+    [ -n "$from_conn" ] && args+=" --from '$from_conn'"
+    [ -n "$to_conn" ] && args+=" --to '$to_conn'"
+
+    # Password files
+    local from_pw=$(get_password_file "$job" "from")
+    local to_pw=$(get_password_file "$job" "to")
+
+    [ -n "$from_pw" ] && args+=" --from-password-file '$from_pw'"
+    [ -n "$to_pw" ] && args+=" --to-password-file '$to_pw'"
+
+    # Options
+    [ "$(get_job_field "$job" "force")" = "true" ] && args+=" --force"
+    [ "$(get_job_field "$job" "verbose")" = "true" ] && args+=" --verbose"
+    [ -n "$(get_job_field "$job" "output")" ] && args+=" --output '$(get_job_field "$job" "output")'"
+    [ -n "$(get_job_field "$job" "from_keep")" ] && args+=" --from-keep $(get_job_field "$job" "from_keep")"
+    [ -n "$(get_job_field "$job" "keep")" ] && args+=" --keep $(get_job_field "$job" "keep")"
+    [ -n "$(get_job_field "$job" "exclude_table")" ] && args+=" --exclude-table '$(get_job_field "$job" "exclude_table")'"
+    [ -n "$(get_job_field "$job" "exclude_data")" ] && args+=" --exclude-data '$(get_job_field "$job" "exclude_data")'"
+    [ -n "$(get_job_field "$job" "exclude_schema")" ] && args+=" --exclude-schema '$(get_job_field "$job" "exclude_schema")'"
+
+    echo "$args"
+}
+
 save_job() {
     local job_name="$1"
     shift
@@ -1591,7 +1843,16 @@ list_jobs() {
     echo ""
     echo "Available jobs:"
     echo "==============="
-    grep "^  [a-zA-Z0-9_-]*:" "$JOBS_FILE" | sed 's/://g; s/^  //' | while read -r job; do
+    # Only list jobs under the 'jobs:' section
+    awk '
+    /^jobs:/ { in_jobs=1; next }
+    /^[a-zA-Z]/ && !/^jobs:/ { in_jobs=0 }
+    in_jobs && /^  [a-zA-Z0-9_-]+:/ {
+        gsub(/^ +/, "")
+        gsub(/:.*/, "")
+        print
+    }
+    ' "$JOBS_FILE" | while read -r job; do
         if [[ "$job" == *"-to-local"* ]]; then
             echo -e "  • ${MAGENTA}${job}${NC}"
         elif [[ "$job" == *"-to-30"* ]]; then
@@ -1619,21 +1880,14 @@ show_job() {
     fi
 
     # Check if job exists
-    if ! grep -q "^  $job_name:" "$JOBS_FILE" 2>/dev/null; then
+    local job_cmd=$(get_job_field "$job_name" "command")
+    if [ -z "$job_cmd" ]; then
         log_error "Job not found: $job_name"
         return 1
     fi
 
-    # Extract and display job info
-    local job_cmd=$(awk -v name="$job_name" '
-        /^  [a-zA-Z0-9_-]+:/ { current = $1; gsub(/:/, "", current) }
-        current == name && /command:/ { gsub(/.*command: */, ""); print; exit }
-    ' "$JOBS_FILE")
-
-    local job_args=$(awk -v name="$job_name" '
-        /^  [a-zA-Z0-9_-]+:/ { current = $1; gsub(/:/, "", current) }
-        current == name && /args:/ { gsub(/.*args: *"?/, ""); gsub(/"$/, ""); print; exit }
-    ' "$JOBS_FILE")
+    # Parse job args (supports both old and new format)
+    local job_args=$(parse_job_to_args "$job_name")
 
     echo ""
     echo -e "Job: ${BOLD}$job_name${NC}"
@@ -1694,21 +1948,16 @@ run_job() {
         return 1
     fi
 
-    # Extract job info using awk
-    local job_cmd=$(awk -v name="$job_name" '
-        /^  [a-zA-Z0-9_-]+:/ { current = $1; gsub(/:/, "", current) }
-        current == name && /command:/ { gsub(/.*command: */, ""); print; exit }
-    ' "$JOBS_FILE")
-
-    local job_args=$(awk -v name="$job_name" '
-        /^  [a-zA-Z0-9_-]+:/ { current = $1; gsub(/:/, "", current) }
-        current == name && /args:/ { gsub(/.*args:/, ""); print; exit }
-    ' "$JOBS_FILE")
+    # Extract command
+    local job_cmd=$(get_job_field "$job_name" "command")
 
     if [ -z "$job_cmd" ]; then
         log_error "Job not found: $job_name"
         return 1
     fi
+
+    # Parse job args (supports both old and new format)
+    local job_args=$(parse_job_to_args "$job_name")
 
     log_info "Running job: $job_name"
     log_debug "Command: $job_cmd $job_args"
@@ -1730,7 +1979,15 @@ cmd_batch() {
         local jobs_array=()
         while IFS= read -r job; do
             jobs_array+=("$job")
-        done < <(grep "^  [a-zA-Z0-9_-]*:" "$JOBS_FILE" | sed 's/://g; s/^  //')
+        done < <(awk '
+            /^jobs:/ { in_jobs=1; next }
+            /^[a-zA-Z]/ && !/^jobs:/ { in_jobs=0 }
+            in_jobs && /^  [a-zA-Z0-9_-]+:/ {
+                gsub(/^ +/, "")
+                gsub(/:.*/, "")
+                print
+            }
+        ' "$JOBS_FILE")
 
         if [ ${#jobs_array[@]} -eq 0 ]; then
             log_warn "No jobs found"
@@ -1791,7 +2048,15 @@ cmd_batch() {
         log_info "Running all jobs..."
         echo ""
 
-        local jobs=$(grep "^  [a-zA-Z0-9_-]*:" "$JOBS_FILE" | sed 's/://g; s/^  //')
+        local jobs=$(awk '
+            /^jobs:/ { in_jobs=1; next }
+            /^[a-zA-Z]/ && !/^jobs:/ { in_jobs=0 }
+            in_jobs && /^  [a-zA-Z0-9_-]+:/ {
+                gsub(/^ +/, "")
+                gsub(/:.*/, "")
+                print
+            }
+        ' "$JOBS_FILE")
         local total=$(echo "$jobs" | wc -l | tr -d ' ')
         local current=0
         local failed=0

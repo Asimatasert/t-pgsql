@@ -233,6 +233,52 @@ ssh://[ssh_user@]ssh_host[:ssh_port]/[db_user@]db_host[:db_port]/database
 ./t-pgsql --batch all --continue-on-error
 ```
 
+### Формат jobs.yaml
+
+t-pgsql поддерживает три формата задач: на основе профилей, строка подключения и legacy args.
+
+#### Формат на основе профилей (Рекомендуется)
+
+```yaml
+# Профили - переиспользуемые конфигурации подключения
+profiles:
+  production:
+    type: ssh
+    ssh_user: deploy
+    ssh_host: prod.example.com
+    db_user: postgres
+    password_file: ~/.secrets/prod.pass
+
+  local:
+    type: local
+    db_user: postgres
+    password_file: ~/.secrets/local.pass
+
+# Задачи с использованием профилей
+jobs:
+  prod-to-local:
+    command: clone
+    from:
+      profile: production
+      database: myapp
+    to:
+      profile: local
+      database: myapp_dev
+    force: true
+    exclude_data: "audit.*,logs"
+```
+
+#### Формат строки подключения
+
+```yaml
+jobs:
+  quick-backup:
+    command: dump
+    from: ssh://user@server/postgres@localhost/mydb
+    from_password_file: ~/.secrets/prod.pass
+    keep: 7
+```
+
 ---
 
 ## Управление паролями

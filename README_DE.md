@@ -233,6 +233,52 @@ Speichern Sie wiederholte Operationen und führen Sie sie mit einem einzigen Bef
 ./t-pgsql --batch all --continue-on-error
 ```
 
+### jobs.yaml Format
+
+t-pgsql unterstützt drei Job-Formate: profilbasiert, Verbindungsstring und Legacy-Args.
+
+#### Profilbasiertes Format (Empfohlen)
+
+```yaml
+# Profile - wiederverwendbare Verbindungskonfigurationen
+profiles:
+  produktion:
+    type: ssh
+    ssh_user: deploy
+    ssh_host: prod.example.com
+    db_user: postgres
+    password_file: ~/.secrets/prod.pass
+
+  lokal:
+    type: local
+    db_user: postgres
+    password_file: ~/.secrets/local.pass
+
+# Jobs mit Profilen
+jobs:
+  prod-zu-lokal:
+    command: clone
+    from:
+      profile: produktion
+      database: myapp
+    to:
+      profile: lokal
+      database: myapp_dev
+    force: true
+    exclude_data: "audit.*,logs"
+```
+
+#### Verbindungsstring-Format
+
+```yaml
+jobs:
+  schnell-backup:
+    command: dump
+    from: ssh://user@server/postgres@localhost/mydb
+    from_password_file: ~/.secrets/prod.pass
+    keep: 7
+```
+
 ---
 
 ## Passwortverwaltung

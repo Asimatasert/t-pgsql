@@ -233,6 +233,52 @@ Guarda operaciones repetitivas y ejecútalas con un solo comando.
 ./t-pgsql --batch all --continue-on-error
 ```
 
+### Formato jobs.yaml
+
+t-pgsql soporta tres formatos de trabajo: basado en perfiles, cadena de conexión y args legacy.
+
+#### Formato Basado en Perfiles (Recomendado)
+
+```yaml
+# Perfiles - configuraciones de conexión reutilizables
+profiles:
+  produccion:
+    type: ssh
+    ssh_user: deploy
+    ssh_host: prod.example.com
+    db_user: postgres
+    password_file: ~/.secrets/prod.pass
+
+  local:
+    type: local
+    db_user: postgres
+    password_file: ~/.secrets/local.pass
+
+# Trabajos usando perfiles
+jobs:
+  prod-a-local:
+    command: clone
+    from:
+      profile: produccion
+      database: myapp
+    to:
+      profile: local
+      database: myapp_dev
+    force: true
+    exclude_data: "audit.*,logs"
+```
+
+#### Formato Cadena de Conexión
+
+```yaml
+jobs:
+  backup-rapido:
+    command: dump
+    from: ssh://user@server/postgres@localhost/mydb
+    from_password_file: ~/.secrets/prod.pass
+    keep: 7
+```
+
 ---
 
 ## Gestión de Contraseñas

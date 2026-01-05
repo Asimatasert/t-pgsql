@@ -378,16 +378,82 @@ Save any command with `--save <name>`:
 
 ### jobs.yaml Format
 
+t-pgsql supports three job formats: profile-based, connection string, and legacy args.
+
+#### Profile-Based Format (Recommended)
+
+Define reusable connection profiles to reduce repetition:
+
+```yaml
+# Profiles - reusable connection configurations
+profiles:
+  production:
+    type: ssh
+    ssh_user: deploy
+    ssh_host: prod.example.com
+    db_user: postgres
+    db_host: localhost
+    db_port: 5432
+    password_file: ~/.secrets/prod.pass
+
+  local:
+    type: local
+    db_user: postgres
+    db_host: localhost
+    password_file: ~/.secrets/local.pass
+
+# Jobs using profiles
+jobs:
+  prod-to-local:
+    command: clone
+    from:
+      profile: production
+      database: myapp
+    to:
+      profile: local
+      database: myapp_dev
+    force: true
+    from_keep: 1
+    exclude_data: "audit.*,logs"
+```
+
+#### Connection String Format
+
+Use direct connection strings for simpler jobs:
+
 ```yaml
 jobs:
-  rftt_sync:
-    command: clone
-    args: --from 'ssh://awesome@192.168.1.31/postgres@localhost/rftt-template' --to 'asimatasert@localhost/test123' --force
-
-  daily_backup:
+  quick-backup:
     command: dump
-    args: --from 'postgres@localhost/prod' --output './dumps' --keep 7
+    from: ssh://user@server/postgres@localhost/mydb
+    from_password_file: ~/.secrets/prod.pass
+    output: ./dumps
+    keep: 7
 ```
+
+#### Legacy Args Format (Backward Compatible)
+
+Old format still works for backward compatibility:
+
+```yaml
+jobs:
+  legacy_job:
+    command: clone
+    args: --from 'ssh://user@server/postgres@localhost/db' --to 'postgres@localhost/db' --force
+```
+
+#### Job Options
+
+| Option | Description |
+|--------|-------------|
+| `force` | Drop and recreate existing database |
+| `verbose` | Show detailed output |
+| `from_keep` | Number of dumps to keep on source |
+| `keep` | Number of local dumps to keep |
+| `output` | Output directory for dumps |
+| `exclude_table` | Tables to exclude completely |
+| `exclude_data` | Tables to exclude data only (supports `schema.*` wildcard) |
+| `exclude_schema` | Schemas to exclude |
 
 ---
 
@@ -547,7 +613,7 @@ When multiple password sources are available, t-pgsql uses this priority:
 |-----------|-------------|---------|----------|---------|
 | `--exclude-table <tables>` | Comma-separated tables to exclude | - | No | `logs,sessions,temp` |
 | `--exclude-schema <schemas>` | Comma-separated schemas to exclude | - | No | `audit,temp` |
-| `--exclude-data <tables>` | Exclude data but keep structure | - | No | `large_table,logs` |
+| `--exclude-data <tables>` | Exclude data but keep structure (supports `schema.*` wildcard) | - | No | `audit.*,logs` |
 | `--only-table <tables>` | Include only these tables | - | No | `users,orders` |
 | `--only-schema <schemas>` | Include only these schemas | - | No | `public,app` |
 
