@@ -1,3 +1,27 @@
+t-pgsql (3.4.0-1) unstable; urgency=medium
+
+  * New features:
+    - Streaming mode (--stream): Direct pipe clone without temp files
+    - Parallel batch execution (--parallel N)
+    - Job filtering (--only, --exclude)
+    - Batch summary notifications (--notify-summary)
+    - Config file support (--config)
+    - Health checks before operations (--health-check)
+    - GFS retention policy (--retention)
+    - Data masking after restore (--mask)
+  * Documentation updates
+  * Added Fish shell completion
+  * Added man page
+
+ -- Asim Atasert <asimatasert@outlook.com>  Mon, 06 Jan 2026 12:00:00 +0300
+
+t-pgsql (3.3.0-1) unstable; urgency=medium
+
+  * Added profile-based job configuration in jobs.yaml
+  * Enhanced exclude-data option to support schema.* wildcard
+
+ -- Asim Atasert <asimatasert@outlook.com>  Sat, 04 Jan 2026 12:00:00 +0300
+
 t-pgsql (1.0.0-1) unstable; urgency=medium
 
   * Initial release.
