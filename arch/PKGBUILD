@@ -13,7 +13,7 @@ optdepends=(
     'fish: for fish completion support'
 )
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('8fe43c12cde366afe992f74ac22877688aac7a81649424a251c94ffafbe0e9c4')
 
 package() {
     cd "${srcdir}/${pkgname}-${pkgver}"
