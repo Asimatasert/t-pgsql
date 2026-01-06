@@ -1,0 +1,230 @@
+.TH T-PGSQL 1 "January 2026" "t-pgsql 3.3.0" "User Commands"
+.SH NAME
+t-pgsql \- PostgreSQL database sync, backup and clone tool
+.SH SYNOPSIS
+.B t-pgsql
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B t-pgsql
+is a powerful tool for PostgreSQL database operations including backup, restore, clone, and sync between local and remote servers via SSH.
+.SH COMMANDS
+.TP
+.B dump
+Create a database backup (pg_dump)
+.TP
+.B restore
+Restore a backup to database (pg_restore)
+.TP
+.B clone
+Full sync: dump + restore in one operation
+.TP
+.B fetch
+Fetch existing dump file from remote server
+.TP
+.B batch
+Run multiple jobs from jobs.yaml
+.TP
+.B jobs
+Manage saved jobs (list, show, delete)
+.TP
+.B list
+List dump files in output directory
+.TP
+.B meta
+Show metadata for dump files
+.TP
+.B clean
+Clean old dump files
+.TP
+.B version
+Show version information
+.TP
+.B help
+Show help message
+.SH CONNECTION OPTIONS
+.TP
+.BR \-\-from " " \fIconnection\fR
+Source connection string. Format: [ssh://user@host/]dbuser@dbhost[:port]/database
+.TP
+.BR \-\-to " " \fIconnection\fR
+Target connection string. Same format as --from
+.TP
+.BR \-\-password " " \fIpassword\fR
+Database password (not recommended, use password-file)
+.TP
+.BR \-\-from\-password " " \fIpassword\fR
+Source database password
+.TP
+.BR \-\-to\-password " " \fIpassword\fR
+Target database password
+.TP
+.BR \-\-password\-file " " \fIfile\fR
+Read password from file
+.TP
+.BR \-\-from\-password\-file " " \fIfile\fR
+Read source password from file
+.TP
+.BR \-\-to\-password\-file " " \fIfile\fR
+Read target password from file
+.SH FILTERING OPTIONS
+.TP
+.BR \-\-exclude\-table " " \fItables\fR
+Exclude tables (comma-separated)
+.TP
+.BR \-\-exclude\-schema " " \fIschemas\fR
+Exclude schemas (comma-separated)
+.TP
+.BR \-\-exclude\-data " " \fItables\fR
+Exclude data only, keep structure. Supports schema.* wildcard (e.g., audit.*)
+.TP
+.BR \-\-only\-table " " \fItables\fR
+Only include these tables
+.TP
+.BR \-\-only\-schema " " \fIschemas\fR
+Only include these schemas
+.SH COMPRESSION OPTIONS
+.TP
+.BR \-\-compress " " \fItype\fR
+Compression type: gzip (default), zstd, xz, bzip2, none
+.TP
+.BR \-\-compress\-level " " \fI1-9\fR
+Compression level (default: 6)
+.TP
+.BR \-\-pg\-compress\-level " " \fI0-9\fR
+pg_dump internal compression level
+.SH STORAGE OPTIONS
+.TP
+.BR \-\-output " " \fIdirectory\fR
+Output directory for dumps
+.TP
+.BR \-\-keep " " \fIn\fR
+Keep last n local dumps
+.TP
+.BR \-\-from\-keep " " \fIn\fR
+Keep last n dumps on source server (0=delete all, -1=keep all)
+.SH RETENTION OPTIONS (GFS)
+.TP
+.B \-\-retention
+Enable Grandfather-Father-Son retention policy
+.TP
+.BR \-\-retention\-daily " " \fIn\fR
+Keep n daily backups (default: 7)
+.TP
+.BR \-\-retention\-weekly " " \fIn\fR
+Keep n weekly backups (default: 4)
+.TP
+.BR \-\-retention\-monthly " " \fIn\fR
+Keep n monthly backups (default: 12)
+.TP
+.BR \-\-retention\-yearly " " \fIn\fR
+Keep n yearly backups (default: 3)
+.SH NOTIFICATION OPTIONS
+.TP
+.BR \-\-notify " " \fIchannel\fR
+Send notifications (slack, telegram, discord, email, webhook)
+.TP
+.B \-\-notify\-on\-error
+Only send notifications on error
+.SH MASKING OPTIONS
+.TP
+.B \-\-mask
+Enable data masking
+.TP
+.BR \-\-mask\-rules " " \fIfile\fR
+Masking rules file
+.TP
+.BR \-\-mask\-tables " " \fItables\fR
+Tables to apply masking
+.SH OTHER OPTIONS
+.TP
+.B \-\-stream
+Enable streaming mode (direct pipe, no temp files)
+.TP
+.BR \-\-stream\-buffer " " \fIMB\fR
+Stream buffer size in MB
+.TP
+.B \-\-sudo
+Use sudo for database commands
+.TP
+.BR \-\-parallel " " \fIn\fR
+Number of parallel jobs for batch mode
+.TP
+.B \-\-continue\-on\-error
+Continue batch on error
+.TP
+.BR \-\-save " " \fIname\fR
+Save current command as a job
+.TP
+.BR \-\-batch " " \fIname\fR
+Run saved job(s). Use "all" for all jobs
+.TP
+.BR \-\-log " " \fIfile\fR
+Write logs to file
+.TP
+.BR \-\-log\-level " " \fIlevel\fR
+Log level: debug, info, warn, error
+.TP
+.BR \-v ", " \-\-verbose
+Verbose output
+.TP
+.BR \-q ", " \-\-quiet
+Quiet output
+.TP
+.BR \-y ", " \-\-yes
+Skip confirmations
+.TP
+.BR \-f ", " \-\-force
+Force overwrite target database
+.TP
+.B \-\-dry\-run
+Show what would be done without executing
+.TP
+.B \-\-no\-meta
+Disable metadata file generation
+.TP
+.BR \-h ", " \-\-help
+Show help message
+.TP
+.B \-\-version
+Show version
+.SH EXAMPLES
+.TP
+Backup local database:
+t-pgsql dump --from postgres@localhost/mydb --output ./dumps
+.TP
+Clone remote to local:
+t-pgsql clone --from 'ssh://admin@server/postgres@localhost/prod' --to postgres@localhost/dev --force
+.TP
+Clone with password files:
+t-pgsql clone --from 'ssh://admin@server/postgres@localhost/prod' --to postgres@localhost/dev --from-password-file ~/.secrets/prod.pass --to-password-file ~/.secrets/local.pass --force
+.TP
+Exclude tables data:
+t-pgsql clone --from postgres@localhost/prod --to postgres@localhost/dev --exclude-data "logs,sessions,audit.*" --force
+.TP
+Run batch job:
+t-pgsql --batch prod-to-dev
+.TP
+List jobs:
+t-pgsql jobs
+.SH FILES
+.TP
+.I ~/.config/t-pgsql/jobs.yaml
+User jobs configuration file
+.TP
+.I ./jobs.yaml
+Local jobs configuration file
+.SH ENVIRONMENT
+.TP
+.B PGPASSWORD
+PostgreSQL password (overridden by --password options)
+.SH SEE ALSO
+.BR pg_dump (1),
+.BR pg_restore (1),
+.BR psql (1)
+.SH AUTHOR
+Asim Atasert
+.SH BUGS
+Report bugs at: https://github.com/Asimatasert/t-pgsql/issues
+.SH COPYRIGHT
+MIT License - Copyright (c) 2026 Asim Atasert

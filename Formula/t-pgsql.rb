@@ -14,6 +14,9 @@ class TPgsql < Formula
 
   def install
     bin.install "t-pgsql"
+    zsh_completion.install "completions/_t-pgsql"
+    bash_completion.install "completions/t-pgsql.bash" => "t-pgsql"
+    man1.install "man/t-pgsql.1"
   end
 
   test do

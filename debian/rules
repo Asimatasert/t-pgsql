@@ -5,3 +5,6 @@
 
 override_dh_auto_install:
 	install -D -m 0755 t-pgsql $(DESTDIR)/usr/bin/t-pgsql
+	install -D -m 0644 completions/_t-pgsql $(DESTDIR)/usr/share/zsh/vendor-completions/_t-pgsql
+	install -D -m 0644 completions/t-pgsql.bash $(DESTDIR)/usr/share/bash-completion/completions/t-pgsql
+	install -D -m 0644 man/t-pgsql.1 $(DESTDIR)/usr/share/man/man1/t-pgsql.1
