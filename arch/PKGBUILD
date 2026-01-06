@@ -10,6 +10,7 @@ depends=('postgresql' 'curl' 'openssh' 'bash')
 optdepends=(
     'zsh: for zsh completion support'
     'bash-completion: for bash completion support'
+    'fish: for fish completion support'
 )
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('2ec8d0fc1d6f4eb20e0cd68fb91459957c184a8b7fb959b923a6016d7b887ad3')
@@ -25,6 +26,9 @@ package() {
 
     # Install bash completion
     install -Dm644 completions/t-pgsql.bash "${pkgdir}/usr/share/bash-completion/completions/t-pgsql"
+
+    # Install fish completion
+    install -Dm644 completions/t-pgsql.fish "${pkgdir}/usr/share/fish/vendor_completions.d/t-pgsql.fish"
 
     # Install man page
     install -Dm644 man/t-pgsql.1 "${pkgdir}/usr/share/man/man1/t-pgsql.1"

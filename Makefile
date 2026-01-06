@@ -2,23 +2,39 @@
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
+MANDIR ?= $(PREFIX)/share/man/man1
+ZSHDIR ?= $(PREFIX)/share/zsh/site-functions
+BASHDIR ?= $(PREFIX)/share/bash-completion/completions
+FISHDIR ?= $(PREFIX)/share/fish/vendor_completions.d
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo "1.0.0")
 
-.PHONY: all install uninstall deb homebrew-tap release clean help
+.PHONY: all install uninstall install-completions uninstall-completions deb homebrew-tap release clean help
 
 all: help
 
-## install: Install t-pgsql to system
+## install: Install t-pgsql to system (with completions and man page)
 install:
 	@echo "Installing t-pgsql to $(BINDIR)..."
 	@install -d $(BINDIR)
 	@install -m 0755 t-pgsql $(BINDIR)/t-pgsql
+	@echo "Installing man page..."
+	@install -d $(MANDIR)
+	@install -m 0644 man/t-pgsql.1 $(MANDIR)/t-pgsql.1
+	@echo "Installing shell completions..."
+	@install -d $(ZSHDIR) $(BASHDIR) $(FISHDIR)
+	@install -m 0644 completions/_t-pgsql $(ZSHDIR)/_t-pgsql
+	@install -m 0644 completions/t-pgsql.bash $(BASHDIR)/t-pgsql
+	@install -m 0644 completions/t-pgsql.fish $(FISHDIR)/t-pgsql.fish
 	@echo "Done! Run 't-pgsql --help' to get started."
 
 ## uninstall: Remove t-pgsql from system
 uninstall:
 	@echo "Removing t-pgsql from $(BINDIR)..."
 	@rm -f $(BINDIR)/t-pgsql
+	@rm -f $(MANDIR)/t-pgsql.1
+	@rm -f $(ZSHDIR)/_t-pgsql
+	@rm -f $(BASHDIR)/t-pgsql
+	@rm -f $(FISHDIR)/t-pgsql.fish
 	@echo "Done!"
 
 ## deb: Build Debian package

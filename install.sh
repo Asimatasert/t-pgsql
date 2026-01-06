@@ -3,12 +3,22 @@
 # t-pgsql installer
 # Usage: curl -fsSL https://raw.githubusercontent.com/Asimatasert/t-pgsql/master/install.sh | bash
 #
+# Options:
+#   INSTALL_DIR=/path    - Installation directory (default: /usr/local/bin)
+#   VERSION=v3.3.0       - Specific version (default: latest)
+#   SKIP_COMPLETIONS=1   - Skip completion installation
+#
 
 set -e
 
 REPO="Asimatasert/t-pgsql"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 VERSION="${VERSION:-latest}"
+SKIP_COMPLETIONS="${SKIP_COMPLETIONS:-0}"
+MANDIR="/usr/local/share/man/man1"
+ZSHDIR="/usr/local/share/zsh/site-functions"
+BASHDIR="/usr/local/share/bash-completion/completions"
+FISHDIR="/usr/local/share/fish/vendor_completions.d"
 
 # Colors
 RED='\033[0;31m'
@@ -97,11 +107,84 @@ main() {
         warn "Make sure $INSTALL_DIR is in your PATH"
     fi
 
+    # Install completions and man page
+    if [[ "$SKIP_COMPLETIONS" != "1" ]]; then
+        install_extras
+    fi
+
     # Check dependencies
     check_deps
 
     echo ""
     info "Usage: t-pgsql --help"
+    info "Man page: man t-pgsql"
+}
+
+# Install completions and man page
+install_extras() {
+    info "Installing shell completions and man page..."
+
+    RAW_URL="https://raw.githubusercontent.com/${REPO}/${VERSION}"
+
+    # Man page
+    if [[ -d "$(dirname $MANDIR)" ]]; then
+        info "Installing man page..."
+        curl -fsSL "$RAW_URL/man/t-pgsql.1" -o "$TMP_DIR/t-pgsql.1" 2>/dev/null || true
+        if [[ -f "$TMP_DIR/t-pgsql.1" ]]; then
+            if [[ -w "$MANDIR" ]] 2>/dev/null; then
+                mkdir -p "$MANDIR"
+                mv "$TMP_DIR/t-pgsql.1" "$MANDIR/t-pgsql.1"
+            else
+                sudo mkdir -p "$MANDIR"
+                sudo mv "$TMP_DIR/t-pgsql.1" "$MANDIR/t-pgsql.1"
+            fi
+        fi
+    fi
+
+    # Zsh completion
+    if command -v zsh >/dev/null 2>&1; then
+        info "Installing zsh completion..."
+        curl -fsSL "$RAW_URL/completions/_t-pgsql" -o "$TMP_DIR/_t-pgsql" 2>/dev/null || true
+        if [[ -f "$TMP_DIR/_t-pgsql" ]]; then
+            if [[ -w "$ZSHDIR" ]] 2>/dev/null; then
+                mkdir -p "$ZSHDIR"
+                mv "$TMP_DIR/_t-pgsql" "$ZSHDIR/_t-pgsql"
+            else
+                sudo mkdir -p "$ZSHDIR"
+                sudo mv "$TMP_DIR/_t-pgsql" "$ZSHDIR/_t-pgsql"
+            fi
+        fi
+    fi
+
+    # Bash completion
+    if command -v bash >/dev/null 2>&1; then
+        info "Installing bash completion..."
+        curl -fsSL "$RAW_URL/completions/t-pgsql.bash" -o "$TMP_DIR/t-pgsql.bash" 2>/dev/null || true
+        if [[ -f "$TMP_DIR/t-pgsql.bash" ]]; then
+            if [[ -w "$BASHDIR" ]] 2>/dev/null; then
+                mkdir -p "$BASHDIR"
+                mv "$TMP_DIR/t-pgsql.bash" "$BASHDIR/t-pgsql"
+            else
+                sudo mkdir -p "$BASHDIR"
+                sudo mv "$TMP_DIR/t-pgsql.bash" "$BASHDIR/t-pgsql"
+            fi
+        fi
+    fi
+
+    # Fish completion
+    if command -v fish >/dev/null 2>&1; then
+        info "Installing fish completion..."
+        curl -fsSL "$RAW_URL/completions/t-pgsql.fish" -o "$TMP_DIR/t-pgsql.fish" 2>/dev/null || true
+        if [[ -f "$TMP_DIR/t-pgsql.fish" ]]; then
+            if [[ -w "$FISHDIR" ]] 2>/dev/null; then
+                mkdir -p "$FISHDIR"
+                mv "$TMP_DIR/t-pgsql.fish" "$FISHDIR/t-pgsql.fish"
+            else
+                sudo mkdir -p "$FISHDIR"
+                sudo mv "$TMP_DIR/t-pgsql.fish" "$FISHDIR/t-pgsql.fish"
+            fi
+        fi
+    fi
 }
 
 main "$@"

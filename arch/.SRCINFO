@@ -11,6 +11,7 @@ pkgbase = t-pgsql
 	depends = bash
 	optdepends = zsh: for zsh completion support
 	optdepends = bash-completion: for bash completion support
+	optdepends = fish: for fish completion support
 	source = t-pgsql-3.3.0.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v3.3.0.tar.gz
 	sha256sums = 2ec8d0fc1d6f4eb20e0cd68fb91459957c184a8b7fb959b923a6016d7b887ad3
 

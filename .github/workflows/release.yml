@@ -23,8 +23,16 @@ jobs:
         run: |
           mkdir -p build/deb/DEBIAN
           mkdir -p build/deb/usr/bin
+          mkdir -p build/deb/usr/share/man/man1
+          mkdir -p build/deb/usr/share/zsh/vendor-completions
+          mkdir -p build/deb/usr/share/bash-completion/completions
+          mkdir -p build/deb/usr/share/fish/vendor_completions.d
           cp t-pgsql build/deb/usr/bin/
           chmod 755 build/deb/usr/bin/t-pgsql
+          cp man/t-pgsql.1 build/deb/usr/share/man/man1/
+          cp completions/_t-pgsql build/deb/usr/share/zsh/vendor-completions/
+          cp completions/t-pgsql.bash build/deb/usr/share/bash-completion/completions/t-pgsql
+          cp completions/t-pgsql.fish build/deb/usr/share/fish/vendor_completions.d/
           cat > build/deb/DEBIAN/control << EOF
           Package: t-pgsql
           Version: ${{ steps.version.outputs.VERSION }}
@@ -41,10 +49,13 @@ jobs:
 
       - name: Create tarball
         run: |
-          mkdir -p dist
-          cp t-pgsql dist/
+          mkdir -p dist/t-pgsql-${{ steps.version.outputs.VERSION }}
+          cp t-pgsql dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
+          cp LICENSE dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
+          cp -r man dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
+          cp -r completions dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
           cd dist
-          tar -czf t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz t-pgsql
+          tar -czf t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz t-pgsql-${{ steps.version.outputs.VERSION }}
           sha256sum t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz > t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz.sha256
 
       - name: Create Release
