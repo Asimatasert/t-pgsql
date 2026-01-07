@@ -238,13 +238,14 @@ notify_telegram() {
     local timestamp="$5"
     local hostname="$6"
 
-    # Parse telegram:BOT_ID:BOT_SECRET:CHAT_ID
+    # Parse telegram:BOT_ID:BOT_SECRET:CHAT_ID or telegram:BOT_ID:BOT_SECRET:CHAT_ID:THREAD_ID
     # Token format: BOT_ID:BOT_SECRET (contains colon)
     local token=$(echo "$channel" | cut -d: -f2-3)
-    local chat_id=$(echo "$channel" | cut -d: -f4-)
+    local chat_id=$(echo "$channel" | cut -d: -f4)
+    local thread_id=$(echo "$channel" | cut -d: -f5)
 
     if [ -z "$token" ] || [ -z "$chat_id" ]; then
-        log_warn "Invalid Telegram config. Use: telegram:TOKEN:CHAT_ID"
+        log_warn "Invalid Telegram config. Use: telegram:TOKEN:CHAT_ID[:THREAD_ID]"
         return 1
     fi
 
@@ -253,11 +254,16 @@ notify_telegram() {
 ${details}
 🕐 ${timestamp}"
 
-    local response=$(curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${text}" \
-        -d "parse_mode=Markdown" \
-        -d "disable_web_page_preview=true" 2>&1)
+    local curl_args=(-s -X POST "https://api.telegram.org/bot${token}/sendMessage"
+        -d "chat_id=${chat_id}"
+        -d "text=${text}"
+        -d "parse_mode=Markdown"
+        -d "disable_web_page_preview=true")
+
+    # Add thread_id for forum topics
+    [ -n "$thread_id" ] && curl_args+=(-d "message_thread_id=${thread_id}")
+
+    local response=$(curl "${curl_args[@]}" 2>&1)
 
     if echo "$response" | grep -q '"ok":true'; then
         log_debug "Telegram notification sent"
@@ -477,7 +483,9 @@ EOF
 
     # Create tar.gz archive
     log_debug "Creating archive: $tar_file"
-    (cd "$dump_dir" && tar -czf "$(basename "$tar_file")" "$dump_name" "metadata.yaml")
+    local tar_files=("$dump_name")
+    [ -f "$meta_file" ] && tar_files+=("metadata.yaml")
+    (cd "$dump_dir" && tar -czf "$(basename "$tar_file")" "${tar_files[@]}" 2>/dev/null)
 
     if [ $? -eq 0 ]; then
         # Remove original files
@@ -506,8 +514,17 @@ meta_update_target() {
     tar -xzf "$tar_file" -C "$temp_dir" 2>/dev/null || { rm -rf "$temp_dir"; return 0; }
 
     # Find the dump file
-    local dump_name=$(ls "$temp_dir"/*.dump 2>/dev/null | head -1 | xargs basename)
+    local dump_name=$(ls "$temp_dir"/*.dump 2>/dev/null | head -1 | xargs basename 2>/dev/null)
     [ -z "$dump_name" ] && { rm -rf "$temp_dir"; return 0; }
+
+    # Create metadata.yaml if it doesn't exist
+    if [ ! -f "$temp_dir/metadata.yaml" ]; then
+        cat > "$temp_dir/metadata.yaml" << EOF
+# t-pgsql metadata (generated during restore)
+timing:
+  restored_at: "$(date '+%Y-%m-%d %H:%M:%S')"
+EOF
+    fi
 
     # Append target and restore info to metadata
     cat >> "$temp_dir/metadata.yaml" << EOF
@@ -526,7 +543,9 @@ restore:
 EOF
 
     # Recreate tar with updated metadata
-    (cd "$temp_dir" && tar -czf "$tar_file" "$dump_name" metadata.yaml 2>/dev/null)
+    local tar_args=("$dump_name")
+    [ -f "$temp_dir/metadata.yaml" ] && tar_args+=("metadata.yaml")
+    (cd "$temp_dir" && tar -czf "$tar_file" "${tar_args[@]}" 2>/dev/null)
 
     rm -rf "$temp_dir"
     log_debug "Metadata updated with target info"
@@ -675,6 +694,8 @@ STREAMING:
     --stream-buffer <MB>          Buffer size (default: 64)
 
 BATCH:
+    --yaml <name>                 Use <name>.yaml instead of jobs.yaml
+                                  Example: --yaml prod (uses prod.yaml)
     --parallel <N>                Parallel jobs (default: 1)
     --continue-on-error           Don't stop on error
     --only <jobs>                 Run only these jobs
@@ -1902,6 +1923,49 @@ get_yaml_value() {
     ' "$file"
 }
 
+# Get value from defaults section in jobs.yaml
+# Usage: get_default_value "key"
+get_default_value() {
+    local key="$1"
+
+    awk -v key="$key" '
+    BEGIN { in_defaults=0 }
+    /^defaults:/ { in_defaults=1; next }
+    /^[a-zA-Z]/ { if ($0 !~ /^defaults:/) in_defaults=0 }
+    in_defaults && /^  [a-zA-Z0-9_-]+:/ {
+        gsub(/^ +/, "")
+        if ($1 == key":") {
+            gsub(/^[^:]+: */, "")
+            gsub(/^["'\'']|["'\'']$/, "")
+            print
+            exit
+        }
+    }
+    ' "$JOBS_FILE"
+}
+
+# Get job field value, with fallback to defaults section
+# Usage: get_job_value "job_name" "field"
+get_job_value() {
+    local job="$1"
+    local field="$2"
+    local val=$(get_job_field "$job" "$field")
+    [ -z "$val" ] && val=$(get_default_value "$field")
+    echo "$val"
+}
+
+# Load batch defaults from jobs.yaml (parallel, continue_on_error)
+load_batch_defaults() {
+    [ ! -f "$JOBS_FILE" ] && return 0
+
+    local val
+    val=$(get_default_value "parallel")
+    [ -n "$val" ] && PARALLEL="$val" || true
+
+    val=$(get_default_value "continue_on_error")
+    [ "$val" = "true" ] && CONTINUE_ON_ERROR=true || true
+}
+
 # Get profile configuration from jobs.yaml
 # Usage: get_profile "profile_name" "key"
 get_profile_value() {
@@ -1911,7 +1975,7 @@ get_profile_value() {
     awk -v profile="$profile" -v key="$key" '
     BEGIN { in_profiles=0; in_profile=0; base_indent=0 }
     /^profiles:/ { in_profiles=1; next }
-    /^[a-zA-Z]/ && !/^profiles:/ { in_profiles=0; in_profile=0 }
+    /^[a-zA-Z]/ { if ($0 !~ /^profiles:/) { in_profiles=0; in_profile=0 } }
     in_profiles && /^  [a-zA-Z0-9_-]+:/ {
         gsub(/:.*/, "", $1)
         if ($1 == profile) { in_profile=1 }
@@ -2091,6 +2155,85 @@ get_password_file() {
     fi
 }
 
+# Get telegram notify config from defaults section
+# Usage: get_default_telegram_config
+get_default_telegram_config() {
+    awk '
+    BEGIN { in_defaults=0; in_notify=0; in_telegram=0; token=""; chat_id=""; thread_id="" }
+    /^defaults:/ { in_defaults=1; next }
+    /^[a-zA-Z]/ { if ($0 !~ /^defaults:/) { in_defaults=0; in_notify=0; in_telegram=0 } }
+    in_defaults && /^  notify:/ { in_notify=1; next }
+    in_defaults && /^  [a-zA-Z]/ { if ($0 !~ /^  notify:/) { in_notify=0; in_telegram=0 } }
+    in_notify && /^    telegram:/ { in_telegram=1; next }
+    in_notify && /^    [a-zA-Z]/ { if ($0 !~ /^    telegram:/) in_telegram=0 }
+    in_telegram && /^      token:/ {
+        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        token=val
+    }
+    in_telegram && /^      chat_id:/ {
+        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        chat_id=val
+    }
+    in_telegram && /^      message_thread_id:/ {
+        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        thread_id=val
+    }
+    END {
+        if (token != "" && chat_id != "") {
+            printf "telegram:%s:%s", token, chat_id
+            if (thread_id != "") printf ":%s", thread_id
+            print ""
+        }
+    }
+    ' "$JOBS_FILE"
+}
+
+# Get telegram notify config from job (3-level nested: notify.telegram.*)
+# Falls back to defaults if job doesn't have notify config
+# Usage: get_job_telegram_config "job_name"
+get_job_telegram_config() {
+    local job="$1"
+
+    local config=$(awk -v job="$job" '
+    BEGIN { in_job=0; in_notify=0; in_telegram=0; token=""; chat_id=""; thread_id="" }
+    /^  [a-zA-Z0-9_-]+:/ {
+        gsub(/:.*/, "", $1)
+        if ($1 == job) { in_job=1 } else { in_job=0; in_notify=0; in_telegram=0 }
+        next
+    }
+    in_job && /^    notify:/ { in_notify=1; next }
+    in_job && /^    [a-zA-Z]/ { if ($0 !~ /^    notify:/) { in_notify=0; in_telegram=0 } }
+    in_notify && /^      telegram:/ { in_telegram=1; next }
+    in_notify && /^      [a-zA-Z]/ { if ($0 !~ /^      telegram:/) in_telegram=0 }
+    in_telegram && /^        token:/ {
+        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        token=val
+    }
+    in_telegram && /^        chat_id:/ {
+        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        chat_id=val
+    }
+    in_telegram && /^        message_thread_id:/ {
+        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        thread_id=val
+    }
+    END {
+        if (token != "" && chat_id != "") {
+            printf "telegram:%s:%s", token, chat_id
+            if (thread_id != "") printf ":%s", thread_id
+            print ""
+        }
+    }
+    ' "$JOBS_FILE")
+
+    # Fallback to defaults if job doesn't have notify
+    if [ -z "$config" ]; then
+        config=$(get_default_telegram_config)
+    fi
+
+    echo "$config"
+}
+
 # Parse job and build command arguments
 # Usage: parse_job_to_args "job_name"
 parse_job_to_args() {
@@ -2118,15 +2261,19 @@ parse_job_to_args() {
     [ -n "$from_pw" ] && args+=" --from-password-file '$from_pw'"
     [ -n "$to_pw" ] && args+=" --to-password-file '$to_pw'"
 
-    # Options
-    [ "$(get_job_field "$job" "force")" = "true" ] && args+=" --force"
-    [ "$(get_job_field "$job" "verbose")" = "true" ] && args+=" --verbose"
-    [ -n "$(get_job_field "$job" "output")" ] && args+=" --output '$(get_job_field "$job" "output")'"
-    [ -n "$(get_job_field "$job" "from_keep")" ] && args+=" --from-keep $(get_job_field "$job" "from_keep")"
-    [ -n "$(get_job_field "$job" "keep")" ] && args+=" --keep $(get_job_field "$job" "keep")"
-    [ -n "$(get_job_field "$job" "exclude_table")" ] && args+=" --exclude-table '$(get_job_field "$job" "exclude_table")'"
-    [ -n "$(get_job_field "$job" "exclude_data")" ] && args+=" --exclude-data '$(get_job_field "$job" "exclude_data")'"
-    [ -n "$(get_job_field "$job" "exclude_schema")" ] && args+=" --exclude-schema '$(get_job_field "$job" "exclude_schema")'"
+    # Options (with defaults fallback)
+    [ "$(get_job_value "$job" "force")" = "true" ] && args+=" --force"
+    [ "$(get_job_value "$job" "verbose")" = "true" ] && args+=" --verbose"
+    [ -n "$(get_job_value "$job" "output")" ] && args+=" --output '$(get_job_value "$job" "output")'"
+    [ -n "$(get_job_value "$job" "from_keep")" ] && args+=" --from-keep $(get_job_value "$job" "from_keep")"
+    [ -n "$(get_job_value "$job" "keep")" ] && args+=" --keep $(get_job_value "$job" "keep")"
+    [ -n "$(get_job_value "$job" "exclude_table")" ] && args+=" --exclude-table '$(get_job_value "$job" "exclude_table")'"
+    [ -n "$(get_job_value "$job" "exclude_data")" ] && args+=" --exclude-data '$(get_job_value "$job" "exclude_data")'"
+    [ -n "$(get_job_value "$job" "exclude_schema")" ] && args+=" --exclude-schema '$(get_job_value "$job" "exclude_schema")'"
+
+    # Notify - telegram
+    local telegram_config=$(get_job_telegram_config "$job")
+    [ -n "$telegram_config" ] && args+=" --notify '$telegram_config'"
 
     echo "$args"
 }
@@ -2210,7 +2357,7 @@ list_jobs() {
     # Only list jobs under the 'jobs:' section
     awk '
     /^jobs:/ { in_jobs=1; next }
-    /^[a-zA-Z]/ && !/^jobs:/ { in_jobs=0 }
+    /^[a-zA-Z]/ { if ($0 !~ /^jobs:/) in_jobs=0 }
     in_jobs && /^  [a-zA-Z0-9_-]+:/ {
         gsub(/^ +/, "")
         gsub(/:.*/, "")
@@ -2333,6 +2480,9 @@ run_job() {
 cmd_batch() {
     local target="$1"
 
+    # Load defaults from jobs.yaml (parallel, continue_on_error)
+    load_batch_defaults
+
     if [ -z "$target" ]; then
         if [ ! -f "$JOBS_FILE" ]; then
             log_error "Jobs file not found: $JOBS_FILE"
@@ -2345,7 +2495,7 @@ cmd_batch() {
             jobs_array+=("$job")
         done < <(awk '
             /^jobs:/ { in_jobs=1; next }
-            /^[a-zA-Z]/ && !/^jobs:/ { in_jobs=0 }
+            /^[a-zA-Z]/ { if ($0 !~ /^jobs:/) in_jobs=0 }
             in_jobs && /^  [a-zA-Z0-9_-]+:/ {
                 gsub(/^ +/, "")
                 gsub(/:.*/, "")
@@ -2415,7 +2565,7 @@ cmd_batch() {
 
         local all_jobs=$(awk '
             /^jobs:/ { in_jobs=1; next }
-            /^[a-zA-Z]/ && !/^jobs:/ { in_jobs=0 }
+            /^[a-zA-Z]/ { if ($0 !~ /^jobs:/) in_jobs=0 }
             in_jobs && /^  [a-zA-Z0-9_-]+:/ {
                 gsub(/^ +/, "")
                 gsub(/:.*/, "")
@@ -2723,6 +2873,12 @@ parse_args() {
         esac
     fi
 
+    # Handle batch subcommand (batch <job|all>)
+    if [ "$COMMAND" = "batch" ] && [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+        BATCH_JOB="$1"
+        shift
+    fi
+
     while [[ $# -gt 0 ]]; do
         case $1 in
             --from) FROM_CONNECTION="$2"; shift 2 ;;
@@ -2790,6 +2946,13 @@ parse_args() {
             --notify-summary) NOTIFY_SUMMARY=true; shift ;;
             --save) SAVE_JOB="$2"; shift 2 ;;
             --batch) BATCH_JOB="$2"; shift 2 ;;
+            --yaml)
+                if [[ "$2" == *"/"* ]] || [[ "$2" == *".yaml" ]]; then
+                    JOBS_FILE="$2"
+                else
+                    JOBS_FILE="${SCRIPT_DIR}/${2}.yaml"
+                fi
+                shift 2 ;;
 
             --file) FILE="$2"; shift 2 ;;
 
