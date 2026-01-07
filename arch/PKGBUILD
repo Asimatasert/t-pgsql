@@ -1,6 +1,6 @@
 # Maintainer: Asim Atasert <asimatasert@outlook.com>
 pkgname=t-pgsql
-pkgver=3.4.0
+pkgver=3.5.0
 pkgrel=1
 pkgdesc="PostgreSQL database sync, backup and clone tool with notifications"
 arch=('any')
@@ -13,7 +13,7 @@ optdepends=(
     'fish: for fish completion support'
 )
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('8fe43c12cde366afe992f74ac22877688aac7a81649424a251c94ffafbe0e9c4')
+sha256sums=('SKIP')  # Update after release
 
 package() {
     cd "${srcdir}/${pkgname}-${pkgver}"

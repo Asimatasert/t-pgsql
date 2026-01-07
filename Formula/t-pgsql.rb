@@ -4,8 +4,8 @@
 class TPgsql < Formula
   desc "PostgreSQL database sync, backup and clone tool with notifications"
   homepage "https://github.com/Asimatasert/t-pgsql"
-  url "https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v3.4.0.tar.gz"
-  sha256 "8fe43c12cde366afe992f74ac22877688aac7a81649424a251c94ffafbe0e9c4"
+  url "https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v3.5.0.tar.gz"
+  sha256 ""  # Update after release
   license "MIT"
   head "https://github.com/Asimatasert/t-pgsql.git", branch: "master"
 
@@ -21,6 +21,6 @@ class TPgsql < Formula
   end
 
   test do
-    assert_match "v3.4.0", shell_output("#{bin}/t-pgsql --version")
+    assert_match "v3.5.0", shell_output("#{bin}/t-pgsql --version")
   end
 end

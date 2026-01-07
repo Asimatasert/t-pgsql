@@ -444,28 +444,33 @@ Save any command with `--save <name>`:
 
 ```bash
 # Run a single job
-./t-pgsql --batch rftt_sync
+./t-pgsql batch rftt_sync
 
 # Run all jobs sequentially
-./t-pgsql --batch all
+./t-pgsql batch all
+
+# Use different YAML file
+./t-pgsql batch all --yaml sync-30     # Uses ~/bin/sync-30.yaml
+./t-pgsql batch all --yaml /path/to/custom.yaml
 
 # Run jobs in parallel (3 concurrent jobs)
-./t-pgsql --batch all --parallel 3
+./t-pgsql batch all --parallel 3
 
 # Parallel with error handling
-./t-pgsql --batch all --parallel 4 --continue-on-error
+./t-pgsql batch all --parallel 4 --continue-on-error
 
 # Run only specific jobs
-./t-pgsql --batch all --only "job1,job2,job3"
+./t-pgsql batch all --only "job1,job2,job3"
 
 # Exclude specific jobs
-./t-pgsql --batch all --exclude "slow_job,optional_job"
+./t-pgsql batch all --exclude "slow_job,optional_job"
 
 # Send summary notification after batch
-./t-pgsql --batch all --notify telegram:TOKEN:CHAT --notify-summary
+./t-pgsql batch all --notify telegram:TOKEN:CHAT --notify-summary
 
 # Combined: parallel with filtering and notifications
-./t-pgsql --batch all \
+./t-pgsql batch all \
+  --yaml sync-myproductions \
   --parallel 3 \
   --exclude "slow_backup" \
   --continue-on-error \
@@ -491,7 +496,7 @@ t-pgsql supports three job formats: profile-based, connection string, and legacy
 
 #### Profile-Based Format (Recommended)
 
-Define reusable connection profiles to reduce repetition:
+Define reusable connection profiles and defaults to reduce repetition:
 
 ```yaml
 # Profiles - reusable connection configurations
@@ -511,7 +516,24 @@ profiles:
     db_host: localhost
     password_file: ~/.secrets/local.pass
 
-# Jobs using profiles
+# Defaults - inherited by all jobs
+defaults:
+  output: ~/data/dumps
+  from_keep: 1
+  force: true
+  compress: gzip
+  compress_level: 6
+  stream_buffer: 256
+  exclude_data: "audit.*,public.sessionlog"
+  parallel: 4
+  continue_on_error: true
+  notify:
+    telegram:
+      chat_id: "-123456789"
+      token: "BOT_TOKEN"
+      message_thread_id: 12345  # Optional: for forum topics
+
+# Jobs using profiles (inherit defaults)
 jobs:
   prod-to-local:
     command: clone
@@ -521,9 +543,7 @@ jobs:
     to:
       profile: local
       database: myapp_dev
-    force: true
-    from_keep: 1
-    exclude_data: "audit.*,logs"
+    # force, output, exclude_data etc. inherited from defaults
 ```
 
 #### Connection String Format
