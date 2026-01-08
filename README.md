@@ -541,6 +541,7 @@ profiles:
 defaults:
   output: ~/data/dumps
   from_keep: 1
+  skip_if_recent: 24h
   force: true
   compress: gzip
   compress_level: 6
@@ -602,6 +603,7 @@ jobs:
 | `from_keep` | Number of dumps to keep on source |
 | `keep` | Number of local dumps to keep |
 | `dump_name` | Custom dump filename (without timestamp) |
+| `skip_if_recent` | Skip if dump exists within timeframe (e.g., `24h`, `1d`, `today`) |
 | `output` | Output directory for dumps |
 | `exclude_table` | Tables to exclude completely |
 | `exclude_data` | Tables to exclude data only (supports `schema.*` wildcard) |
@@ -915,6 +917,7 @@ When multiple password sources are available, t-pgsql uses this priority:
 | `--keep <N>` | Number of local dumps to keep | `-1` (all) | No | `7`, `0` (delete), `-1` (all) |
 | `--from-keep <N>` | Number of dumps to keep on source | `1` | No | `3`, `0` (delete), `-1` (all) |
 | `--dump-name <name>` | Custom dump filename (without timestamp) | Database name | No | `myapp-backup` |
+| `--skip-if-recent <time>` | Skip if dump exists within timeframe | - | No | `24h`, `12h`, `1d`, `today` |
 | `--file <path>` | Specific dump file for restore | - | No | `./dumps/backup.tar.gz` |
 | `--from-file [pattern]` | Fetch existing dump (no value = latest) | - | No | `mydb_*.dump` |
 
