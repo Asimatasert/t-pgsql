@@ -176,12 +176,19 @@ install_extras() {
         info "Installing fish completion..."
         curl -fsSL "$RAW_URL/completions/t-pgsql.fish" -o "$TMP_DIR/t-pgsql.fish" 2>/dev/null || true
         if [[ -f "$TMP_DIR/t-pgsql.fish" ]]; then
-            if [[ -w "$FISHDIR" ]] 2>/dev/null; then
+            # Prefer user directory (no sudo needed)
+            USER_FISHDIR="$HOME/.config/fish/completions"
+            mkdir -p "$USER_FISHDIR" 2>/dev/null
+            if [[ -d "$USER_FISHDIR" ]]; then
+                cp "$TMP_DIR/t-pgsql.fish" "$USER_FISHDIR/t-pgsql.fish"
+                info "Fish completion installed to $USER_FISHDIR"
+            elif [[ -w "$FISHDIR" ]] 2>/dev/null; then
                 mkdir -p "$FISHDIR"
                 mv "$TMP_DIR/t-pgsql.fish" "$FISHDIR/t-pgsql.fish"
             else
-                sudo mkdir -p "$FISHDIR"
-                sudo mv "$TMP_DIR/t-pgsql.fish" "$FISHDIR/t-pgsql.fish"
+                sudo mkdir -p "$FISHDIR" 2>/dev/null && \
+                sudo mv "$TMP_DIR/t-pgsql.fish" "$FISHDIR/t-pgsql.fish" || \
+                warn "Could not install fish completion"
             fi
         fi
     fi
