@@ -1,6 +1,6 @@
 # Maintainer: Asim Atasert <asimatasert@outlook.com>
 pkgname=t-pgsql
-pkgver=3.5.0
+pkgver=3.6.0
 pkgrel=1
 pkgdesc="PostgreSQL database sync, backup and clone tool with notifications"
 arch=('any')

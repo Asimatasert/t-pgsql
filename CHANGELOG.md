@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.6.0] - 2026-01-08
+
+### Added
+- **Custom YAML file support for jobs command**: Use `--yaml` parameter with jobs list/show/remove commands
+- **Custom dump naming**: New `--dump-name` parameter and `dump_name` job option for custom dump file names
+- **Notification support for fetch command**: Added missing notification functionality to fetch operations
+
+### Fixed
+- **Fish shell compatibility**: Changed PGPASSWORD syntax to `env PGPASSWORD=` for cross-shell compatibility
+- **Health check fallback**: Added fallback to 'postgres' database when target database doesn't exist yet
+- **Jobs command argument parsing**: Fixed --yaml parameter parsing for jobs subcommand
+- **Clone command**: Fixed undefined `get_dump_name` function call in clone operation
+
+### Changed
+- Updated help text with --yaml parameter for jobs command
+- Enhanced README documentation with jobs command examples and custom dump naming
+
 ## [3.3.0] - 2025-01-05
 
 ### Added

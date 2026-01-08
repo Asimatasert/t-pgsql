@@ -11,7 +11,7 @@ set -e
 # ==============================================================================
 # VERSION & PATHS
 # ==============================================================================
-VERSION="3.5.0"
+VERSION="3.6.0"
 SCRIPT_NAME="t-pgsql"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -658,6 +658,7 @@ COMPRESSION:
 
 STORAGE:
     --output <dir>                Output directory
+    --dump-name <name>            Custom dump filename (without timestamp)
     --keep <N>                    Keep last N local dumps (-1=all, 0=none)
     --from-keep <N>               Keep N dumps on source (default: 1, -1=all, 0=delete)
     --from-file [pattern]         Fetch existing dump (for fetch command)
@@ -1832,10 +1833,11 @@ cmd_clone() {
 
     # Find latest archive (normalize path first)
     local norm_output_dir=$(cd "$OUTPUT_DIR" && pwd)
-    local latest=$(ls -t "${norm_output_dir}/${FROM_DATABASE}_"*.tar.gz 2>/dev/null | head -1)
+    local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
+    local latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.tar.gz 2>/dev/null | head -1)
 
     # Fallback to .dump if no tar.gz
-    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${FROM_DATABASE}_"*.dump 2>/dev/null | head -1)
+    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.dump 2>/dev/null | head -1)
     [ -z "$latest" ] && { log_error "Dump not found"; return 1; }
 
     FILE="$latest"

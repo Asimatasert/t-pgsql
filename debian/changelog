@@ -1,3 +1,19 @@
+t-pgsql (3.6.0-1) unstable; urgency=medium
+
+  * New features:
+    - Custom YAML file support for jobs command (--yaml parameter)
+    - Custom dump naming with --dump-name parameter
+    - Notification support for fetch command
+  * Bug fixes:
+    - Fish shell compatibility (PGPASSWORD syntax)
+    - Health check fallback to postgres database
+    - Jobs command --yaml parameter parsing
+    - Clone command: Fixed undefined get_dump_name function
+  * Documentation:
+    - Updated help text and README with new features
+
+ -- Asim Atasert <asimatasert@outlook.com>  Wed, 08 Jan 2026 15:30:00 +0300
+
 t-pgsql (3.5.0-1) unstable; urgency=medium
 
   * Bug fixes:

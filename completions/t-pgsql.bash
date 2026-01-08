@@ -14,8 +14,8 @@ _t_pgsql() {
         --exclude-table --exclude-schema --exclude-data
         --only-table --only-schema
         --compress --compress-level --pg-compress-level
-        --output --keep --from-keep
-        --from-file --file
+        --output --dump-name --keep --from-keep
+        --from-file --file --yaml
         --retention --retention-daily --retention-weekly --retention-monthly --retention-yearly
         --health-check --health-check-after --no-health-check
         --notify --notify-on-error
@@ -51,6 +51,10 @@ _t_pgsql() {
             ;;
         --password-file|--from-password-file|--to-password-file|--config|--mask-rules|--log|--file|--from-file)
             _filedir
+            return
+            ;;
+        --yaml)
+            COMPREPLY=($(compgen -f -X '!*.yaml' -- "$cur"))
             return
             ;;
         --output)

@@ -49,10 +49,12 @@ complete -c t-pgsql -l pg-compress-level -d "pg_dump compression 0-9"
 
 # Storage options
 complete -c t-pgsql -l output -d "Output directory" -ra "(__fish_complete_directories)"
+complete -c t-pgsql -l dump-name -d "Custom dump filename"
 complete -c t-pgsql -l keep -d "Keep N local dumps"
 complete -c t-pgsql -l from-keep -d "Keep N on source"
 complete -c t-pgsql -l from-file -d "Fetch existing dump" -r
 complete -c t-pgsql -l file -d "Dump file" -r
+complete -c t-pgsql -l yaml -d "Custom YAML file" -ra "(__fish_complete_suffix .yaml)"
 
 # Retention options
 complete -c t-pgsql -l retention -d "Enable GFS retention"
