@@ -602,12 +602,16 @@ check_skip_recent() {
 
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
     local latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null | head -1)
+    [ -z "$latest" ] && latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.zst 2>/dev/null | head -1)
+    [ -z "$latest" ] && latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.xz 2>/dev/null | head -1)
+    [ -z "$latest" ] && latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.bz2 2>/dev/null | head -1)
     [ -z "$latest" ] && latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump 2>/dev/null | head -1)
     [ -z "$latest" ] && return 1  # No existing dump, proceed
 
-    # Get file modification time
-    local file_epoch=$(stat -f %m "$latest" 2>/dev/null || stat -c %Y "$latest" 2>/dev/null)
-    [ -z "$file_epoch" ] && return 1
+    # Get file modification time (macOS uses -f, Linux uses -c)
+    local file_epoch
+    file_epoch=$(stat -c %Y "$latest" 2>/dev/null) || file_epoch=$(stat -f %m "$latest" 2>/dev/null)
+    [[ ! "$file_epoch" =~ ^[0-9]+$ ]] && return 1
 
     local now_epoch=$(date +%s)
     local diff_sec=$((now_epoch - file_epoch))
@@ -1394,6 +1398,9 @@ cmd_restore() {
     if [ -z "$FILE" ]; then
         local norm_dir=$(cd "$OUTPUT_DIR" 2>/dev/null && pwd)
         FILE=$(ls -t "${norm_dir}/"*.tar.gz 2>/dev/null | head -1)
+        [ -z "$FILE" ] && FILE=$(ls -t "${norm_dir}/"*.dump.zst 2>/dev/null | head -1)
+        [ -z "$FILE" ] && FILE=$(ls -t "${norm_dir}/"*.dump.xz 2>/dev/null | head -1)
+        [ -z "$FILE" ] && FILE=$(ls -t "${norm_dir}/"*.dump.bz2 2>/dev/null | head -1)
         [ -z "$FILE" ] && FILE=$(ls -t "${norm_dir}/"*.dump 2>/dev/null | head -1)
 
         if [ -z "$FILE" ]; then
@@ -1903,7 +1910,10 @@ cmd_clone() {
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
     local latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.tar.gz 2>/dev/null | head -1)
 
-    # Fallback to .dump if no tar.gz
+    # Fallback to compressed dump files, then uncompressed .dump
+    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.dump.zst 2>/dev/null | head -1)
+    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.dump.xz 2>/dev/null | head -1)
+    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.dump.bz2 2>/dev/null | head -1)
     [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.dump 2>/dev/null | head -1)
     [ -z "$latest" ] && { log_error "Dump not found"; return 1; }
 
@@ -1945,14 +1955,15 @@ cmd_list() {
     printf "%-50s %8s %s\n" "FILE" "SIZE" "DATE"
     printf "%s\n" "$(printf '%.0s-' {1..75})"
 
-    # List both .tar.gz and .dump files
-    find "$norm_dir" \( -name "*.tar.gz" -o -name "*.dump" \) -type f -print0 2>/dev/null | \
-        xargs -0 stat -f "%m %z %N" 2>/dev/null | \
+    # List .tar.gz, .dump, and compressed dump files
+    # Use stat with platform-specific options (Linux: -c, macOS: -f)
+    find "$norm_dir" \( -name "*.tar.gz" -o -name "*.dump" -o -name "*.dump.zst" -o -name "*.dump.xz" -o -name "*.dump.bz2" \) -type f -print0 2>/dev/null | \
+        xargs -0 -I{} sh -c 'stat -c "%Y %s %n" "$1" 2>/dev/null || stat -f "%m %z %N" "$1" 2>/dev/null' _ {} | \
         sort -rn | \
         while read -r mtime size filepath; do
             local fname=$(basename "$filepath")
             local hsize=$(numfmt --to=iec-i --suffix=B $size 2>/dev/null || echo "${size}B")
-            local fdate=$(date -r "$mtime" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
+            local fdate=$(date -r "$mtime" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$mtime" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
             printf "%-50s %8s %s\n" "$fname" "$hsize" "$fdate"
         done
     echo ""
@@ -1963,9 +1974,13 @@ cmd_list() {
 # ==============================================================================
 cmd_meta() {
     if [ -z "$FILE" ]; then
-        # Show latest
+        # Show latest (check tar.gz, compressed dumps, then plain dumps)
         local norm_output_dir=$(cd "$OUTPUT_DIR" 2>/dev/null && pwd)
         FILE=$(ls -t "${norm_output_dir}/"*.tar.gz 2>/dev/null | head -1)
+        [ -z "$FILE" ] && FILE=$(ls -t "${norm_output_dir}/"*.dump.zst 2>/dev/null | head -1)
+        [ -z "$FILE" ] && FILE=$(ls -t "${norm_output_dir}/"*.dump.xz 2>/dev/null | head -1)
+        [ -z "$FILE" ] && FILE=$(ls -t "${norm_output_dir}/"*.dump.bz2 2>/dev/null | head -1)
+        [ -z "$FILE" ] && FILE=$(ls -t "${norm_output_dir}/"*.dump 2>/dev/null | head -1)
     fi
 
     if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
@@ -2870,14 +2885,20 @@ cleanup_old_dumps() {
     [ "$KEEP" -le 0 ] && return 0
 
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-    local count=$(find "$OUTPUT_DIR" -name "${dump_base_name}_*.tar.gz" -type f 2>/dev/null | wc -l)
+    # Count all dump formats: tar.gz, compressed dumps, and plain dumps
+    local count=$(find "$OUTPUT_DIR" \( -name "${dump_base_name}_*.tar.gz" -o -name "${dump_base_name}_*.dump" -o -name "${dump_base_name}_*.dump.zst" -o -name "${dump_base_name}_*.dump.xz" -o -name "${dump_base_name}_*.dump.bz2" \) -type f 2>/dev/null | wc -l)
 
     if [ "$count" -gt "$KEEP" ]; then
         local del=$((count - KEEP))
         log_info "Deleting $del old dump(s)..."
 
-        # Use ls for macOS compatibility
-        ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null | tail -n "$del" | \
+        # Use ls for macOS compatibility - list all dump formats sorted by time
+        { ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null; \
+          ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.zst 2>/dev/null; \
+          ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.xz 2>/dev/null; \
+          ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.bz2 2>/dev/null; \
+          ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump 2>/dev/null; } | \
+            sort -t_ -k2 -r | tail -n "$del" | \
             while read f; do
                 rm -f "$f"
                 log_debug "Deleted: $f"
@@ -2892,7 +2913,12 @@ cleanup_gfs() {
 
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
     local keep_files=""
-    local all_files=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null)
+    # List all dump formats sorted by time
+    local all_files=$( { ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null; \
+                         ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.zst 2>/dev/null; \
+                         ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.xz 2>/dev/null; \
+                         ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.bz2 2>/dev/null; \
+                         ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump 2>/dev/null; } | sort -t_ -k2 -r )
 
     [ -z "$all_files" ] && return 0
 
@@ -2907,8 +2933,8 @@ cleanup_gfs() {
         [ -z "$file" ] && continue
 
         local fname=$(basename "$file")
-        # Extract date from filename: database_YYYYMMDD_HHMMSS.tar.gz
-        local file_date=$(echo "$fname" | sed -n 's/.*_\([0-9]\{8\}\)_[0-9]\{6\}\.tar\.gz/\1/p')
+        # Extract date from filename: database_YYYYMMDD_HHMMSS.{tar.gz,dump,dump.zst,dump.xz,dump.bz2}
+        local file_date=$(echo "$fname" | sed -n 's/.*_\([0-9]\{8\}\)_[0-9]\{6\}\.\(tar\.gz\|dump\|dump\.zst\|dump\.xz\|dump\.bz2\)/\1/p')
 
         [ -z "$file_date" ] && continue
 
