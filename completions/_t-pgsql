@@ -50,6 +50,7 @@ _t-pgsql() {
                 '--dump-name[Custom dump filename]'
                 '--keep[Keep N local dumps]'
                 '--from-keep[Keep N on source]'
+                '--skip-if-recent[Skip if recent dump exists]:time:(today 24h 12h 6h 1d)'
                 '--from-file[Fetch existing dump]'
                 '--yaml[Custom YAML file]:yaml:_files -g "*.yaml"'
                 '--retention[Enable GFS retention]'

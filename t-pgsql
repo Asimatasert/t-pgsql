@@ -65,6 +65,7 @@ PG_COMPRESS_LEVEL=6
 OUTPUT_DIR="${SCRIPT_DIR}/../data/dumps"
 KEEP=-1
 FROM_KEEP=1  # 0=delete, N=keep last N, -1=keep all (default: 1)
+SKIP_IF_RECENT=""  # Skip if dump exists within timeframe (e.g., 24h, 12h, today)
 
 # Retention (GFS)
 RETENTION=false
@@ -594,6 +595,60 @@ format_elapsed() {
     fi
 }
 
+# Check if recent dump exists (skip_if_recent feature)
+# Returns 0 if should skip, 1 if should proceed
+check_skip_recent() {
+    [ -z "$SKIP_IF_RECENT" ] && return 1  # No skip configured, proceed
+
+    local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
+    local latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null | head -1)
+    [ -z "$latest" ] && latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump 2>/dev/null | head -1)
+    [ -z "$latest" ] && return 1  # No existing dump, proceed
+
+    # Get file modification time
+    local file_epoch=$(stat -f %m "$latest" 2>/dev/null || stat -c %Y "$latest" 2>/dev/null)
+    [ -z "$file_epoch" ] && return 1
+
+    local now_epoch=$(date +%s)
+    local diff_sec=$((now_epoch - file_epoch))
+
+    # Parse timeframe
+    local skip_sec=0
+    case "$SKIP_IF_RECENT" in
+        today)
+            # Check if file was created today
+            local file_date=$(date -r "$file_epoch" +%Y%m%d 2>/dev/null || date -d "@$file_epoch" +%Y%m%d 2>/dev/null)
+            local today_date=$(date +%Y%m%d)
+            if [ "$file_date" = "$today_date" ]; then
+                log_info "Skipping: dump already exists today ($(basename "$latest"))"
+                return 0
+            fi
+            return 1
+            ;;
+        *h)
+            skip_sec=$(( ${SKIP_IF_RECENT%h} * 3600 ))
+            ;;
+        *m)
+            skip_sec=$(( ${SKIP_IF_RECENT%m} * 60 ))
+            ;;
+        *d)
+            skip_sec=$(( ${SKIP_IF_RECENT%d} * 86400 ))
+            ;;
+        *)
+            # Assume hours if no suffix
+            skip_sec=$(( SKIP_IF_RECENT * 3600 ))
+            ;;
+    esac
+
+    if [ $diff_sec -lt $skip_sec ]; then
+        local age=$(format_elapsed $diff_sec)
+        log_info "Skipping: recent dump exists ($age ago, threshold: $SKIP_IF_RECENT)"
+        return 0
+    fi
+
+    return 1
+}
+
 # ==============================================================================
 # HELP
 # ==============================================================================
@@ -661,6 +716,8 @@ STORAGE:
     --dump-name <name>            Custom dump filename (without timestamp)
     --keep <N>                    Keep last N local dumps (-1=all, 0=none)
     --from-keep <N>               Keep N dumps on source (default: 1, -1=all, 0=delete)
+    --skip-if-recent <time>       Skip if dump exists within timeframe
+                                  Examples: 24h, 12h, 1d, today
     --from-file [pattern]         Fetch existing dump (for fetch command)
                                   No value = latest dump for database
                                   Pattern: filename or glob (e.g., mydb_*.dump)
@@ -1176,6 +1233,11 @@ cmd_dump() {
 
     parse_connection "$FROM_CONNECTION" "FROM"
     get_password "FROM"
+
+    # Check if recent dump exists (skip_if_recent)
+    if check_skip_recent; then
+        return 0
+    fi
 
     # Run health check before operation
     run_health_checks true false
@@ -1813,6 +1875,11 @@ cmd_clone() {
     # Run health check before operation
     run_health_checks true true
 
+    # Check if recent dump exists (skip_if_recent)
+    if check_skip_recent; then
+        return 0
+    fi
+
     # Dry-run mode
     if [ "$DRY_RUN" = true ]; then
         log_info "[DRY-RUN] Would dump from: $FROM_CONNECTION"
@@ -2286,15 +2353,59 @@ parse_job_to_args() {
     [ -n "$to_pw" ] && args+=" --to-password-file '$to_pw'"
 
     # Options (with defaults fallback)
+    # Boolean flags
     [ "$(get_job_value "$job" "force")" = "true" ] && args+=" --force"
     [ "$(get_job_value "$job" "verbose")" = "true" ] && args+=" --verbose"
+    [ "$(get_job_value "$job" "quiet")" = "true" ] && args+=" --quiet"
+    [ "$(get_job_value "$job" "dry_run")" = "true" ] && args+=" --dry-run"
+    [ "$(get_job_value "$job" "no_meta")" = "true" ] && args+=" --no-meta"
+    [ "$(get_job_value "$job" "sudo")" = "true" ] && args+=" --sudo"
+    [ "$(get_job_value "$job" "stream")" = "true" ] && args+=" --stream"
+    [ "$(get_job_value "$job" "notify_on_error")" = "true" ] && args+=" --notify-on-error"
+
+    # Storage options
     [ -n "$(get_job_value "$job" "output")" ] && args+=" --output '$(get_job_value "$job" "output")'"
-    [ -n "$(get_job_value "$job" "from_keep")" ] && args+=" --from-keep $(get_job_value "$job" "from_keep")"
-    [ -n "$(get_job_value "$job" "keep")" ] && args+=" --keep $(get_job_value "$job" "keep")"
     [ -n "$(get_job_value "$job" "dump_name")" ] && args+=" --dump-name '$(get_job_value "$job" "dump_name")'"
+    [ -n "$(get_job_value "$job" "keep")" ] && args+=" --keep $(get_job_value "$job" "keep")"
+    [ -n "$(get_job_value "$job" "from_keep")" ] && args+=" --from-keep $(get_job_value "$job" "from_keep")"
+    [ -n "$(get_job_value "$job" "skip_if_recent")" ] && args+=" --skip-if-recent '$(get_job_value "$job" "skip_if_recent")'"
+
+    # Filtering options
     [ -n "$(get_job_value "$job" "exclude_table")" ] && args+=" --exclude-table '$(get_job_value "$job" "exclude_table")'"
     [ -n "$(get_job_value "$job" "exclude_data")" ] && args+=" --exclude-data '$(get_job_value "$job" "exclude_data")'"
     [ -n "$(get_job_value "$job" "exclude_schema")" ] && args+=" --exclude-schema '$(get_job_value "$job" "exclude_schema")'"
+    [ -n "$(get_job_value "$job" "only_table")" ] && args+=" --only-table '$(get_job_value "$job" "only_table")'"
+    [ -n "$(get_job_value "$job" "only_schema")" ] && args+=" --only-schema '$(get_job_value "$job" "only_schema")'"
+
+    # Compression options
+    [ -n "$(get_job_value "$job" "compress")" ] && args+=" --compress '$(get_job_value "$job" "compress")'"
+    [ -n "$(get_job_value "$job" "compress_level")" ] && args+=" --compress-level $(get_job_value "$job" "compress_level")"
+    [ -n "$(get_job_value "$job" "pg_compress_level")" ] && args+=" --pg-compress-level $(get_job_value "$job" "pg_compress_level")"
+
+    # Streaming options
+    [ -n "$(get_job_value "$job" "stream_buffer")" ] && args+=" --stream-buffer $(get_job_value "$job" "stream_buffer")"
+
+    # Health check options
+    [ "$(get_job_value "$job" "health_check")" = "true" ] && args+=" --health-check"
+    [ "$(get_job_value "$job" "health_check_after")" = "true" ] && args+=" --health-check-after"
+    [ "$(get_job_value "$job" "no_health_check")" = "true" ] && args+=" --no-health-check"
+    [ "$(get_job_value "$job" "health_check_fail")" = "true" ] && args+=" --health-check-fail"
+
+    # Retention (GFS) options
+    [ "$(get_job_value "$job" "retention")" = "true" ] && args+=" --retention"
+    [ -n "$(get_job_value "$job" "retention_daily")" ] && args+=" --retention-daily $(get_job_value "$job" "retention_daily")"
+    [ -n "$(get_job_value "$job" "retention_weekly")" ] && args+=" --retention-weekly $(get_job_value "$job" "retention_weekly")"
+    [ -n "$(get_job_value "$job" "retention_monthly")" ] && args+=" --retention-monthly $(get_job_value "$job" "retention_monthly")"
+    [ -n "$(get_job_value "$job" "retention_yearly")" ] && args+=" --retention-yearly $(get_job_value "$job" "retention_yearly")"
+
+    # Masking options
+    [ "$(get_job_value "$job" "mask")" = "true" ] && args+=" --mask"
+    [ -n "$(get_job_value "$job" "mask_rules")" ] && args+=" --mask-rules '$(get_job_value "$job" "mask_rules")'"
+    [ -n "$(get_job_value "$job" "mask_tables")" ] && args+=" --mask-tables '$(get_job_value "$job" "mask_tables")'"
+
+    # Logging options
+    [ -n "$(get_job_value "$job" "log")" ] && args+=" --log '$(get_job_value "$job" "log")'"
+    [ -n "$(get_job_value "$job" "log_level")" ] && args+=" --log-level '$(get_job_value "$job" "log_level")'"
 
     # Notify - telegram
     local telegram_config=$(get_job_telegram_config "$job")
@@ -2943,6 +3054,7 @@ parse_args() {
             --keep) KEEP="$2"; shift 2 ;;
             --from-keep) FROM_KEEP="$2"; shift 2 ;;
             --dump-name) DUMP_NAME="$2"; shift 2 ;;
+            --skip-if-recent) SKIP_IF_RECENT="$2"; shift 2 ;;
             --from-file)
                 # Optional value: --from-file or --from-file <pattern>
                 if [[ -n "$2" && ! "$2" =~ ^-- ]]; then

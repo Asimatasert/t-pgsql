@@ -14,7 +14,7 @@ _t_pgsql() {
         --exclude-table --exclude-schema --exclude-data
         --only-table --only-schema
         --compress --compress-level --pg-compress-level
-        --output --dump-name --keep --from-keep
+        --output --dump-name --keep --from-keep --skip-if-recent
         --from-file --file --yaml
         --retention --retention-daily --retention-weekly --retention-monthly --retention-yearly
         --health-check --health-check-after --no-health-check
@@ -55,6 +55,10 @@ _t_pgsql() {
             ;;
         --yaml)
             COMPREPLY=($(compgen -f -X '!*.yaml' -- "$cur"))
+            return
+            ;;
+        --skip-if-recent)
+            COMPREPLY=($(compgen -W "today 24h 12h 6h 1d" -- "$cur"))
             return
             ;;
         --output)
