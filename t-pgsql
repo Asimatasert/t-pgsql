@@ -611,9 +611,9 @@ COMMANDS:
     fetch       Fetch existing dump from remote (no new dump)
     batch       Run multiple jobs from config
     jobs        Manage saved jobs
-                  jobs              List all jobs
-                  jobs show <name>  Show job details
-                  jobs remove <name> Remove a job
+                  jobs [list] [--yaml <file>]  List all jobs
+                  jobs show <name> [--yaml <file>]  Show job details
+                  jobs remove <name> [--yaml <file>] Remove a job
     list        List dump files
     meta        Show metadata from archive
     clean       Clean old dumps
@@ -1056,16 +1056,25 @@ health_check() {
         log_debug "SSH connection OK"
 
         # Check database connection via SSH
-        local check_cmd="PGPASSWORD='$password' psql -U $user -h $db_host -p $db_port -d $database -c 'SELECT 1' >/dev/null 2>&1 && echo ok"
+        local check_cmd="env PGPASSWORD='$password' psql -U $user -h $db_host -p $db_port -d $database -c 'SELECT 1' >/dev/null 2>&1 && echo ok"
         if ! ssh -p "$ssh_port" "${ssh_user}@${ssh_host}" "$check_cmd" | grep -q "ok"; then
-            log_error "Database connection failed: $user@$db_host:$db_port/$database"
-            return 1
+            # If database doesn't exist, try connecting to postgres database to verify server access
+            local fallback_cmd="env PGPASSWORD='$password' psql -U $user -h $db_host -p $db_port -d postgres -c 'SELECT 1' >/dev/null 2>&1 && echo ok"
+            if ! ssh -p "$ssh_port" "${ssh_user}@${ssh_host}" "$fallback_cmd" | grep -q "ok"; then
+                log_error "Database connection failed: $user@$db_host:$db_port/$database"
+                return 1
+            fi
+            log_debug "Database '$database' doesn't exist yet, but PostgreSQL server is accessible"
         fi
     else
         # Local database check
-        if ! PGPASSWORD="$password" psql -U "$user" -h "$FROM_DB_HOST" -p "$port" -d "$database" -c 'SELECT 1' >/dev/null 2>&1; then
-            log_error "Database connection failed: $user@$FROM_DB_HOST:$port/$database"
-            return 1
+        if ! env PGPASSWORD="$password" psql -U "$user" -h "$FROM_DB_HOST" -p "$port" -d "$database" -c 'SELECT 1' >/dev/null 2>&1; then
+            # If database doesn't exist, try connecting to postgres database to verify server access
+            if ! env PGPASSWORD="$password" psql -U "$user" -h "$FROM_DB_HOST" -p "$port" -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
+                log_error "Database connection failed: $user@$FROM_DB_HOST:$port/$database"
+                return 1
+            fi
+            log_debug "Database '$database' doesn't exist yet, but PostgreSQL server is accessible"
         fi
     fi
 
@@ -1173,7 +1182,8 @@ cmd_dump() {
     mkdir -p "$OUTPUT_DIR"
 
     local ts=$(date '+%Y%m%d_%H%M%S')
-    local dump_file="${OUTPUT_DIR}/${FROM_DATABASE}_${ts}.dump"
+    local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
+    local dump_file="${OUTPUT_DIR}/${dump_base_name}_${ts}.dump"
 
     log_info "From: ${FROM_DB_USER}@${FROM_DB_HOST}:${FROM_DB_PORT}/${FROM_DATABASE}"
     log_info "To: ${dump_file}"
@@ -1208,9 +1218,9 @@ cmd_dump() {
                 local tables=""
                 if [ "$FROM_TYPE" = "ssh" ]; then
                     tables=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-                        "PGPASSWORD='$FROM_DB_PASSWORD' psql -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -d $FROM_DATABASE -tAc \"SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$schema_name'\"")
+                        "env PGPASSWORD='$FROM_DB_PASSWORD' psql -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -d $FROM_DATABASE -tAc \"SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$schema_name'\"")
                 else
-                    tables=$(PGPASSWORD="$FROM_DB_PASSWORD" psql -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -d $FROM_DATABASE -tAc "SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$schema_name'")
+                    tables=$(env PGPASSWORD="$FROM_DB_PASSWORD" psql -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -d $FROM_DATABASE -tAc "SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$schema_name'")
                 fi
                 for tbl in $tables; do
                     exclude_opts="$exclude_opts --exclude-table-data='$tbl'"
@@ -1227,7 +1237,8 @@ cmd_dump() {
         log_info "Dumping via SSH..."
         local remote_dump_dir="/tmp/t-pgsql"
         ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "mkdir -p '$remote_dump_dir'"
-        local remote_file="${remote_dump_dir}/${FROM_DATABASE}_${ts}.dump"
+        local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
+        local remote_file="${remote_dump_dir}/${dump_base_name}_${ts}.dump"
 
         local cmd=""
         if [ "$SUDO" = true ]; then
@@ -1236,7 +1247,7 @@ cmd_dump() {
             cmd="$cmd -h $FROM_DB_HOST -p $FROM_DB_PORT"
         else
             # Use password auth
-            cmd="PGPASSWORD='$FROM_DB_PASSWORD' pg_dump"
+            cmd="env PGPASSWORD='$FROM_DB_PASSWORD' pg_dump"
             cmd="$cmd -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT"
         fi
         cmd="$cmd -Fc -Z${PG_COMPRESS_LEVEL} -v $exclude_opts"
@@ -1255,7 +1266,8 @@ cmd_dump() {
                 ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "rm -f '$remote_file'"
             elif [ "$FROM_KEEP" -gt 0 ]; then
                 log_info "Keeping last $FROM_KEEP dump(s) on source..."
-                local cleanup_cmd="cd /tmp/t-pgsql && ls -t ${FROM_DATABASE}_*.dump 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
+                local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
+                local cleanup_cmd="cd /tmp/t-pgsql && ls -t ${dump_base_name}_*.dump 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
                 ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
             else
                 log_info "Keeping source dump (--from-keep -1)"
@@ -1453,7 +1465,7 @@ restore_ssh() {
     local remote="/tmp/t-pgsql/$(basename $dump)"
 
     # Check if DB exists on remote
-    local check_cmd="PGPASSWORD='$TO_DB_PASSWORD' psql -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -tAc \"SELECT 1 FROM pg_database WHERE datname='$TO_DATABASE'\" postgres 2>/dev/null"
+    local check_cmd="env PGPASSWORD='$TO_DB_PASSWORD' psql -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -tAc \"SELECT 1 FROM pg_database WHERE datname='$TO_DATABASE'\" postgres 2>/dev/null"
     local exists=$(ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$check_cmd")
 
     if [ "$exists" = "1" ]; then
@@ -1562,11 +1574,21 @@ cmd_fetch() {
         local size=$(ls -lh "$local_file" | awk '{print $5}')
         log_success "Fetched: $local_file ($size)"
         meta_write "$local_file" "success" 0
+        
+        # Send notification
+        local details=$(build_notify_details "FETCH" "Success" "File: $(basename $local_file)\nSize: $size\nSource: ${FROM_SSH_HOST}")
+        send_notification "success" "Fetch completed: ${FROM_DATABASE}" "$details"
+        
         echo "DUMP_FILE=$local_file"
         echo "DUMP_SIZE=$size"
     else
         log_error "Fetch failed"
         meta_write "$local_file" "failed" 1
+        
+        # Send notification
+        local details=$(build_notify_details "FETCH" "Failed" "Source: ${FROM_SSH_HOST}")
+        send_notification "failed" "Fetch failed: ${FROM_DATABASE}" "$details"
+        
         return 1
     fi
 }
@@ -1644,11 +1666,11 @@ apply_masking() {
     # Execute masking SQL
     local result=0
     if [ "$type" = "ssh" ]; then
-        local cmd="PGPASSWORD='$password' psql -U $user -h $host -p $port -d $database -c \"$mask_sql\" 2>&1"
+        local cmd="env PGPASSWORD='$password' psql -U $user -h $host -p $port -d $database -c \"$mask_sql\" 2>&1"
         ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$cmd"
         result=$?
     else
-        PGPASSWORD="$password" psql -U "$user" -h "$host" -p "$port" -d "$database" -c "$mask_sql" 2>&1
+        env PGPASSWORD="$password" psql -U "$user" -h "$host" -p "$port" -d "$database" -c "$mask_sql" 2>&1
         result=$?
     fi
 
@@ -1697,10 +1719,10 @@ clone_stream() {
             if [ "$SUDO" = true ]; then
                 dump_cmd="ssh -p $FROM_SSH_PORT ${FROM_SSH_USER}@${FROM_SSH_HOST} 'sudo -u $FROM_DB_USER pg_dump -h $FROM_DB_HOST -p $FROM_DB_PORT -Fc $exclude_opts $FROM_DATABASE'"
             else
-                dump_cmd="ssh -p $FROM_SSH_PORT ${FROM_SSH_USER}@${FROM_SSH_HOST} 'PGPASSWORD=\"$FROM_DB_PASSWORD\" pg_dump -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -Fc $exclude_opts $FROM_DATABASE'"
+                dump_cmd="ssh -p $FROM_SSH_PORT ${FROM_SSH_USER}@${FROM_SSH_HOST} 'env PGPASSWORD=\"$FROM_DB_PASSWORD\" pg_dump -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -Fc $exclude_opts $FROM_DATABASE'"
             fi
         else
-            dump_cmd="PGPASSWORD='$FROM_DB_PASSWORD' pg_dump -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -Fc $exclude_opts $FROM_DATABASE"
+            dump_cmd="env PGPASSWORD='$FROM_DB_PASSWORD' pg_dump -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -Fc $exclude_opts $FROM_DATABASE"
         fi
 
         # Build pg_restore command
@@ -1716,7 +1738,7 @@ clone_stream() {
 
             ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$prep_cmd"
 
-            restore_cmd="ssh -p $TO_SSH_PORT ${TO_SSH_USER}@${TO_SSH_HOST} 'PGPASSWORD=\"$TO_DB_PASSWORD\" pg_restore --no-owner --no-privileges -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -d $TO_DATABASE'"
+            restore_cmd="ssh -p $TO_SSH_PORT ${TO_SSH_USER}@${TO_SSH_HOST} 'env PGPASSWORD=\"$TO_DB_PASSWORD\" pg_restore --no-owner --no-privileges -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -d $TO_DATABASE'"
         else
             # Prepare local target database
             export PGPASSWORD="$TO_DB_PASSWORD"
@@ -1727,7 +1749,7 @@ clone_stream() {
             fi
             createdb -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" "$TO_DATABASE" 2>/dev/null || true
 
-            restore_cmd="PGPASSWORD='$TO_DB_PASSWORD' pg_restore --no-owner --no-privileges -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -d $TO_DATABASE"
+            restore_cmd="env PGPASSWORD='$TO_DB_PASSWORD' pg_restore --no-owner --no-privileges -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -d $TO_DATABASE"
         fi
 
         # Execute streaming pipe with buffer
@@ -2267,6 +2289,7 @@ parse_job_to_args() {
     [ -n "$(get_job_value "$job" "output")" ] && args+=" --output '$(get_job_value "$job" "output")'"
     [ -n "$(get_job_value "$job" "from_keep")" ] && args+=" --from-keep $(get_job_value "$job" "from_keep")"
     [ -n "$(get_job_value "$job" "keep")" ] && args+=" --keep $(get_job_value "$job" "keep")"
+    [ -n "$(get_job_value "$job" "dump_name")" ] && args+=" --dump-name '$(get_job_value "$job" "dump_name")'"
     [ -n "$(get_job_value "$job" "exclude_table")" ] && args+=" --exclude-table '$(get_job_value "$job" "exclude_table")'"
     [ -n "$(get_job_value "$job" "exclude_data")" ] && args+=" --exclude-data '$(get_job_value "$job" "exclude_data")'"
     [ -n "$(get_job_value "$job" "exclude_schema")" ] && args+=" --exclude-schema '$(get_job_value "$job" "exclude_schema")'"
@@ -2733,14 +2756,15 @@ cleanup_old_dumps() {
     # Simple keep-N retention
     [ "$KEEP" -le 0 ] && return 0
 
-    local count=$(find "$OUTPUT_DIR" -name "${FROM_DATABASE}_*.tar.gz" -type f 2>/dev/null | wc -l)
+    local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
+    local count=$(find "$OUTPUT_DIR" -name "${dump_base_name}_*.tar.gz" -type f 2>/dev/null | wc -l)
 
     if [ "$count" -gt "$KEEP" ]; then
         local del=$((count - KEEP))
         log_info "Deleting $del old dump(s)..."
 
         # Use ls for macOS compatibility
-        ls -t "$OUTPUT_DIR"/${FROM_DATABASE}_*.tar.gz 2>/dev/null | tail -n "$del" | \
+        ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null | tail -n "$del" | \
             while read f; do
                 rm -f "$f"
                 log_debug "Deleted: $f"
@@ -2753,8 +2777,9 @@ cleanup_gfs() {
     log_info "Applying GFS retention policy..."
     log_debug "Daily: $RETENTION_DAILY, Weekly: $RETENTION_WEEKLY, Monthly: $RETENTION_MONTHLY, Yearly: $RETENTION_YEARLY"
 
+    local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
     local keep_files=""
-    local all_files=$(ls -t "$OUTPUT_DIR"/${FROM_DATABASE}_*.tar.gz 2>/dev/null)
+    local all_files=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null)
 
     [ -z "$all_files" ] && return 0
 
@@ -2859,7 +2884,17 @@ parse_args() {
             list|show|remove)
                 JOBS_ACTION="$1"
                 shift
-                [ $# -gt 0 ] && { JOBS_TARGET="$1"; shift; }
+                # Skip options and get target
+                while [[ $# -gt 0 ]]; do
+                    if [[ "$1" == -* ]]; then
+                        # It's an option, will be parsed in main loop
+                        break
+                    else
+                        JOBS_TARGET="$1"
+                        shift
+                        break
+                    fi
+                done
                 ;;
             -*)
                 # It's an option, not a subcommand
@@ -2905,6 +2940,7 @@ parse_args() {
             --output) OUTPUT_DIR="$2"; shift 2 ;;
             --keep) KEEP="$2"; shift 2 ;;
             --from-keep) FROM_KEEP="$2"; shift 2 ;;
+            --dump-name) DUMP_NAME="$2"; shift 2 ;;
             --from-file)
                 # Optional value: --from-file or --from-file <pattern>
                 if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
@@ -2947,9 +2983,14 @@ parse_args() {
             --save) SAVE_JOB="$2"; shift 2 ;;
             --batch) BATCH_JOB="$2"; shift 2 ;;
             --yaml)
-                if [[ "$2" == *"/"* ]] || [[ "$2" == *".yaml" ]]; then
+                if [[ "$2" == *".yaml" ]]; then
+                    # Already has .yaml extension
                     JOBS_FILE="$2"
+                elif [[ "$2" == *"/"* ]]; then
+                    # Contains path but no .yaml extension
+                    JOBS_FILE="${2}.yaml"
                 else
+                    # Just a name, use SCRIPT_DIR
                     JOBS_FILE="${SCRIPT_DIR}/${2}.yaml"
                 fi
                 shift 2 ;;

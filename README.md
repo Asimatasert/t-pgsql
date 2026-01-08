@@ -213,12 +213,18 @@ Creates a database backup.
   --from "ssh://user@server/postgres@localhost/prod" \
   --from-password-file .secrets/prod.pass \
   --from-keep 3  # Keep last 3 dumps
+
+# Custom dump name
+./t-pgsql dump \
+  --from "postgres@localhost/mydb" \
+  --password-file .secrets/db.pass \
+  --dump-name myapp-backup  # Creates: myapp-backup_YYYYMMDD_HHMMSS.dump
 ```
 
 **Output:** `./dumps/database_YYYYMMDD_HHMMSS.tar.gz`
 
 The tar archive contains:
-- `database_YYYYMMDD_HHMMSS.dump` - PostgreSQL dump file
+- `database_YYYYMMDD_HHMMSS.dump` - PostgreSQL dump file (or custom name)
 - `metadata.yaml` - Operation information
 
 ---
@@ -480,7 +486,22 @@ Save any command with `--save <name>`:
 ### Listing Jobs
 
 ```bash
+# List jobs from default jobs.yaml
 ./t-pgsql jobs
+./t-pgsql jobs list
+
+# List jobs from custom YAML file
+./t-pgsql jobs list --yaml sync-30
+./t-pgsql jobs list --yaml ~/bin/aschenbrenner
+./t-pgsql jobs list --yaml /path/to/custom.yaml
+
+# Show specific job details
+./t-pgsql jobs show rftt_sync
+./t-pgsql jobs show rftt_sync --yaml sync-30
+
+# Remove a job
+./t-pgsql jobs remove old_job
+./t-pgsql jobs remove old_job --yaml sync-30
 
 # Output:
 # Available jobs:
@@ -537,6 +558,7 @@ defaults:
 jobs:
   prod-to-local:
     command: clone
+    dump_name: myapp-backup  # Custom dump name (optional)
     from:
       profile: production
       database: myapp
@@ -579,6 +601,7 @@ jobs:
 | `verbose` | Show detailed output |
 | `from_keep` | Number of dumps to keep on source |
 | `keep` | Number of local dumps to keep |
+| `dump_name` | Custom dump filename (without timestamp) |
 | `output` | Output directory for dumps |
 | `exclude_table` | Tables to exclude completely |
 | `exclude_data` | Tables to exclude data only (supports `schema.*` wildcard) |
@@ -891,6 +914,7 @@ When multiple password sources are available, t-pgsql uses this priority:
 | `--output <dir>` | Output directory for dumps | `./data/dumps` | No | `/backups/daily` |
 | `--keep <N>` | Number of local dumps to keep | `-1` (all) | No | `7`, `0` (delete), `-1` (all) |
 | `--from-keep <N>` | Number of dumps to keep on source | `1` | No | `3`, `0` (delete), `-1` (all) |
+| `--dump-name <name>` | Custom dump filename (without timestamp) | Database name | No | `myapp-backup` |
 | `--file <path>` | Specific dump file for restore | - | No | `./dumps/backup.tar.gz` |
 | `--from-file [pattern]` | Fetch existing dump (no value = latest) | - | No | `mydb_*.dump` |
 
