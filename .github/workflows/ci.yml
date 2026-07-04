@@ -9,7 +9,7 @@ jobs:
   build-sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: t-pgsql matches src/ (generated file in sync)
         run: ./build.sh --check
       - name: Syntax check (bash -n)
