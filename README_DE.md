@@ -2,7 +2,7 @@
 
 Erweitertes CLI-Tool zum Sichern, Wiederherstellen und Synchronisieren von PostgreSQL-Datenbanken.
 
-**Dokumentation:** [English](README.md) | [Türkçe](README_TR.md) | [Español](README_ES.md) | [Русский](README_RU.md)
+**Dokumentation:** [English](README.md) | [Español](README_ES.md) | [Русский](README_RU.md)
 
 ## Funktionen
 
@@ -42,7 +42,7 @@ sudo ln -s $(pwd)/t-pgsql /usr/local/bin/t-pgsql
 ./t-pgsql dump --from "postgres@localhost/mydb" --password-file .secrets/db.pass
 
 # Dump von Remote-Server
-./t-pgsql dump --from "ssh://user@192.168.1.100/postgres@localhost/mydb" --from-password-file .secrets/remote.pass
+./t-pgsql dump --from "ssh://user@192.0.2.20/postgres@localhost/mydb" --from-password-file .secrets/remote.pass
 
 # Dump wiederherstellen
 ./t-pgsql restore --file ./dumps/mydb_20250101.tar.gz --to "postgres@localhost/mydb_copy" --to-password-file .secrets/local.pass
@@ -75,8 +75,8 @@ ssh://[ssh_user@]ssh_host[:ssh_port]/[db_user@]db_host[:db_port]/database
 
 | Beispiel | Beschreibung |
 |----------|--------------|
-| `ssh://user@192.168.1.100/mydb` | Einfaches Format (db: localhost, user: postgres) |
-| `ssh://user@192.168.1.100/postgres@localhost/mydb` | Mit DB-Benutzer |
+| `ssh://user@192.0.2.20/mydb` | Einfaches Format (db: localhost, user: postgres) |
+| `ssh://user@192.0.2.20/postgres@localhost/mydb` | Mit DB-Benutzer |
 | `ssh://user@server:2222/postgres@localhost:5433/prod` | Benutzerdefinierte Ports |
 
 ---

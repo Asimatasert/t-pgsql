@@ -1,7 +1,7 @@
 # Fish completion for t-pgsql
 
 # Commands
-set -l commands dump restore clone fetch batch jobs list meta clean version help
+set -l commands dump restore clone upgrade fetch batch jobs list meta clean version help
 
 # Disable file completion by default
 complete -c t-pgsql -f
@@ -10,6 +10,7 @@ complete -c t-pgsql -f
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "dump" -d "Create database backup"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "restore" -d "Restore backup to database"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "clone" -d "Dump + Restore (full sync)"
+complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "upgrade" -d "Logical major-version migration"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "fetch" -d "Fetch existing dump from remote"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "batch" -d "Run multiple jobs"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "jobs" -d "Manage saved jobs"
@@ -22,7 +23,7 @@ complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "help" -d 
 # Jobs subcommands
 complete -c t-pgsql -n "__fish_seen_subcommand_from jobs" -a "list" -d "List all jobs"
 complete -c t-pgsql -n "__fish_seen_subcommand_from jobs" -a "show" -d "Show job details"
-complete -c t-pgsql -n "__fish_seen_subcommand_from jobs" -a "delete" -d "Delete a job"
+complete -c t-pgsql -n "__fish_seen_subcommand_from jobs" -a "remove" -d "Remove a job"
 
 # Connection options
 complete -c t-pgsql -l from -d "Source connection"
@@ -68,10 +69,12 @@ complete -c t-pgsql -l retention-yearly -d "Yearly backups"
 complete -c t-pgsql -l health-check -d "Check before"
 complete -c t-pgsql -l health-check-after -d "Check after"
 complete -c t-pgsql -l no-health-check -d "Disable checks"
+complete -c t-pgsql -l health-check-fail -d "Fail on health check error"
 
 # Notification options
 complete -c t-pgsql -l notify -d "Notification channel"
 complete -c t-pgsql -l notify-on-error -d "Only on error"
+complete -c t-pgsql -l notify-summary -d "Send batch summary notification"
 
 # Masking options
 complete -c t-pgsql -l mask -d "Enable masking"
@@ -82,8 +85,14 @@ complete -c t-pgsql -l mask-tables -d "Tables to mask"
 complete -c t-pgsql -l stream -d "Stream mode"
 complete -c t-pgsql -l stream-buffer -d "Buffer size MB"
 complete -c t-pgsql -l sudo -d "Use sudo"
+complete -c t-pgsql -l globals -d "Also migrate roles/tablespaces"
+complete -c t-pgsql -l pg-bindir -d "PostgreSQL client bin dir" -ra "(__fish_complete_directories)"
 complete -c t-pgsql -l parallel -d "Parallel jobs"
 complete -c t-pgsql -l continue-on-error -d "Continue on error"
+complete -c t-pgsql -l only-jobs -d "Only run these batch jobs"
+complete -c t-pgsql -l exclude-jobs -d "Exclude these batch jobs"
+complete -c t-pgsql -l only -d "Alias for --only-jobs"
+complete -c t-pgsql -l exclude -d "Alias for --exclude-jobs"
 complete -c t-pgsql -l save -d "Save as job"
 complete -c t-pgsql -l batch -d "Run batch job"
 complete -c t-pgsql -l log -d "Log file" -r

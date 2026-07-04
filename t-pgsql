@@ -5,13 +5,23 @@
 #
 # Usage: t-pgsql <command> [options]
 #
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ GENERATED FILE — do not edit directly.                                     │
+# │ Sources live in src/*.sh; rebuild with `./build.sh` (or `make build`).     │
+# │ Order is defined by src/build.manifest. CI runs `./build.sh --check`.      │
+# └────────────────────────────────────────────────────────────────────────────┘
+#
 
-set -e
+# NOTE: 'set -e' (errexit) intentionally NOT enabled. This script uses explicit
+# "cmd; result=$?; if ...; else <failure handling> fi" patterns, background-job
+# .exit tracking, and multi-target/--continue-on-error logic throughout. Under
+# errexit those failure branches would abort the script before running, making
+# all error-handling dead code. Failures are handled explicitly instead.
 
 # ==============================================================================
 # VERSION & PATHS
 # ==============================================================================
-VERSION="3.7.1"
+VERSION="3.9.0"
 SCRIPT_NAME="t-pgsql"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -60,9 +70,14 @@ ONLY_SCHEMAS=""
 COMPRESS="gzip"
 COMPRESS_LEVEL=6
 PG_COMPRESS_LEVEL=6
+PG_COMPRESS_LEVEL_SET=false  # true if --pg-compress-level passed on CLI
 
 # Storage
-OUTPUT_DIR="${SCRIPT_DIR}/../data/dumps"
+OUTPUT_DIR="${T_PGSQL_OUTPUT_DIR:-${SCRIPT_DIR}/../data/dumps}"
+OUTPUT_DIR_SET=false          # true once --output is given on the CLI (beats config/env)
+KEEP_SET=false                # true once --keep given on CLI (beats config)
+FROM_KEEP_SET=false           # true once --from-keep given on CLI
+COMPRESS_SET=false            # true once --compress given on CLI
 KEEP=-1
 FROM_KEEP=1  # 0=delete, N=keep last N, -1=keep all (default: 1)
 SKIP_IF_RECENT=""  # Skip if dump exists within timeframe (e.g., 24h, 12h, today)
@@ -95,15 +110,39 @@ STREAM_BUFFER=64
 # Sudo
 SUDO=false
 
+# Common SSH options for transfers: fail fast on connect, and detect a stalled
+# link (e.g. a dropped Tailscale route) within ~60s instead of hanging forever.
+SSH_OPTS=(-o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+
+# Transfer resilience / throttling (SSH scp + streaming)
+BWLIMIT=""                    # human rate: 10m (MByte/s), 500k (KByte/s), or bare KByte/s
+BWLIMIT_KBIT=""               # derived: scp -l wants Kbit/s
+PV_RATE=""                    # derived: pv -L rate for streaming clone
+RETRIES=0                     # extra retries for scp transfers on failure
+
+# Migration / upgrade
+GLOBALS=false                 # also migrate cluster globals (roles, tablespaces)
+PG_BINDIR=""                  # dir prepended to PATH so a specific PostgreSQL
+                              # client version is used (e.g. dump an old server
+                              # with the target major version's tools)
+
 # Batch
 PARALLEL=1
+PARALLEL_SET=false            # true if --parallel passed on CLI
 CONTINUE_ON_ERROR=false
+CONTINUE_ON_ERROR_SET=false   # true if --continue-on-error passed on CLI
 ONLY_JOBS=""
 EXCLUDE_JOBS=""
 NOTIFY_SUMMARY=false
 SAVE_JOB=""
 BATCH_JOB=""
-JOBS_FILE="${SCRIPT_DIR}/jobs.yaml"
+BOT_TOKEN=""
+BOT_COOLDOWN="1h"
+# Name of the job currently running; inherited from the environment when a job
+# re-execs the script, so failure notifications can attach a "re-run" button
+# targeting the specific job.
+CURRENT_JOB_NAME="${CURRENT_JOB_NAME:-}"
+JOBS_FILE="${JOBS_FILE:-${SCRIPT_DIR}/jobs.yaml}"
 JOBS_ACTION=""
 JOBS_TARGET=""
 
@@ -118,6 +157,12 @@ LOG_LEVEL="info"
 
 # Restore
 FILE=""
+
+# Clean (optional positional database/base-name for the "clean" command)
+CLEAN_DB=""
+
+# Custom dump base name (also usable by "clean")
+DUMP_NAME=""
 
 # Fetch (existing dump from source)
 FROM_FILE=""
@@ -187,19 +232,198 @@ log_success() {
 }
 
 log_debug() {
-    [ "$VERBOSE" = true ] && echo -e "${CYAN}[DEBUG]${NC} $1"
+    # Console debug is shown when --verbose is set or --log-level is debug.
+    if [ "$VERBOSE" = true ] || [ "$(log_level_num "$LOG_LEVEL")" -le 0 ]; then
+        echo -e "${CYAN}[DEBUG]${NC} $1"
+    fi
     log_to_file "DEBUG" "$1"
+}
+
+# Map a log level name (debug|info|warn|error and their INFO/OK aliases) to a
+# numeric severity so --log-level can gate output.
+log_level_num() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        debug)      echo 0 ;;
+        info|ok)    echo 1 ;;
+        warn)       echo 2 ;;
+        error)      echo 3 ;;
+        *)          echo 1 ;;
+    esac
 }
 
 log_to_file() {
     if [ -n "$LOG_FILE" ]; then
+        # Only write messages at or above the configured --log-level.
+        [ "$(log_level_num "$1")" -lt "$(log_level_num "$LOG_LEVEL")" ] && return 0
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2" >> "$LOG_FILE"
     fi
 }
 
 # ==============================================================================
+# SECURITY HELPERS (credential handling, shell/SQL escaping, redaction)
+# ==============================================================================
+# Trim leading/trailing whitespace WITHOUT mangling backslashes or quotes the way
+# "echo \$x | xargs" does (that silently corrupted an identifier so its filter was ignored).
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+
+# Shell-quote a value for safe re-parsing by a shell (local eval or remote sh).
+pq() { printf '%q' "$1"; }
+
+# POSIX single-quote a value (portable for remote shells that lack $'...').
+shq() {
+    local s
+    s=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+    printf "'%s'" "$s"
+}
+
+# Escape a value for use inside a SQL single-quoted string literal.
+sqllit() {
+    local s="$1" sq="'"
+    s="${s//$sq/$sq$sq}"
+    printf '%s' "$s"
+}
+
+# Quote a value as a SQL identifier (double-quoted, embedded quotes doubled).
+sqlid() {
+    local s="$1"
+    s="${s//\"/\"\"}"
+    printf '"%s"' "$s"
+}
+
+# Quote a possibly schema-qualified table name: "schema"."table" (or "table"). The LAST
+# dotted segment is the table; everything before it is the (possibly dotted) schema.
+sqlid_table() {
+    local t="$1"
+    if [[ "$t" == *.* ]]; then
+        printf '%s.%s' "$(sqlid "${t%.*}")" "$(sqlid "${t##*.}")"
+    else
+        sqlid "$t"
+    fi
+}
+
+# Escape a field for the libpq .pgpass file (backslash and colon are special).
+pgpass_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g'
+}
+
+# Redact known passwords from a command string before logging.
+redact_cmd() {
+    local s="$1" p
+    # Redact both the raw and the .pgpass-escaped form of each known password.
+    for p in "$FROM_DB_PASSWORD" "$TO_DB_PASSWORD"; do
+        [ -z "$p" ] && continue
+        s="${s//"$p"/***}"
+        s="${s//"$(pgpass_escape "$p")"/***}"
+    done
+    # Fallback: neutralize any lingering PGPASSWORD=<value> tokens.
+    s="$(printf '%s' "$s" | sed -E "s/PGPASSWORD=([\"'])[^\"']*\1/PGPASSWORD=***/g; s/PGPASSWORD=[^[:space:]'\"]*/PGPASSWORD=***/g")"
+    printf '%s' "$s"
+}
+
+# Redact inline password FLAG values (--password/--from-password/--to-password <value>)
+# from an argv-style string before logging it. Complements redact_cmd (which redacts known
+# password VALUES); this catches the flag form used by legacy job 'args:' strings.
+redact_args() {
+    # Quote-aware value matcher: consume a whole '...'/"..." token (which may contain spaces)
+    # or a bare token, so a space-containing quoted password is fully masked, not just its
+    # first word.
+    printf '%s' "$1" | sed -E "s/(--(from-|to-)?password)[[:space:]]+('[^']*'|\"[^\"]*\"|[^[:space:]]+)/\1 ***/g"
+}
+
+# Create a 600-mode .pgpass file for the given credentials and echo its path.
+make_pgpass_file() {
+    local user="$1" password="$2" f
+    f="$(umask 077; mktemp "${TMPDIR:-/tmp}/t-pgsql-pgpass.XXXXXX")" || return 1
+    chmod 600 "$f"
+    printf '%s\n' "*:*:*:$(pgpass_escape "$user"):$(pgpass_escape "$password")" > "$f"
+    printf '%s' "$f"
+}
+
+# Create a local 600-mode .pgpass file and export PGPASSFILE for local commands.
+# Sets global _PGPASS_TMP so cleanup_local_pgpass can remove it.
+# Temp paths to remove on exit/interruption. A SIGINT/SIGTERM (or "timeout") used to
+# kill the shell before cleanup_* ran, leaking the plaintext-password .pgpass files and
+# decompressed dumps. install_cleanup_trap (called from main) wires the trap.
+_TMP_TO_CLEAN=()
+reg_tmp() { [ -n "$1" ] && _TMP_TO_CLEAN+=("$1"); }
+run_tmp_cleanup() { local p; for p in "${_TMP_TO_CLEAN[@]}"; do rm -rf "$p" 2>/dev/null; done; }
+install_cleanup_trap() { trap 'run_tmp_cleanup' EXIT INT TERM; }
+
+_PGPASS_TMP=""
+setup_local_pgpass() {
+    _PGPASS_TMP="$(make_pgpass_file "$1" "$2")" || return 1
+    reg_tmp "$_PGPASS_TMP"
+    unset PGPASSWORD
+    export PGPASSFILE="$_PGPASS_TMP"
+}
+cleanup_local_pgpass() {
+    unset PGPASSFILE
+    [ -n "$_PGPASS_TMP" ] && rm -f "$_PGPASS_TMP"
+    _PGPASS_TMP=""
+}
+
+# Run a remote command over ssh WITHOUT placing it — and any password embedded in a
+# remote_pgpass_preamble — into the LOCAL process argv (where another local user's `ps`
+# could read it). The command is fed to the remote shell via stdin instead. Use this for
+# any ssh call whose own stdin is otherwise unused; sites that pipe data through ssh
+# stdin (stream, globals-apply, masking batch) cannot use it and keep the secret only
+# transiently in argv. Returns the remote command's exit status; stdout/stderr pass
+# through so `out=$(ssh_exec ...)` and redirections on the call still work.
+# Usage: ssh_exec <port> <user@host> <command> [extra ssh options...]
+# The remote command is executed by bash when the remote has it, else /bin/sh. bash is
+# preferred because call sites escape values with pq() (printf %q), whose $'...' output for
+# control characters is bash-only; falling back to sh keeps minimal remotes (busybox/ash,
+# no bash) working for the common case of values without control characters.
+ssh_exec() {
+    local port="$1" dest="$2" cmd="$3"; shift 3
+    # Probe for bash with the redirect scoped to the PROBE (command -v), then exec cleanly.
+    # NOT 'exec bash 2>/dev/null': that redirect survives the exec and would permanently
+    # send the remote command's stderr to /dev/null (breaking stderr capture). NOT
+    # 'exec bash || exec sh': a failed exec makes a non-interactive shell exit before the
+    # ||, so the sh fallback would be dead code on a bash-less (busybox/ash) remote.
+    printf '%s\n' "$cmd" | ssh -p "$port" "${SSH_OPTS[@]}" "$@" "$dest" 'command -v bash >/dev/null 2>&1 && exec bash; exec sh'
+}
+
+# Emit a remote shell preamble that writes a 600-mode .pgpass, exports
+# PGPASSFILE via an assignment (never argv), and cleans it up on exit.
+# The password only appears as an argument to the printf builtin, not to
+# any long-lived process (psql/pg_dump/pg_restore) argv.
+remote_pgpass_preamble() {
+    local line
+    line=$(shq "*:*:*:$(pgpass_escape "$1"):$(pgpass_escape "$2")")
+    printf '%s' \
+'PGPASSFILE=$(umask 077; mktemp 2>/dev/null || { f="/tmp/.tpg.$$"; :>"$f"; echo "$f"; }); export PGPASSFILE; chmod 600 "$PGPASSFILE"; printf '"'"'%s\n'"'"' '"$line"' >"$PGPASSFILE"; trap '"'"'rm -f "$PGPASSFILE"'"'"' EXIT; '
+}
+
+# ==============================================================================
 # NOTIFICATIONS
 # ==============================================================================
+
+# Escape a string for safe embedding inside a JSON double-quoted value (prevents
+# JSON/payload injection through a database/job/host/error name).
+json_escape() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//$'\n'/\\n}"
+    v="${v//$'\r'/\\r}"
+    v="${v//$'\t'/\\t}"
+    printf '%s' "$v"
+}
+
+# Call the Telegram Bot API without exposing the bot token in the local process argv.
+# The token lives only in the request URL, which is passed to curl via a config on stdin
+# (-K -) instead of on the command line — otherwise a local `ps` reveals the token (and
+# for the long-running bot's getUpdates poll, continuously). Non-secret data (-d/
+# --data-urlencode args) stays on argv. Extra curl args are forwarded; stdout passes through.
+# Usage: tg_api <token> <method> [curl args...]
+tg_api() {
+    local token="$1" method="$2"; shift 2
+    printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$token" "$method" \
+        | curl -s -K - "$@"
+}
+
 send_notification() {
     local status="$1"      # success, failed, error
     local message="$2"     # Main message
@@ -223,12 +447,33 @@ send_notification() {
     for channel in "${NOTIFY[@]}"; do
         case "$channel" in
             telegram:*) notify_telegram "$channel" "$emoji" "$message" "$details" "$timestamp" "$hostname" ;;
+            telegram)
+                # Bare "telegram": resolve config from env or jobs.yaml defaults.
+                local resolved; resolved="$(resolve_bare_telegram)"
+                if [ -n "$resolved" ]; then
+                    notify_telegram "$resolved" "$emoji" "$message" "$details" "$timestamp" "$hostname"
+                else
+                    log_warn "Notification channel 'telegram' requested but no config found (set TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID or defaults.notify.telegram in $JOBS_FILE)"
+                fi
+                ;;
             webhook:*)  notify_webhook "$channel" "$status" "$message" "$details" "$timestamp" ;;
             slack:*)    notify_slack "$channel" "$emoji" "$message" "$details" "$timestamp" "$hostname" ;;
             email:*)    notify_email "$channel" "$status" "$message" "$details" ;;
             *)          log_warn "Unknown notification channel: $channel" ;;
         esac
     done
+}
+
+# Resolve the "telegram:TOKEN:CHAT[:THREAD]" string for a bare "telegram"
+# channel from environment variables first, then jobs.yaml defaults.
+resolve_bare_telegram() {
+    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        local cfg="telegram:${TELEGRAM_BOT_TOKEN}:${TELEGRAM_CHAT_ID}"
+        [ -n "$TELEGRAM_THREAD_ID" ] && cfg="${cfg}:${TELEGRAM_THREAD_ID}"
+        printf '%s' "$cfg"
+        return 0
+    fi
+    [ -f "$JOBS_FILE" ] && get_default_telegram_config
 }
 
 notify_telegram() {
@@ -255,19 +500,39 @@ notify_telegram() {
 ${details}
 🕐 ${timestamp}"
 
-    local curl_args=(-s -X POST "https://api.telegram.org/bot${token}/sendMessage"
-        -d "chat_id=${chat_id}"
-        -d "text=${text}"
-        -d "parse_mode=Markdown"
+    # On a failure notification, attach an inline "re-run backup" button whose
+    # callback_data the running bot (t-pgsql bot) understands: backup:<yaml>:<job>.
+    local callback_data=""
+    if [ -n "$JOBS_FILE" ] && [ -n "$CURRENT_JOB_NAME" ]; then
+        callback_data="backup:$(basename "$JOBS_FILE"):${CURRENT_JOB_NAME}"
+    elif [ -n "$JOBS_FILE" ]; then
+        callback_data="backup:$(basename "$JOBS_FILE"):all"
+    fi
+
+    local reply_markup=""
+    if [[ "$emoji" == "❌" ]] && [ -n "$callback_data" ]; then
+        reply_markup='{"inline_keyboard":[[{"text":"🔄 Re-run Backup","callback_data":"'"$(json_escape "${callback_data}")"'"}]]}'
+    fi
+
+    # Base args WITHOUT parse_mode; parse_mode is added only to the first (Markdown) attempt
+    # so the plain-text retry can reuse the exact same base (no fragile array filtering).
+    local base_args=(-X POST
+        --data-urlencode "chat_id=${chat_id}"
+        --data-urlencode "text=${text}"
         -d "disable_web_page_preview=true")
+    [ -n "$thread_id" ] && base_args+=(-d "message_thread_id=${thread_id}")
+    [ -n "$reply_markup" ] && base_args+=(-d "reply_markup=${reply_markup}")
 
-    # Add thread_id for forum topics
-    [ -n "$thread_id" ] && curl_args+=(-d "message_thread_id=${thread_id}")
-
-    local response=$(curl "${curl_args[@]}" 2>&1)
-
+    local response=$(tg_api "$token" sendMessage "${base_args[@]}" -d "parse_mode=Markdown" 2>&1)
     if echo "$response" | grep -q '"ok":true'; then
         log_debug "Telegram notification sent"
+        return 0
+    fi
+    # Markdown parsing fails with HTTP 400 when an interpolated db/host/error name contains a
+    # Markdown metacharacter, which would silently drop the whole alert. Retry as PLAIN TEXT.
+    response=$(tg_api "$token" sendMessage "${base_args[@]}" 2>&1)
+    if echo "$response" | grep -q '"ok":true'; then
+        log_debug "Telegram notification sent (plain-text fallback)"
     else
         log_warn "Telegram notification failed: $response"
     fi
@@ -284,10 +549,10 @@ notify_webhook() {
 
     local payload=$(cat <<EOF
 {
-    "status": "$status",
-    "message": "$message",
-    "details": "$details",
-    "timestamp": "$timestamp",
+    "status": "$(json_escape "$status")",
+    "message": "$(json_escape "$message")",
+    "details": "$(json_escape "$details")",
+    "timestamp": "$(json_escape "$timestamp")",
     "tool": "t-pgsql",
     "version": "$VERSION"
 }
@@ -319,9 +584,9 @@ notify_slack() {
 {
     "attachments": [{
         "color": "$color",
-        "title": "$emoji t-pgsql: $message",
-        "text": "$details",
-        "footer": "Host: $hostname | $timestamp"
+        "title": "$emoji t-pgsql: $(json_escape "$message")",
+        "text": "$(json_escape "$details")",
+        "footer": "Host: $(json_escape "$hostname") | $(json_escape "$timestamp")"
     }]
 }
 EOF
@@ -417,6 +682,10 @@ meta_write() {
     local status="${2:-success}"
     local exit_code="${3:-0}"
 
+    # META_ARTIFACT reports the file that actually exists after this call so the
+    # caller can print an accurate DUMP_FILE=... line. Reset it every call.
+    META_ARTIFACT=""
+
     [ "$META_ENABLED" != true ] && return 0
     [ -z "$dump_file" ] && return 0
     [ ! -f "$dump_file" ] && return 0
@@ -424,7 +693,11 @@ meta_write() {
     local dump_dir=$(dirname "$dump_file")
     local dump_name=$(basename "$dump_file")
     local base_name="${dump_name%.dump}"
-    local meta_file="${dump_dir}/metadata.yaml"
+    # Build metadata in a UNIQUE temp dir (not a shared dump_dir/metadata.yaml) so
+    # concurrent dumps in the same directory don't race on / corrupt each other's
+    # metadata. It is added to the tar as "metadata.yaml" via a second -C below.
+    local meta_dir; meta_dir=$(mktemp -d); reg_tmp "$meta_dir"
+    local meta_file="${meta_dir}/metadata.yaml"
     local tar_file="${dump_dir}/${base_name}.tar.gz"
 
     local end_time=$(date '+%Y-%m-%d %H:%M:%S')
@@ -445,14 +718,14 @@ timing:
   elapsed_seconds: ${elapsed_sec}
 
 source:
-  type: ${FROM_TYPE}
-  host: ${FROM_SSH_HOST:-${FROM_DB_HOST}}
-  port: ${FROM_DB_PORT}
-  database: ${FROM_DATABASE}
-  user: ${FROM_DB_USER}
+  type: "${FROM_TYPE}"
+  host: "${FROM_SSH_HOST:-${FROM_DB_HOST}}"
+  port: "${FROM_DB_PORT}"
+  database: "${FROM_DATABASE//\"/}"
+  user: "${FROM_DB_USER//\"/}"
 
 file:
-  name: ${dump_name}
+  name: "${dump_name//\"/}"
   size: "${dump_size:-unknown}"
   compression: ${COMPRESS}
   compress_level: ${PG_COMPRESS_LEVEL}
@@ -482,21 +755,32 @@ filter:
 EOF
     fi
 
-    # Create tar.gz archive
-    log_debug "Creating archive: $tar_file"
-    local tar_files=("$dump_name")
-    [ -f "$meta_file" ] && tar_files+=("metadata.yaml")
-    (cd "$dump_dir" && tar -czf "$(basename "$tar_file")" "${tar_files[@]}" 2>/dev/null)
+    if [[ "$dump_name" == *.dump ]]; then
+        # Plain pg_dump archive: wrap dump + metadata into a single tar.gz.
+        log_debug "Creating archive: $tar_file"
+        local meta_opt=()
+        [ -f "$meta_file" ] && meta_opt=(-C "$meta_dir" "metadata.yaml")
+        COPYFILE_DISABLE=1 tar -czf "$tar_file" -C "$dump_dir" "$dump_name" "${meta_opt[@]}" 2>/dev/null
 
-    if [ $? -eq 0 ]; then
-        # Remove original files
-        rm -f "$dump_file" "$meta_file"
-        log_debug "Archive created: $tar_file"
+        if [ $? -eq 0 ]; then
+            # Remove original files
+            rm -f "$dump_file"; rm -rf "$meta_dir"
+            log_debug "Archive created: $tar_file"
+            META_ARTIFACT="$tar_file"
 
-        # Return the tar file path (for use by caller)
-        echo "TAR_FILE=$tar_file"
+            # Return the tar file path (for use by caller)
+            echo "TAR_FILE=$tar_file"
+        else
+            log_warn "Failed to create archive, keeping separate files"
+            META_ARTIFACT="$dump_file"
+        fi
     else
-        log_warn "Failed to create archive, keeping separate files"
+        # Externally compressed standalone artifact (.dump.zst/.xz/.bz2): keep it
+        # as-is and drop a "${file}.meta" sidecar (read by show_meta). Wrapping it
+        # in tar.gz would break restore, which decompresses these files directly.
+        mv "$meta_file" "${dump_file}.meta" 2>/dev/null
+        META_ARTIFACT="$dump_file"
+        log_debug "Metadata sidecar: ${dump_file}.meta"
     fi
 }
 
@@ -510,12 +794,13 @@ meta_update_target() {
     [ ! -f "$tar_file" ] && return 0
 
     local temp_dir=$(mktemp -d)
+    [ -z "$temp_dir" ] && { log_error "mktemp failed"; return 0; }
 
     # Extract everything from tar
     tar -xzf "$tar_file" -C "$temp_dir" 2>/dev/null || { rm -rf "$temp_dir"; return 0; }
 
-    # Find the dump file
-    local dump_name=$(ls "$temp_dir"/*.dump 2>/dev/null | head -1 | xargs basename 2>/dev/null)
+    # Find the dump file (ignore macOS AppleDouble ._ sidecars, which sort first).
+    local dump_name=$(ls "$temp_dir"/*.dump 2>/dev/null | grep -vE '/\._' | head -1 | xargs basename 2>/dev/null)
     [ -z "$dump_name" ] && { rm -rf "$temp_dir"; return 0; }
 
     # Create metadata.yaml if it doesn't exist
@@ -543,25 +828,54 @@ restore:
   total_elapsed: "$(format_elapsed $(($(date +%s) - META_START_EPOCH)))"
 EOF
 
-    # Recreate tar with updated metadata
+    # Recreate tar with updated metadata. Write to a SIDE FILE and atomically replace the
+    # original only on success — a failed re-tar (disk full, etc.) must not truncate/corrupt
+    # the only backup archive, which the old in-place rewrite could do right before the temp
+    # copy was deleted.
     local tar_args=("$dump_name")
     [ -f "$temp_dir/metadata.yaml" ] && tar_args+=("metadata.yaml")
-    (cd "$temp_dir" && tar -czf "$tar_file" "${tar_args[@]}" 2>/dev/null)
+    local new_tar="${tar_file}.tpgtmp.$$"
+    if (cd "$temp_dir" && COPYFILE_DISABLE=1 tar -czf "$new_tar" "${tar_args[@]}" 2>/dev/null) && [ -s "$new_tar" ]; then
+        mv -f "$new_tar" "$tar_file"
+        log_debug "Metadata updated with target info"
+    else
+        rm -f "$new_tar"
+        log_warn "Metadata re-archive failed; leaving the original dump archive intact"
+    fi
 
     rm -rf "$temp_dir"
-    log_debug "Metadata updated with target info"
 }
 
-# Extract dump from tar archive, returns path to extracted dump
+# Extract dump from tar archive, returns path to extracted dump.
+# The member name comes from the (possibly untrusted) archive, so it is validated
+# against path traversal BEFORE extraction: a member like '../../tmp/evil.dump' or an
+# absolute path could otherwise write outside extract_dir when restoring a crafted archive.
 extract_dump() {
     local file="$1"
     local extract_dir="${2:-$(mktemp -d)}"
+    [ -z "$extract_dir" ] && { log_error "mktemp failed"; return 1; }
 
     if [[ "$file" == *.tar.gz ]]; then
-        local dump_name=$(tar -tzf "$file" 2>/dev/null | grep -E '\.dump$' | head -1)
+        # Skip macOS AppleDouble sidecars (._name): an archive that passed through macOS
+        # (with xattrs, e.g. com.apple.provenance) carries a "._<dump>.dump" entry that would
+        # otherwise be picked ahead of the real dump and fail the restore.
+        local dump_name=$(tar -tzf "$file" 2>/dev/null | grep -E '\.dump$' | grep -vE '(^|/)\._' | head -1)
         if [ -n "$dump_name" ]; then
+            # Reject absolute paths and any '..' component; require a plain relative name.
+            case "$dump_name" in
+                /*|*/../*|../*|*/..|..) log_error "Unsafe archive member (path traversal), refusing to extract: $dump_name"; return 1 ;;
+            esac
             tar -xzf "$file" -C "$extract_dir" "$dump_name" 2>/dev/null
-            echo "${extract_dir}/${dump_name}"
+            # Confirm the extracted file really landed inside extract_dir (defends against
+            # symlink/edge cases the name check might miss on non-GNU tar).
+            local out="${extract_dir}/${dump_name}" real base
+            real=$(cd "$(dirname "$out")" 2>/dev/null && pwd -P)/$(basename "$out")
+            base=$(cd "$extract_dir" 2>/dev/null && pwd -P)
+            if [ -z "$real" ] || [ -z "$base" ] || [ "${real#"$base"/}" = "$real" ]; then
+                log_error "Extracted dump escaped the temp directory, refusing: $dump_name"
+                return 1
+            fi
+            echo "$out"
         fi
     elif [[ "$file" == *.dump ]]; then
         echo "$file"
@@ -573,9 +887,15 @@ show_meta() {
     local file="$1"
 
     if [[ "$file" == *.tar.gz ]]; then
-        tar -xzf "$file" -O metadata.yaml 2>/dev/null
+        tar -xzf "$file" -O metadata.yaml 2>/dev/null || {
+            log_error "No metadata found (not a valid t-pgsql archive): $file"
+            return 1
+        }
     elif [[ -f "${file}.meta" ]]; then
         cat "${file}.meta"
+    else
+        log_error "No metadata for: $file (not a .tar.gz archive and no .meta sidecar)"
+        return 1
     fi
 }
 
@@ -595,17 +915,32 @@ format_elapsed() {
     fi
 }
 
+# List dump files belonging to EXACTLY one base name, newest first.
+# The shell glob "${base}_*" also matches a prefix-overlapping db (e.g. base
+# "prod" would grab "prod_v2_...").  Anchor the result with a regex so only
+# files named base + "_" + YYYYMMDD + "_" + HHMMSS + a known extension survive.
+# Usage: list_dumps_for_base "dir" "base"
+list_dumps_for_base() {
+    local dir="$1"
+    local base="$2"
+    # Escape regex metacharacters in the base so it is matched literally.
+    local esc_base
+    esc_base=$(printf '%s' "$base" | sed 's/[][\.^$*+?(){}|/]/\\&/g')
+    local re="/${esc_base}_[0-9]{8}_[0-9]{6}(_[0-9]+)?\.(tar\.gz|dump\.zst|dump\.xz|dump\.bz2|dump)\$"
+    { ls -t "$dir"/"${base}"_*.tar.gz \
+           "$dir"/"${base}"_*.dump.zst \
+           "$dir"/"${base}"_*.dump.xz \
+           "$dir"/"${base}"_*.dump.bz2 \
+           "$dir"/"${base}"_*.dump 2>/dev/null; } | grep -E "$re"
+}
+
 # Check if recent dump exists (skip_if_recent feature)
 # Returns 0 if should skip, 1 if should proceed
 check_skip_recent() {
     [ -z "$SKIP_IF_RECENT" ] && return 1  # No skip configured, proceed
 
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-    local latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null | head -1)
-    [ -z "$latest" ] && latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.zst 2>/dev/null | head -1)
-    [ -z "$latest" ] && latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.xz 2>/dev/null | head -1)
-    [ -z "$latest" ] && latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.bz2 2>/dev/null | head -1)
-    [ -z "$latest" ] && latest=$(ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump 2>/dev/null | head -1)
+    local latest=$(list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name" | head -1)
     [ -z "$latest" ] && return 1  # No existing dump, proceed
 
     # Get file modification time (macOS uses -f, Linux uses -c)
@@ -629,18 +964,23 @@ check_skip_recent() {
             fi
             return 1
             ;;
-        *h)
-            skip_sec=$(( ${SKIP_IF_RECENT%h} * 3600 ))
-            ;;
-        *m)
-            skip_sec=$(( ${SKIP_IF_RECENT%m} * 60 ))
-            ;;
-        *d)
-            skip_sec=$(( ${SKIP_IF_RECENT%d} * 86400 ))
-            ;;
-        *)
-            # Assume hours if no suffix
-            skip_sec=$(( SKIP_IF_RECENT * 3600 ))
+        *h|*m|*d|*)
+            # Extract the numeric part and its unit multiplier. Validate BEFORE any
+            # arithmetic: a garbage value like "24hr"/"1.5h"/"5x" used to hit a bash
+            # arithmetic error and ABORT the whole backup (a missed backup). Now we
+            # warn and proceed with the backup instead of skipping.
+            local _num _mult=3600
+            case "$SKIP_IF_RECENT" in
+                *h) _num="${SKIP_IF_RECENT%h}"; _mult=3600 ;;
+                *m) _num="${SKIP_IF_RECENT%m}"; _mult=60 ;;
+                *d) _num="${SKIP_IF_RECENT%d}"; _mult=86400 ;;
+                *)  _num="$SKIP_IF_RECENT"; _mult=3600 ;;
+            esac
+            if ! [[ "$_num" =~ ^[0-9]+$ ]]; then
+                log_warn "Invalid --skip-if-recent '$SKIP_IF_RECENT' (use e.g. 24h, 30m, 2d, today); proceeding with backup"
+                return 1
+            fi
+            skip_sec=$(( _num * _mult ))
             ;;
     esac
 
@@ -667,15 +1007,21 @@ COMMANDS:
     dump        Create database backup
     restore     Restore backup to database
     clone       Dump + Restore (full sync)
+    upgrade     Logical major-version migration (clone + cluster globals)
     fetch       Fetch existing dump from remote (no new dump)
     batch       Run multiple jobs from config
+    bot         Telegram bot (listen for commands + inline button callbacks)
+                  bot [--yaml <file>] [--token <token>] [--cooldown <time>]
     jobs        Manage saved jobs
                   jobs [list] [--yaml <file>]  List all jobs
                   jobs show <name> [--yaml <file>]  Show job details
                   jobs remove <name> [--yaml <file>] Remove a job
     list        List dump files
     meta        Show metadata from archive
-    clean       Clean old dumps
+    clean       Clean old dumps (requires a target + retention)
+                  clean <db> --keep <N>        Clean by database name
+                  clean --from <conn> --keep <N>
+                  clean --dump-name <name> --retention
     version     Show version
 
 CONNECTION:
@@ -689,8 +1035,8 @@ CONNECTION:
     Examples:
       localhost/mydb
       postgres@localhost:5432/mydb
-      ssh://ubuntu@192.168.1.100/mydb
-      ssh://ubuntu@192.168.1.100:22/postgres@localhost:5432/mydb
+      ssh://ubuntu@192.0.2.20/mydb
+      ssh://ubuntu@192.0.2.20:22/postgres@localhost:5432/mydb
 
 PASSWORD:
     --password <pass>             Password for both connections
@@ -699,27 +1045,36 @@ PASSWORD:
     --password-file <file>        Read password from file
     --from-password-file <file>   Source password file
     --to-password-file <file>     Target password file (repeatable for multiple targets)
-    --config <file>               Config file with credentials
+    --config <file>               Defaults file (connections/credentials) for a single run.
+                                  This is NOT the batch jobs file — use --yaml for jobs.
 
     Env vars: T_PGSQL_PASSWORD, T_PGSQL_FROM_PASSWORD, T_PGSQL_TO_PASSWORD
+    Tip: prefer password files or env vars over --password (CLI args are visible in `ps`).
 
-FILTER:
+FILTER (dump content — which tables/schemas go into the dump):
     --exclude-table <t1,t2>       Exclude tables
     --exclude-schema <s1,s2>      Exclude schemas
     --exclude-data <t1,t2>        Exclude data only (keep structure, supports schema.* wildcard)
     --only-table <t1,t2>          Include only these tables
     --only-schema <s1,s2>         Include only these schemas
+    (For selecting which batch JOBS run, see --only-jobs/--exclude-jobs under BATCH.)
 
 COMPRESSION:
     --compress <type>             gzip|zstd|xz|bzip2|none (default: gzip)
-    --compress-level <1-9>        Compression level (default: 6)
-    --pg-compress-level <0-9>     pg_dump compression (default: 6)
+    --compress-level <N>          Level for the active compressor (default: 6).
+                                  Valid range depends on the type: gzip/xz/bzip2 1-9,
+                                  zstd 1-19. With zstd/xz/bzip2, pg_dump's built-in
+                                  compression is disabled so data is compressed once.
+    --pg-compress-level <0-9>     Advanced: override pg_dump's built-in -Z level
+                                  (only affects the gzip type; default: 6)
 
 STORAGE:
-    --output <dir>                Output directory
+    --output <dir>                Output directory (default: env T_PGSQL_OUTPUT_DIR,
+                                  else <script dir>/../data/dumps)
     --dump-name <name>            Custom dump filename (without timestamp)
     --keep <N>                    Keep last N local dumps (-1=all, 0=none)
-    --from-keep <N>               Keep N dumps on source (default: 1, -1=all, 0=delete)
+    --from-keep <N>               For SSH sources: how many dumps to keep in the remote
+                                  /tmp staging dir (default: 1, -1=all, 0=delete)
     --skip-if-recent <time>       Skip if dump exists within timeframe
                                   Examples: 24h, 12h, 1d, today
     --from-file [pattern]         Fetch existing dump (for fetch command)
@@ -760,9 +1115,32 @@ BATCH:
                                   Example: --yaml prod (uses prod.yaml)
     --parallel <N>                Parallel jobs (default: 1)
     --continue-on-error           Don't stop on error
-    --only <jobs>                 Run only these jobs
-    --exclude <jobs>              Skip these jobs
+    --only-jobs <j1,j2>           Run only these jobs   (alias: --only)
+    --exclude-jobs <j1,j2>        Skip these jobs       (alias: --exclude)
     --notify-summary              Summary notification
+
+MIGRATION / UPGRADE:
+    --globals                     Also migrate cluster globals (roles, tablespaces)
+                                  from source to every target (local/TCP or SSH)
+    --pg-bindir <dir>             Use PostgreSQL client tools from <dir> for local
+                                  operations (e.g. dump an old server with the target
+                                  major version's pg_dump). Does not affect SSH sources.
+
+    The 'upgrade' command = clone + --globals + a version preflight (it refuses to
+    restore into an OLDER major version). This is the logical (dump/restore) path;
+    for large clusters or minimal downtime prefer pg_upgrade or logical replication.
+
+TRANSFER (SSH scp + streaming clone):
+    --bwlimit <rate>              Cap transfer bandwidth. Accepts 10m (MByte/s),
+                                  500k (KByte/s) or a bare number (KByte/s).
+                                  Applies to scp copies and the streaming pipe (pv).
+    --retries <N>                 Retry a failed scp transfer N extra times (backoff).
+    (SSH transfers also use ConnectTimeout + ServerAlive keepalive so a stalled
+     link fails within ~60s instead of hanging.)
+
+BOT:
+    --token <token>               Telegram bot token (or auto-detect from YAML)
+    --cooldown <time>             Min interval between button-triggered backups (default: 1h)
 
 RESTORE:
     --file <path>                 Dump file to restore
@@ -781,7 +1159,7 @@ GENERAL:
 EXAMPLES:
     # Remote to local
     t-pgsql clone \
-      --from ssh://ubuntu@192.168.1.100/prod_db \
+      --from ssh://ubuntu@192.0.2.20/prod_db \
       --to localhost/dev_db \
       --from-password-file ~/.secrets/prod.pass \
       --to-password-file ~/.secrets/local.pass
@@ -789,12 +1167,12 @@ EXAMPLES:
     # Local to remote (push)
     t-pgsql clone \
       --from localhost/mydb \
-      --to ssh://ubuntu@192.168.1.100/backup_db \
+      --to ssh://ubuntu@192.0.2.20/backup_db \
       --password-file ~/.secrets/db.pass
 
     # Dump with retention
     t-pgsql dump \
-      --from ssh://ubuntu@192.168.1.100/prod \
+      --from ssh://ubuntu@192.0.2.20/prod \
       --from-password-file ~/.secrets/prod.pass \
       --compress zstd \
       --retention
@@ -806,14 +1184,26 @@ EXAMPLES:
       --to-password-file ~/.secrets/local.pass
 
     # Batch
-    t-pgsql batch --config jobs.yaml --parallel 2
+    t-pgsql batch all --yaml prod --parallel 2
+
+    # Major-version logical migration (e.g. PG16 -> PG18), with roles/tablespaces.
+    # Run from a host/container whose pg_dump matches the TARGET version.
+    t-pgsql upgrade \
+      --from "postgres@old-16-host:5432/appdb" \
+      --to   "postgres@new-18-host:5432/appdb" -y
+
+    # Telegram bot (token from YAML), custom cooldown
+    t-pgsql bot --yaml prod --cooldown 30m
+    #   /list              - list all YAML files
+    #   /list prod         - list jobs in prod.yaml
+    #   /backup prod nightly - run the "nightly" job (respects cooldown)
 
     # Fetch latest dump for database (auto-find)
-    t-pgsql fetch --from ssh://ubuntu@192.168.1.100/prod --from-file
+    t-pgsql fetch --from ssh://ubuntu@192.0.2.20/prod --from-file
 
     # Fetch with specific pattern
     t-pgsql fetch \
-      --from ssh://ubuntu@192.168.1.100/prod \
+      --from ssh://ubuntu@192.0.2.20/prod \
       --from-file "prod_20250130*.dump"
 
 More info: https://github.com/Asimatasert/t-pgsql
@@ -851,10 +1241,10 @@ parse_local_connection() {
 
     # Format: user@host[:port]/[db_user@]database
     # Examples:
-    #   asimatasert@localhost/test           -> user=asimatasert, db=test
-    #   asimatasert@localhost/postgres@test  -> user=postgres, db=test
-    #   asimatasert@localhost:5432/test      -> with port
-    #   postgres@test                        -> simple format, localhost
+    #   dbadmin@localhost/test           -> user=dbadmin, db=test
+    #   dbadmin@localhost/postgres@test  -> user=postgres, db=test
+    #   dbadmin@localhost:5432/test      -> with port
+    #   postgres@test                    -> simple format, localhost
 
     if [[ "$conn" == */* ]]; then
         # Has slash: user@host/database or user@host:port/database
@@ -878,8 +1268,19 @@ parse_local_connection() {
             conn="${conn#*@}"
         fi
 
-        # host:port or just host
-        if [[ "$conn" == *:* ]]; then
+        # host:port or just host. Support IPv6 bracket forms [addr]:port and [addr];
+        # a bare IPv6 (multiple colons, unbracketed) is ambiguous and is rejected
+        # rather than silently blanking the host (which used to dump via the local
+        # socket and report success — a silent wrong-target).
+        if [[ "$conn" == \[*\]:* ]]; then
+            host="${conn%]:*}"; host="${host#\[}"
+            port="${conn##*]:}"
+        elif [[ "$conn" == \[*\] ]]; then
+            host="${conn#\[}"; host="${host%]}"
+        elif [[ "$conn" == *:*:* ]]; then
+            log_error "IPv6 host must be bracketed, e.g. [${conn%:*}]:${conn##*:} or [${conn}]"
+            return 1
+        elif [[ "$conn" == *:* ]]; then
             host="${conn%%:*}"
             port="${conn##*:}"
         else
@@ -898,11 +1299,17 @@ parse_local_connection() {
 
     [ -z "$db" ] && { log_error "Missing database: $1"; return 1; }
 
-    eval "${prefix}_TYPE='local'"
-    eval "${prefix}_DB_USER='$user'"
-    eval "${prefix}_DB_HOST='$host'"
-    eval "${prefix}_DB_PORT='$port'"
-    eval "${prefix}_DATABASE='$db'"
+    printf -v "${prefix}_TYPE" '%s' 'local'
+    printf -v "${prefix}_DB_USER" '%s' "$user"
+    printf -v "${prefix}_DB_HOST" '%s' "$host"
+    printf -v "${prefix}_DB_PORT" '%s' "$port"
+    printf -v "${prefix}_DATABASE" '%s' "$db"
+    # Reset the SSH fields: parsing a LOCAL target must not leave a stale SSH host/user/port
+    # from a previously-parsed ssh:// target (which would e.g. defeat the clone source==target
+    # guard, or misroute code that inspects ${prefix}_SSH_HOST).
+    printf -v "${prefix}_SSH_HOST" '%s' ''
+    printf -v "${prefix}_SSH_USER" '%s' ''
+    printf -v "${prefix}_SSH_PORT" '%s' ''
 
     log_debug "$prefix: local $user@$host:$port/$db"
 }
@@ -923,8 +1330,8 @@ parse_ssh_connection() {
 
     # Format: ssh_user@ssh_host[:ssh_port]/db_user@db_host[:db_port]/database
     # Examples:
-    #   awesome@10.10.1.30/postgres@localhost/workarea
-    #   awesome@10.10.1.30:2222/postgres@localhost:5433/workarea
+    #   dbadmin@192.0.2.10/postgres@localhost/appdb
+    #   dbadmin@192.0.2.10:2222/postgres@localhost:5433/appdb
 
     # Extract database name (last /)
     if [[ "$conn" == */* ]]; then
@@ -981,14 +1388,14 @@ parse_ssh_connection() {
     # If db_user not specified, use "postgres" as default
     [ -z "$db_user" ] && db_user="postgres"
 
-    eval "${prefix}_TYPE='ssh'"
-    eval "${prefix}_SSH_USER='$ssh_user'"
-    eval "${prefix}_SSH_HOST='$ssh_host'"
-    eval "${prefix}_SSH_PORT='$ssh_port'"
-    eval "${prefix}_DB_USER='$db_user'"
-    eval "${prefix}_DB_HOST='$db_host'"
-    eval "${prefix}_DB_PORT='$db_port'"
-    eval "${prefix}_DATABASE='$db'"
+    printf -v "${prefix}_TYPE" '%s' 'ssh'
+    printf -v "${prefix}_SSH_USER" '%s' "$ssh_user"
+    printf -v "${prefix}_SSH_HOST" '%s' "$ssh_host"
+    printf -v "${prefix}_SSH_PORT" '%s' "$ssh_port"
+    printf -v "${prefix}_DB_USER" '%s' "$db_user"
+    printf -v "${prefix}_DB_HOST" '%s' "$db_host"
+    printf -v "${prefix}_DB_PORT" '%s' "$db_port"
+    printf -v "${prefix}_DATABASE" '%s' "$db"
 
     log_debug "$prefix: ssh $ssh_user@$ssh_host:$ssh_port -> $db_user@$db_host:$db_port/$db"
 }
@@ -1027,19 +1434,28 @@ get_password() {
         if [ "$prefix" = "FROM" ] && [ -n "$FROM_PASSWORD_FILE" ]; then
             pf="$FROM_PASSWORD_FILE"
         elif [ "$prefix" = "TO" ] && [ ${#TO_PASSWORD_FILES[@]} -gt 0 ]; then
-            # Multiple targets: use indexed password file or fallback to first one
-            if [ ${#TO_PASSWORD_FILES[@]} -gt 1 ] && [ -n "${TO_PASSWORD_FILES[$index]}" ]; then
-                pf="${TO_PASSWORD_FILES[$index]}"
-            else
-                # Single password file for all targets
+            # One file applies to all targets; multiple files map per-target by index.
+            # If there are multiple files but fewer than targets, an out-of-range target
+            # gets NO file (not target 0's) — reusing another target's credential is wrong.
+            if [ ${#TO_PASSWORD_FILES[@]} -eq 1 ]; then
                 pf="${TO_PASSWORD_FILES[0]}"
+            else
+                pf="${TO_PASSWORD_FILES[$index]}"
             fi
         elif [ -n "$PASSWORD_FILE" ]; then
             pf="$PASSWORD_FILE"
         fi
 
-        if [ -n "$pf" ] && [ -f "$pf" ]; then
-            pass=$(cat "$pf" | tr -d '\n')
+        if [ -n "$pf" ]; then
+            if [ ! -f "$pf" ]; then
+                # A password file was explicitly requested but is missing — fail loudly
+                # instead of silently proceeding with no password.
+                log_error "Password file not found: $pf"
+                return 1
+            fi
+            # Strip CR and LF so a Windows/CRLF-saved file doesn't leave a trailing \r
+            # embedded in the password.
+            pass=$(cat "$pf" | tr -d '\r\n')
             log_debug "Password from file: $pf"
         fi
     fi
@@ -1053,7 +1469,7 @@ get_password() {
     # Sudo mode doesn't need password for FROM
     if [ -z "$pass" ] && [ "$prefix" = "FROM" ] && [ "$SUDO" = true ]; then
         log_debug "Sudo mode: skipping FROM password"
-        eval "${prefix}_DB_PASSWORD=''"
+        printf -v "${prefix}_DB_PASSWORD" '%s' ''
         return 0
     fi
 
@@ -1062,7 +1478,7 @@ get_password() {
         return 1
     fi
 
-    eval "${prefix}_DB_PASSWORD='$pass'"
+    printf -v "${prefix}_DB_PASSWORD" '%s' "$pass"
 }
 
 # ==============================================================================
@@ -1110,34 +1526,51 @@ health_check() {
             db_port="$TO_DB_PORT"
         fi
 
-        # Check SSH connection
-        if ! ssh -p "$ssh_port" -o ConnectTimeout=5 -o BatchMode=yes "${ssh_user}@${ssh_host}" "echo ok" >/dev/null 2>&1; then
+        # Check SSH connection (honor the same SSH_OPTS as every other ssh call so the
+        # probe uses the same key/keepalive settings as the operations it precedes).
+        if ! ssh -p "$ssh_port" "${SSH_OPTS[@]}" -o ConnectTimeout=5 -o BatchMode=yes "${ssh_user}@${ssh_host}" "echo ok" >/dev/null 2>&1; then
             log_error "SSH connection failed: ${ssh_user}@${ssh_host}:${ssh_port}"
             return 1
         fi
         log_debug "SSH connection OK"
 
-        # Check database connection via SSH
-        local check_cmd="env PGPASSWORD='$password' psql -U $user -h $db_host -p $db_port -d $database -c 'SELECT 1' >/dev/null 2>&1 && echo ok"
-        if ! ssh -p "$ssh_port" "${ssh_user}@${ssh_host}" "$check_cmd" | grep -q "ok"; then
-            # If database doesn't exist, try connecting to postgres database to verify server access
-            local fallback_cmd="env PGPASSWORD='$password' psql -U $user -h $db_host -p $db_port -d postgres -c 'SELECT 1' >/dev/null 2>&1 && echo ok"
-            if ! ssh -p "$ssh_port" "${ssh_user}@${ssh_host}" "$fallback_cmd" | grep -q "ok"; then
+        # Check database connection via SSH (password via remote PGPASSFILE, not argv)
+        local pgpass_pre; pgpass_pre="$(remote_pgpass_preamble "$user" "$password")"
+        local check_cmd="${pgpass_pre}psql -U $(pq "$user") -h $(pq "$db_host") -p $(pq "$db_port") -d $(pq "$database") -c 'SELECT 1' >/dev/null 2>&1 && echo ok"
+        if ! ssh_exec "$ssh_port" "${ssh_user}@${ssh_host}" "$check_cmd" -o ConnectTimeout=5 -o BatchMode=yes | grep -q "ok"; then
+            # A SOURCE database MUST exist — do not fall back (that falsely passed the
+            # check for a non-existent source). Only a TARGET may not exist yet.
+            if [ "$prefix" = "FROM" ]; then
+                log_error "Source database does not exist or is unreachable: $user@$db_host:$db_port/$database"
+                return 1
+            fi
+            local fallback_cmd="${pgpass_pre}psql -U $(pq "$user") -h $(pq "$db_host") -p $(pq "$db_port") -d postgres -c 'SELECT 1' >/dev/null 2>&1 && echo ok"
+            if ! ssh_exec "$ssh_port" "${ssh_user}@${ssh_host}" "$fallback_cmd" -o ConnectTimeout=5 -o BatchMode=yes | grep -q "ok"; then
                 log_error "Database connection failed: $user@$db_host:$db_port/$database"
                 return 1
             fi
-            log_debug "Database '$database' doesn't exist yet, but PostgreSQL server is accessible"
+            log_debug "Target database '$database' doesn't exist yet, but PostgreSQL server is accessible"
         fi
     else
-        # Local database check
-        if ! env PGPASSWORD="$password" psql -U "$user" -h "$FROM_DB_HOST" -p "$port" -d "$database" -c 'SELECT 1' >/dev/null 2>&1; then
-            # If database doesn't exist, try connecting to postgres database to verify server access
-            if ! env PGPASSWORD="$password" psql -U "$user" -h "$FROM_DB_HOST" -p "$port" -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
-                log_error "Database connection failed: $user@$FROM_DB_HOST:$port/$database"
+        # Local database check (password via PGPASSFILE, not argv).
+        # Use "$host" (set per-prefix above), NOT a hardcoded FROM_DB_HOST — otherwise
+        # a TO-target check probes the source's host and spuriously fails.
+        setup_local_pgpass "$user" "$password" || { log_error "Failed to prepare credentials"; return 1; }
+        if ! psql -U "$user" -h "$host" -p "$port" -d "$database" -c 'SELECT 1' >/dev/null 2>&1; then
+            # Source must exist; only a target may not exist yet (see above).
+            if [ "$prefix" = "FROM" ]; then
+                cleanup_local_pgpass
+                log_error "Source database does not exist or is unreachable: $user@$host:$port/$database"
                 return 1
             fi
-            log_debug "Database '$database' doesn't exist yet, but PostgreSQL server is accessible"
+            if ! psql -U "$user" -h "$host" -p "$port" -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
+                cleanup_local_pgpass
+                log_error "Database connection failed: $user@$host:$port/$database"
+                return 1
+            fi
+            log_debug "Target database '$database' doesn't exist yet, but PostgreSQL server is accessible"
         fi
+        cleanup_local_pgpass
     fi
 
     log_success "Health check passed: $label"
@@ -1170,6 +1603,27 @@ run_health_checks() {
     return $failed
 }
 
+# Post-operation health check (--health-check-after): verify connectivity with a
+# "SELECT 1" against the operation's endpoint (target if set, otherwise source).
+run_post_health_check() {
+    [ "$HEALTH_CHECK_AFTER" != true ] && return 0
+    [ "$DRY_RUN" = true ] && return 0
+
+    log_info "Running post-operation health check..."
+    local rc=0
+    if [ -n "$TO_DATABASE" ]; then
+        health_check "TO" "Target (post-op)" || rc=1
+    elif [ -n "$FROM_DATABASE" ]; then
+        health_check "FROM" "Source (post-op)" || rc=1
+    else
+        log_warn "Post-operation health check skipped: no database to check"
+        return 0
+    fi
+
+    [ $rc -eq 0 ] && log_success "Post-operation health check passed" || log_warn "Post-operation health check failed"
+    return $rc
+}
+
 # ==============================================================================
 # CONFIG FILE PARSER
 # ==============================================================================
@@ -1188,12 +1642,26 @@ load_config() {
         # Skip comments and empty lines
         [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
 
-        # Trim whitespace and quotes
-        key=$(echo "$key" | xargs)
-        value=$(echo "$value" | sed 's/^["'"'"']\|["'"'"']$//g' | xargs)
+        # Trim surrounding whitespace, then strip at most one matching pair of
+        # surrounding quotes. Pure bash so it is portable (no GNU-only sed BRE
+        # alternation) and safe on values containing apostrophes (no xargs).
+        key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
+        case "$value" in
+            \"*) value="${value#\"}" ;;
+            \'*) value="${value#\'}" ;;
+        esac
+        case "$value" in
+            *\") value="${value%\"}" ;;
+            *\') value="${value%\'}" ;;
+        esac
 
-        # Expand ~ to home directory
-        value="${value/#\~/$HOME}"
+        # Expand a leading ~ to $HOME ONLY for path-type keys — never for passwords
+        # or connection strings (a password that happens to start with ~ was being
+        # silently rewritten into a home-dir path).
+        case "$key" in
+            output|log|log_level|*_file|*-file) value="${value/#\~/$HOME}" ;;
+        esac
 
         case "$key" in
             from) [ -z "$FROM_CONNECTION" ] && FROM_CONNECTION="$value" ;;
@@ -1204,10 +1672,10 @@ load_config() {
             password_file|password-file) [ -z "$PASSWORD_FILE" ] && PASSWORD_FILE="$value" ;;
             from_password_file|from-password-file) [ -z "$FROM_PASSWORD_FILE" ] && FROM_PASSWORD_FILE="$value" ;;
             to_password_file|to-password-file) [ ${#TO_PASSWORD_FILES[@]} -eq 0 ] && TO_PASSWORD_FILES+=("$value") ;;
-            output) [ "$OUTPUT_DIR" = "${SCRIPT_DIR}/../data/dumps" ] && OUTPUT_DIR="$value" ;;
-            keep) [ "$KEEP" -eq -1 ] && KEEP="$value" ;;
-            from_keep|from-keep) [ "$FROM_KEEP" -eq 1 ] && FROM_KEEP="$value" ;;
-            compress) [ "$COMPRESS" = "gzip" ] && COMPRESS="$value" ;;
+            output) [ "$OUTPUT_DIR_SET" != true ] && OUTPUT_DIR="$value" ;;
+            keep) [ "$KEEP_SET" != true ] && KEEP="$value" ;;
+            from_keep|from-keep) [ "$FROM_KEEP_SET" != true ] && FROM_KEEP="$value" ;;
+            compress) [ "$COMPRESS_SET" != true ] && COMPRESS="$value" ;;
             exclude_table|exclude-table) [ -z "$EXCLUDE_TABLES" ] && EXCLUDE_TABLES="$value" ;;
             exclude_schema|exclude-schema) [ -z "$EXCLUDE_SCHEMAS" ] && EXCLUDE_SCHEMAS="$value" ;;
             exclude_data|exclude-data) [ -z "$EXCLUDE_DATA" ] && EXCLUDE_DATA="$value" ;;
@@ -1235,7 +1703,7 @@ cmd_dump() {
         return 1
     fi
 
-    parse_connection "$FROM_CONNECTION" "FROM"
+    parse_connection "$FROM_CONNECTION" "FROM" || { log_error "Invalid source connection: $FROM_CONNECTION"; return 1; }
     get_password "FROM"
 
     # Check if recent dump exists (skip_if_recent)
@@ -1250,7 +1718,24 @@ cmd_dump() {
 
     local ts=$(date '+%Y%m%d_%H%M%S')
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-    local dump_file="${OUTPUT_DIR}/${dump_base_name}_${ts}.dump"
+    # Atomically reserve a unique filename (O_EXCL via noclobber) so two concurrent
+    # dumps with the same name in the same second can't clobber each other — the
+    # loser gets a _N suffix instead of overwriting the winner's backup.
+    local dump_file="${OUTPUT_DIR}/${dump_base_name}_${ts}.dump" _n=0
+    if [ "$DRY_RUN" != true ]; then
+        while ! (set -o noclobber; : > "$dump_file") 2>/dev/null; do
+            # Only retry for a genuine name COLLISION (the file exists). Any other
+            # failure — unwritable dir, name too long — leaves no file, so error out
+            # instead of spinning forever.
+            if [ ! -e "$dump_file" ]; then
+                log_error "Cannot create dump file (output dir not writable or name too long): $dump_file"
+                return 1
+            fi
+            _n=$((_n + 1))
+            [ "$_n" -gt 10000 ] && { log_error "Too many colliding dumps for ${dump_base_name}_${ts}"; return 1; }
+            dump_file="${OUTPUT_DIR}/${dump_base_name}_${ts}_${_n}.dump"
+        done
+    fi
 
     log_info "From: ${FROM_DB_USER}@${FROM_DB_HOST}:${FROM_DB_PORT}/${FROM_DATABASE}"
     log_info "To: ${dump_file}"
@@ -1260,124 +1745,183 @@ cmd_dump() {
         return 0
     fi
 
-    # Build exclude options
+    # Build exclude options. These strings are later eval'd, so every table/schema
+    # value MUST be shell-escaped with pq (printf %q) — a naive '...' wrapper let an
+    # identifier containing a quote break out and run arbitrary shell commands.
     local exclude_opts=""
     if [ -n "$EXCLUDE_TABLES" ]; then
         IFS=',' read -ra arr <<< "$EXCLUDE_TABLES"
         for t in "${arr[@]}"; do
-            exclude_opts="$exclude_opts --exclude-table='$(echo $t | xargs)'"
+            exclude_opts="$exclude_opts --exclude-table=$(pq "$(trim "$t")")"
         done
     fi
     if [ -n "$EXCLUDE_SCHEMAS" ]; then
         IFS=',' read -ra arr <<< "$EXCLUDE_SCHEMAS"
         for s in "${arr[@]}"; do
-            exclude_opts="$exclude_opts --exclude-schema='$(echo $s | xargs)'"
+            exclude_opts="$exclude_opts --exclude-schema=$(pq "$(trim "$s")")"
         done
     fi
     if [ -n "$EXCLUDE_DATA" ]; then
         IFS=',' read -ra arr <<< "$EXCLUDE_DATA"
         for t in "${arr[@]}"; do
-            t=$(echo $t | xargs)
+            t=$(trim "$t")
             # Check for wildcard pattern (e.g., "public.*" or "audit.*")
             if [[ "$t" == *".*" ]]; then
                 local schema_name="${t%.*}"
                 log_info "Expanding wildcard: $t"
                 local tables=""
+                local wc_sql="SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$(sqllit "$schema_name")'"
                 if [ "$FROM_TYPE" = "ssh" ]; then
-                    tables=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-                        "env PGPASSWORD='$FROM_DB_PASSWORD' psql -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -d $FROM_DATABASE -tAc \"SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$schema_name'\"")
+                    local wc_pre; wc_pre="$(remote_pgpass_preamble "$FROM_DB_USER" "$FROM_DB_PASSWORD")"
+                    tables=$(ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+                        "${wc_pre}psql -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -d $(pq "$FROM_DATABASE") -tAc $(pq "$wc_sql")")
                 else
-                    tables=$(env PGPASSWORD="$FROM_DB_PASSWORD" psql -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -d $FROM_DATABASE -tAc "SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$schema_name'")
+                    setup_local_pgpass "$FROM_DB_USER" "$FROM_DB_PASSWORD"
+                    tables=$(psql -U "$FROM_DB_USER" -h "$FROM_DB_HOST" -p "$FROM_DB_PORT" -d "$FROM_DATABASE" -tAc "$wc_sql")
+                    cleanup_local_pgpass
                 fi
                 for tbl in $tables; do
-                    exclude_opts="$exclude_opts --exclude-table-data='$tbl'"
+                    exclude_opts="$exclude_opts --exclude-table-data=$(pq "$tbl")"
                 done
             else
-                exclude_opts="$exclude_opts --exclude-table-data='$t'"
+                exclude_opts="$exclude_opts --exclude-table-data=$(pq "$t")"
             fi
         done
     fi
+
+    # Build include-only options (--only-table -> -t, --only-schema -> -n).
+    # Comma-separated lists become one -t/-n per item. pq-escaped (see above).
+    local only_opts=""
+    if [ -n "$ONLY_TABLES" ]; then
+        IFS=',' read -ra arr <<< "$ONLY_TABLES"
+        for t in "${arr[@]}"; do
+            only_opts="$only_opts -t $(pq "$(trim "$t")")"
+        done
+    fi
+    if [ -n "$ONLY_SCHEMAS" ]; then
+        IFS=',' read -ra arr <<< "$ONLY_SCHEMAS"
+        for s in "${arr[@]}"; do
+            only_opts="$only_opts -n $(pq "$(trim "$s")")"
+        done
+    fi
+
+    # Determine pg_dump's built-in (-Z) compression level from the --compress type:
+    #   none            -> 0 (no compression at all)
+    #   gzip            -> pg_dump compresses; honor --compress-level (or the
+    #                      advanced --pg-compress-level override)
+    #   zstd/xz/bzip2   -> 0: let the external compressor do the work. Compressing
+    #                      twice (pg_dump -Z then zstd/xz/bzip2) wastes CPU and
+    #                      usually yields a WORSE ratio than a single pass.
+    local pg_zlevel="$PG_COMPRESS_LEVEL"
+    case "$COMPRESS" in
+        none)              pg_zlevel=0 ;;
+        gzip)              [ "$PG_COMPRESS_LEVEL_SET" = true ] && pg_zlevel="$PG_COMPRESS_LEVEL" || pg_zlevel="$COMPRESS_LEVEL" ;;
+        zstd|xz|bzip2)     pg_zlevel=0 ;;
+    esac
 
     local result=0
 
     if [ "$FROM_TYPE" = "ssh" ]; then
         log_info "Dumping via SSH..."
         local remote_dump_dir="/tmp/t-pgsql"
-        ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "mkdir -p '$remote_dump_dir'"
+        ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "mkdir -p $(pq "$remote_dump_dir") && chmod 700 $(pq "$remote_dump_dir")"
         local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
         local remote_file="${remote_dump_dir}/${dump_base_name}_${ts}.dump"
 
         local cmd=""
         if [ "$SUDO" = true ]; then
             # Use sudo -u postgres (peer auth)
-            cmd="sudo -u $FROM_DB_USER pg_dump"
-            cmd="$cmd -h $FROM_DB_HOST -p $FROM_DB_PORT"
+            cmd="sudo -u $(pq "$FROM_DB_USER") pg_dump"
+            cmd="$cmd -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT")"
         else
-            # Use password auth
-            cmd="env PGPASSWORD='$FROM_DB_PASSWORD' pg_dump"
-            cmd="$cmd -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT"
+            # Use password auth via remote PGPASSFILE (not argv)
+            cmd="$(remote_pgpass_preamble "$FROM_DB_USER" "$FROM_DB_PASSWORD")pg_dump"
+            cmd="$cmd -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT")"
         fi
-        cmd="$cmd -Fc -Z${PG_COMPRESS_LEVEL} -v $exclude_opts"
-        cmd="$cmd -f '$remote_file' $FROM_DATABASE"
+        cmd="$cmd -Fc -Z${pg_zlevel} -v $exclude_opts $only_opts"
+        cmd="$cmd -f $(pq "$remote_file") $(pq "$FROM_DATABASE")"
 
-        ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cmd"
+        # stdin-free: feed the command (with embedded pgpass preamble) via stdin so the
+        # password never lands in the local ssh process argv.
+        ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cmd"
         result=$?
 
         if [ $result -eq 0 ]; then
             log_info "Transferring..."
-            scp -P "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}:${remote_file}" "$dump_file"
+            if ! scp_transfer "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}:${remote_file}" "$dump_file"; then
+                log_error "Transfer failed; leaving the source dump in place"
+                result=1
+            fi
 
-            # Cleanup based on FROM_KEEP
-            if [ "$FROM_KEEP" -eq 0 ]; then
+            # Cleanup based on FROM_KEEP — ONLY after a successful transfer, so a
+            # failed copy never deletes the only remaining copy on the source.
+            if [ $result -eq 0 ] && [ "$FROM_KEEP" -eq 0 ]; then
                 log_info "Cleaning source dump..."
-                ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "rm -f '$remote_file'"
-            elif [ "$FROM_KEEP" -gt 0 ]; then
+                ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "rm -f $(pq "$remote_file")"
+            elif [ $result -eq 0 ] && [ "$FROM_KEEP" -gt 0 ]; then
                 log_info "Keeping last $FROM_KEEP dump(s) on source..."
                 local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-                local cleanup_cmd="cd /tmp/t-pgsql && ls -t ${dump_base_name}_*.dump 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
-                ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
-            else
+                local cleanup_cmd="cd $(pq "$remote_dump_dir") && ls -t $(pq "$dump_base_name")_*.dump 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
+                ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
+            elif [ $result -eq 0 ]; then
                 log_info "Keeping source dump (--from-keep -1)"
             fi
         fi
     else
         log_info "Dumping locally..."
-        export PGPASSWORD="$FROM_DB_PASSWORD"
+        setup_local_pgpass "$FROM_DB_USER" "$FROM_DB_PASSWORD"
 
-        local cmd="pg_dump -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT"
-        cmd="$cmd -Fc -Z${PG_COMPRESS_LEVEL} -v $exclude_opts"
-        cmd="$cmd -f '$dump_file' $FROM_DATABASE"
+        local cmd="pg_dump -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT")"
+        cmd="$cmd -Fc -Z${pg_zlevel} -v $exclude_opts $only_opts"
+        cmd="$cmd -f $(pq "$dump_file") $(pq "$FROM_DATABASE")"
 
         eval "$cmd"
         result=$?
-        unset PGPASSWORD
+        cleanup_local_pgpass
     fi
 
     if [ $result -eq 0 ]; then
-        local size=$(ls -lh "$dump_file" | awk '{print $5}')
         local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
-        log_success "Dump complete: $dump_file ($size)"
 
-        # External compression
+        # External compression must happen BEFORE metadata is written, and
+        # dump_file must be advanced to the compressed artifact so meta_write
+        # sees an existing file (and DUMP_FILE reflects what really exists).
         if [ "$COMPRESS" != "gzip" ] && [ "$COMPRESS" != "none" ]; then
-            compress_file "$dump_file"
+            if compress_file "$dump_file"; then
+                case "$COMPRESS" in
+                    zstd)  dump_file="${dump_file}.zst" ;;
+                    xz)    dump_file="${dump_file}.xz" ;;
+                    bzip2) dump_file="${dump_file}.bz2" ;;
+                esac
+            fi
         fi
 
-        # Write metadata
+        # Size of the final artifact that actually exists on disk
+        local size=$(ls -lh "$dump_file" 2>/dev/null | awk '{print $5}')
+        log_success "Dump complete: $dump_file ($size)"
+
+        # Write metadata (meta_write sets META_ARTIFACT to the resulting file)
         meta_write "$dump_file" "success" 0
+        local final_file="${META_ARTIFACT:-$dump_file}"
 
         # Cleanup
         cleanup_old_dumps
+
+        # Post-operation health check (--health-check-after)
+        run_post_health_check
 
         # Send notification
         local details=$(build_notify_details "DUMP" "Success" "$elapsed" "$size")
         send_notification "success" "Dump completed: ${FROM_DATABASE}" "$details"
 
-        echo "DUMP_FILE=$dump_file"
+        echo "DUMP_FILE=$final_file"
         echo "DUMP_SIZE=$size"
     else
         log_error "Dump failed: $result"
-        meta_write "$dump_file" "failed" $result
+        # pg_dump opens its output file before connecting, so a failed run leaves a
+        # partial/0-byte .dump behind. Remove it (and any half-written artifact) so a
+        # failure does not leave a misleading archive in the output directory.
+        rm -f "$dump_file" "${dump_file}.zst" "${dump_file}.xz" "${dump_file}.bz2" 2>/dev/null
 
         # Send notification
         local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
@@ -1391,17 +1935,72 @@ cmd_dump() {
 # ==============================================================================
 # RESTORE
 # ==============================================================================
+# Populate the _DBOPTS array with createdb options that reproduce the dump's database
+# encoding and locale. Without this, a non-UTF8 (e.g. LATIN1) or non-default-locale
+# source is silently restored with the cluster defaults, corrupting text. Best-effort:
+# parsed from the CREATE DATABASE statement pg_restore emits for the (local) archive;
+# callers fall back to a plain createdb if these options aren't available or are rejected
+# (e.g. the source locale isn't installed on the target host).
+_DBOPTS=()
+build_db_opts_from_dump() {
+    _DBOPTS=()
+    local dump="$1" line
+    # -Fd directory dumps and plain files both work; only custom/dir archives yield a line.
+    line=$(pg_restore --create --schema-only -f - "$dump" 2>/dev/null | grep -m1 -i '^CREATE DATABASE ')
+    [ -z "$line" ] && return 0
+    local enc collate ctype locale
+    enc=$(printf '%s' "$line"     | sed -n "s/.*ENCODING = '\([^']*\)'.*/\1/p")
+    collate=$(printf '%s' "$line" | sed -n "s/.*LC_COLLATE = '\([^']*\)'.*/\1/p")
+    ctype=$(printf '%s' "$line"   | sed -n "s/.*LC_CTYPE = '\([^']*\)'.*/\1/p")
+    locale=$(printf '%s' "$line"  | sed -n "s/.*[^_]LOCALE = '\([^']*\)'.*/\1/p")
+    [ -z "$enc" ] && return 0
+    _DBOPTS+=(--template=template0 -E "$enc")
+    if [ -n "$collate" ] || [ -n "$ctype" ]; then
+        [ -n "$collate" ] && _DBOPTS+=(--lc-collate="$collate")
+        [ -n "$ctype" ]   && _DBOPTS+=(--lc-ctype="$ctype")
+    elif [ -n "$locale" ]; then
+        _DBOPTS+=(--locale="$locale")
+    fi
+}
+
+# Emit the _DBOPTS as a shq-escaped string for embedding in a remote /bin/sh command.
+# shq (POSIX single-quoting) is used rather than pq (printf %q, which emits bash-only
+# $'...' for control chars) because ssh_exec runs the command under the remote /bin/sh.
+dbopts_remote() { local o out=""; for o in "${_DBOPTS[@]}"; do out+=" $(shq "$o")"; done; printf '%s' "$out"; }
+
+# Grep pattern matching pg_restore output that indicates a FATAL archive/read failure
+# DEFAULT-SAFE swap decision. A nonzero pg_restore exit is only safe to accept (and swap
+# the restored temp DB over the original) when EVERY reported error is a cosmetic ownership
+# error — the canonical case being "COMMENT ON EXTENSION plpgsql" -> "must be owner of
+# extension" on managed / non-superuser PostgreSQL, which does not affect table data. ANY
+# other error (disk full, decompression/corruption, lost connection, timeout, a failed
+# CREATE that drops data, or anything unrecognized) makes this FALSE, so the swap is aborted
+# and the intact original is kept. This is an allowlist, NOT a blocklist: unknown failures
+# must never be treated as benign, or a partial restore could silently replace good data.
+_PGRESTORE_BENIGN_RE='must be owner of'
+restore_only_benign_errors() {
+    local log="$1" errs
+    [ -z "$log" ] || [ ! -s "$log" ] && return 1
+    errs=$(grep -E 'pg_restore: error:' "$log" 2>/dev/null)
+    [ -z "$errs" ] && return 1                                   # nonzero but no error lines -> unknown -> unsafe
+    printf '%s\n' "$errs" | grep -qvE "$_PGRESTORE_BENIGN_RE" && return 1  # a non-benign error -> unsafe
+    return 0
+}
+
 cmd_restore() {
     log_info "Starting restore..."
 
-    # Auto-find latest dump if no file specified
+    # Auto-find latest dump if no file specified. Pick the genuinely newest file by
+    # mtime across ALL formats — the old code tried *.tar.gz first, so a stale tar.gz
+    # would shadow a newer .dump/.dump.zst and silently restore an OLDER backup.
     if [ -z "$FILE" ]; then
         local norm_dir=$(cd "$OUTPUT_DIR" 2>/dev/null && pwd)
-        FILE=$(ls -t "${norm_dir}/"*.tar.gz 2>/dev/null | head -1)
-        [ -z "$FILE" ] && FILE=$(ls -t "${norm_dir}/"*.dump.zst 2>/dev/null | head -1)
-        [ -z "$FILE" ] && FILE=$(ls -t "${norm_dir}/"*.dump.xz 2>/dev/null | head -1)
-        [ -z "$FILE" ] && FILE=$(ls -t "${norm_dir}/"*.dump.bz2 2>/dev/null | head -1)
-        [ -z "$FILE" ] && FILE=$(ls -t "${norm_dir}/"*.dump 2>/dev/null | head -1)
+        if [ -z "$norm_dir" ]; then
+            log_error "Output directory not found: $OUTPUT_DIR"
+            return 1
+        fi
+        FILE=$(ls -t "${norm_dir}/"*.tar.gz "${norm_dir}/"*.dump.zst "${norm_dir}/"*.dump.xz \
+                     "${norm_dir}/"*.dump.bz2 "${norm_dir}/"*.dump 2>/dev/null | head -1)
 
         if [ -z "$FILE" ]; then
             log_error "No dump file found. Use --file <path>"
@@ -1410,7 +2009,8 @@ cmd_restore() {
         log_info "Using latest: $(basename "$FILE")"
     fi
 
-    if [ ! -f "$FILE" ]; then
+    # Accept a regular file OR a directory (pg_dump -Fd directory-format dump).
+    if [ ! -e "$FILE" ]; then
         log_error "File not found: $FILE"
         return 1
     fi
@@ -1421,6 +2021,7 @@ cmd_restore() {
     fi
 
     local restore_file="$FILE"
+    local _decompressed=""
     local temp_dir=""
     local cleanup_temp=false
 
@@ -1428,7 +2029,8 @@ cmd_restore() {
     case "$restore_file" in
         *.tar.gz)
             # Extract dump from tar archive
-            temp_dir=$(mktemp -d)
+            temp_dir=$(mktemp -d); reg_tmp "$temp_dir"
+            [ -z "$temp_dir" ] && { log_error "mktemp failed, cannot extract archive"; return 1; }
             cleanup_temp=true
             log_info "Extracting from archive..."
             restore_file=$(extract_dump "$FILE" "$temp_dir")
@@ -1438,30 +2040,48 @@ cmd_restore() {
                 return 1
             fi
             ;;
-        *.gz)  gunzip -k "$restore_file"; restore_file="${restore_file%.gz}" ;;
-        *.xz)  unxz -k "$restore_file"; restore_file="${restore_file%.xz}" ;;
-        *.bz2) bunzip2 -k "$restore_file"; restore_file="${restore_file%.bz2}" ;;
-        *.zst) zstd -dk "$restore_file"; restore_file="${restore_file%.zst}" ;;
+        *.gz|*.xz|*.bz2|*.zst)
+            # Decompress to a UNIQUE temp dir (not next to the archive): avoids a
+            # collision with a same-named sibling .dump and leaves no plaintext copy behind.
+            local _dd; _dd=$(mktemp -d); reg_tmp "$_dd"
+            local _out="$_dd/$(basename "${restore_file%.*}")"
+            case "$restore_file" in
+                *.gz)  gunzip  -c "$restore_file" > "$_out" ;;
+                *.xz)  unxz    -c "$restore_file" > "$_out" ;;
+                *.bz2) bunzip2 -c "$restore_file" > "$_out" ;;
+                *.zst) zstd   -dc "$restore_file" > "$_out" ;;
+            esac
+            if [ $? -ne 0 ]; then log_error "Decompression failed: $restore_file"; return 1; fi
+            restore_file="$_out"
+            ;;
     esac
 
     local idx=0
     local restore_failed=0
     for conn in "${TO_CONNECTIONS[@]}"; do
         restore_to "$conn" "$restore_file" "$idx" || restore_failed=1
-        ((idx++))
+        idx=$((idx+1))
     done
 
-    # Cleanup temp dir if created
+    # Cleanup temp dir and any file we decompressed next to the source archive.
     [ "$cleanup_temp" = true ] && rm -rf "$temp_dir"
+    [ -n "$_decompressed" ] && rm -f "$_decompressed"
 
-    # Send notification (only for standalone restore, not when called from clone)
+    # Post-operation health check (--health-check-after)
+    [ $restore_failed -eq 0 ] && run_post_health_check
+
+    # Send notification (only for standalone restore, not when called from clone).
+    # With multiple targets, TO_DATABASE holds only the LAST target, so name the count
+    # rather than implying a single database succeeded/failed.
     if [ "$COMMAND" = "restore" ]; then
+        local tgt_label="${TO_DATABASE}"
+        [ "${#TO_CONNECTIONS[@]}" -gt 1 ] && tgt_label="${#TO_CONNECTIONS[@]} targets"
         if [ $restore_failed -eq 0 ]; then
             local details=$(build_notify_details "RESTORE" "Success" "")
-            send_notification "success" "Restore completed: ${TO_DATABASE}" "$details"
+            send_notification "success" "Restore completed: ${tgt_label}" "$details"
         else
             local details=$(build_notify_details "RESTORE" "Failed" "")
-            send_notification "failed" "Restore failed: ${TO_DATABASE}" "$details"
+            send_notification "failed" "Restore failed: ${tgt_label}" "$details"
         fi
     fi
 
@@ -1473,8 +2093,10 @@ restore_to() {
     local dump="$2"
     local index="${3:-0}"
 
-    parse_connection "$conn" "TO"
-    get_password "TO" "$index"
+    parse_connection "$conn" "TO" || { log_error "Invalid target connection: $conn"; return 1; }
+    # Fail this target if its password can't be resolved — do NOT silently reuse the
+    # previous target's credential.
+    get_password "TO" "$index" || return 1
 
     log_info "To: ${TO_DB_USER}@${TO_DB_HOST}:${TO_DB_PORT}/${TO_DATABASE}"
 
@@ -1493,50 +2115,132 @@ restore_to() {
 restore_local() {
     local dump="$1"
 
-    export PGPASSWORD="$TO_DB_PASSWORD"
-
-    # Check exists
-    local exists=$(psql -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" \
-        -tAc "SELECT 1 FROM pg_database WHERE datname='$TO_DATABASE'" postgres 2>/dev/null)
-
-    if [ "$exists" = "1" ]; then
-        if [ "$FORCE" = true ]; then
-            log_warn "Database '$TO_DATABASE' exists, dropping (--force)..."
-            psql -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" \
-                -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$TO_DATABASE' AND pid<>pg_backend_pid();" postgres >/dev/null 2>&1
-            dropdb -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" "$TO_DATABASE" 2>/dev/null
-        else
-            log_error "Database '$TO_DATABASE' already exists. Use --force to overwrite."
-            unset PGPASSWORD
-            return 1
-        fi
+    # Validate the dump is a readable custom-format archive BEFORE any destructive
+    # step. Otherwise --force would drop the populated target DB and only then find
+    # out the dump is corrupt — losing the existing data with nothing to restore.
+    if ! pg_restore -l "$dump" >/dev/null 2>&1; then
+        log_error "Not a valid dump archive (refusing to touch the target): $dump"
+        return 1
     fi
 
-    log_info "Creating database..."
-    createdb -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" "$TO_DATABASE"
+    setup_local_pgpass "$TO_DB_USER" "$TO_DB_PASSWORD"
 
-    log_info "Restoring..."
-    pg_restore --verbose --no-owner --no-privileges --clean --if-exists \
-        -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" \
-        -d "$TO_DATABASE" "$dump" 2>&1
+    local _pc=(-U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT")
+    # Reproduce the source DB encoding/locale (best-effort; plain createdb is the fallback).
+    build_db_opts_from_dump "$dump"
 
-    local r=$?
-    unset PGPASSWORD
+    # Check exists
+    local exists=$(psql "${_pc[@]}" \
+        -tAc "SELECT 1 FROM pg_database WHERE datname='$(sqllit "$TO_DATABASE")'" postgres 2>/dev/null)
 
-    # Apply data masking if enabled
-    apply_masking "TO"
+    if [ "$exists" = "1" ] && [ "$FORCE" != true ]; then
+        log_error "Database '$TO_DATABASE' already exists. Use --force to overwrite."
+        cleanup_local_pgpass
+        return 1
+    fi
+
+    local r=0
+
+    if [ "$exists" != "1" ]; then
+        # Target does not exist: nothing to lose, restore directly.
+        log_info "Creating database..."
+        if ! createdb "${_pc[@]}" "${_DBOPTS[@]}" -- "$TO_DATABASE" 2>/dev/null && \
+           ! createdb "${_pc[@]}" -- "$TO_DATABASE"; then
+            log_error "Failed to create database '$TO_DATABASE', aborting restore"
+            cleanup_local_pgpass
+            return 1
+        fi
+        log_info "Restoring..."
+        pg_restore --verbose --no-owner --no-privileges --clean --if-exists \
+            "${_pc[@]}" -d "$TO_DATABASE" "$dump" 2>&1
+        r=$?
+    else
+        # Target EXISTS and --force: restore into a fresh temp database and only swap it
+        # into place once the restore succeeds. A dump that passes the TOC check but fails
+        # mid-data (e.g. a truncated transfer) then can no longer destroy the existing data.
+        # Temp/old names use short fixed prefixes (not derived from the target name) so they
+        # can never collide after PostgreSQL's 63-byte identifier truncation, nor inherit a
+        # leading '-' from the target name.
+        local tmpdb="tpgtmp_$$"
+        local olddb="tpgold_$$"
+        local q_tmp; q_tmp="$(sqlid "$tmpdb")"
+        local q_old; q_old="$(sqlid "$olddb")"
+        local q_tgt; q_tgt="$(sqlid "$TO_DATABASE")"
+
+        dropdb "${_pc[@]}" --if-exists -- "$tmpdb" 2>/dev/null
+        log_info "Restoring into temporary database (safe swap)..."
+        if ! createdb "${_pc[@]}" "${_DBOPTS[@]}" -- "$tmpdb" 2>/dev/null && \
+           ! createdb "${_pc[@]}" -- "$tmpdb"; then
+            log_error "Failed to create temporary database, aborting (existing '$TO_DATABASE' left intact)"
+            cleanup_local_pgpass
+            return 1
+        fi
+
+        # Capture the restore log to make a DEFAULT-SAFE swap decision: swap only when the
+        # restore is clean (exit 0) or its only errors are cosmetic ownership errors. Any
+        # other failure (truncated/corrupt dump, disk full, lost connection, ...) keeps the
+        # intact original and discards the partial temp DB.
+        local _rlog; _rlog="$(mktemp "${TMPDIR:-/tmp}/t-pgsql-restore.XXXXXX")" && reg_tmp "$_rlog"
+        pg_restore --verbose --no-owner --no-privileges \
+            "${_pc[@]}" -d "$tmpdb" "$dump" >"${_rlog:-/dev/stdout}" 2>&1
+        r=$?
+        [ -n "$_rlog" ] && cat "$_rlog"
+
+        # r>128 means pg_restore was killed by a signal (OOM-killer/SIGTERM) mid-restore —
+        # never benign, even if only cosmetic errors were logged before it died.
+        if [ $r -ne 0 ] && { [ "$r" -gt 128 ] || ! restore_only_benign_errors "$_rlog"; }; then
+            log_error "Restore failed — existing '$TO_DATABASE' left intact (partial restore discarded)"
+            dropdb "${_pc[@]}" --if-exists -- "$tmpdb" 2>/dev/null
+            cleanup_local_pgpass
+            return 1
+        fi
+        [ $r -ne 0 ] && log_warn "Restore reported only cosmetic ownership errors; swapping the restored copy into place"
+
+        # Swap: rename existing -> old, temp -> target, then drop old. If the second
+        # rename fails, roll the original back. The original is recoverable at every step.
+        log_info "Swapping restored database into place..."
+        psql "${_pc[@]}" -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$(sqllit "$TO_DATABASE")' AND pid<>pg_backend_pid();" postgres >/dev/null 2>&1
+        if ! psql "${_pc[@]}" -v ON_ERROR_STOP=1 -c "ALTER DATABASE $q_tgt RENAME TO $q_old;" postgres >/dev/null 2>&1; then
+            log_error "Could not rename existing '$TO_DATABASE' (active connections?) — restored copy kept as '$tmpdb'"
+            cleanup_local_pgpass
+            return 1
+        fi
+        if ! psql "${_pc[@]}" -v ON_ERROR_STOP=1 -c "ALTER DATABASE $q_tmp RENAME TO $q_tgt;" postgres >/dev/null 2>&1; then
+            log_error "Swap failed; rolling back original '$TO_DATABASE'"
+            psql "${_pc[@]}" -c "ALTER DATABASE $q_old RENAME TO $q_tgt;" postgres >/dev/null 2>&1
+            dropdb "${_pc[@]}" --if-exists -- "$tmpdb" 2>/dev/null
+            cleanup_local_pgpass
+            return 1
+        fi
+        dropdb "${_pc[@]}" --if-exists -- "$olddb" 2>/dev/null
+    fi
+
+    cleanup_local_pgpass
+
+    # Apply data masking if enabled. If the restore succeeded but masking failed,
+    # fail the whole operation — the target may hold unmasked data the user wanted masked.
+    apply_masking "TO"; local mrc=$?
+    if [ $r -eq 0 ] && [ "$MASK" = true ] && [ $mrc -ne 0 ]; then
+        log_error "Restore succeeded but masking failed — target may contain UNMASKED data"
+        r=1
+    fi
 
     [ $r -eq 0 ] && log_success "Restore complete" || log_warn "Restore done with warnings"
+
+    return $r
 }
 
 restore_ssh() {
     local dump="$1"
-    ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "mkdir -p /tmp/t-pgsql"
-    local remote="/tmp/t-pgsql/$(basename $dump)"
+    local remote_dump_dir="/tmp/t-pgsql"
+    ssh -p "$TO_SSH_PORT" "${SSH_OPTS[@]}" "${TO_SSH_USER}@${TO_SSH_HOST}" "mkdir -p $(pq "$remote_dump_dir") && chmod 700 $(pq "$remote_dump_dir")"
+    local remote="${remote_dump_dir}/$(basename "$dump")"
 
-    # Check if DB exists on remote
-    local check_cmd="env PGPASSWORD='$TO_DB_PASSWORD' psql -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -tAc \"SELECT 1 FROM pg_database WHERE datname='$TO_DATABASE'\" postgres 2>/dev/null"
-    local exists=$(ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$check_cmd")
+    # Check if DB exists on remote (password via remote PGPASSFILE, not argv)
+    local pgpass_pre; pgpass_pre="$(remote_pgpass_preamble "$TO_DB_USER" "$TO_DB_PASSWORD")"
+    local check_sql="SELECT 1 FROM pg_database WHERE datname='$(sqllit "$TO_DATABASE")'"
+    local check_cmd="${pgpass_pre}psql -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -tAc $(pq "$check_sql") postgres 2>/dev/null"
+    local exists=$(ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$check_cmd")
 
     if [ "$exists" = "1" ]; then
         if [ "$FORCE" = true ]; then
@@ -1548,24 +2252,72 @@ restore_ssh() {
     fi
 
     log_info "Uploading dump..."
-    scp -P "$TO_SSH_PORT" "$dump" "${TO_SSH_USER}@${TO_SSH_HOST}:${remote}"
+    if ! scp_transfer "$TO_SSH_PORT" "$dump" "${TO_SSH_USER}@${TO_SSH_HOST}:${remote}"; then
+        log_error "Upload failed"
+        return 1
+    fi
 
     log_info "Restoring on remote..."
-    local cmd="export PGPASSWORD='$TO_DB_PASSWORD';"
-    if [ "$FORCE" = true ]; then
-        cmd+="psql -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$TO_DATABASE' AND pid<>pg_backend_pid();\" postgres 2>/dev/null;"
-        cmd+="dropdb -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT --if-exists $TO_DATABASE 2>/dev/null;"
+    # Reusable, pq-escaped connection flags for the remote psql/createdb/dropdb/pg_restore.
+    local rcf="-U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT")"
+    local q_remote; q_remote="$(pq "$remote")"
+    # Reproduce the source DB encoding/locale on the remote createdb (parsed from the local
+    # dump); remote createdb falls back to defaults if the options are rejected.
+    build_db_opts_from_dump "$dump"
+    local dbo; dbo="$(dbopts_remote)"
+    local cmd="$pgpass_pre"
+
+    if [ "$exists" = "1" ] && [ "$FORCE" = true ]; then
+        # Same safe temp-swap as restore_local: restore into a fresh temp DB and only swap
+        # it into place on success, so a mid-data failure can't destroy the existing remote
+        # database. Short fixed temp/old names (never derived from the target) avoid 63-byte
+        # truncation collisions and leading-'-' issues.
+        local tmpdb="tpgtmp_$$" olddb="tpgold_$$"
+        local q_tgt q_tmp q_old
+        q_tgt="$(sqlid "$TO_DATABASE")"; q_tmp="$(sqlid "$tmpdb")"; q_old="$(sqlid "$olddb")"
+        local term_sql="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$(sqllit "$TO_DATABASE")' AND pid<>pg_backend_pid();"
+        cmd+="dropdb $rcf --if-exists -- $(pq "$tmpdb") 2>/dev/null;"
+        cmd+="{ createdb $rcf$dbo -- $(pq "$tmpdb") 2>/dev/null || createdb $rcf -- $(pq "$tmpdb"); } || { rm -f $q_remote 2>/dev/null; exit 1; };"
+        # DEFAULT-SAFE swap decision (mirrors restore_local): swap only if the restore is
+        # clean or its ONLY errors are cosmetic ownership errors; any other failure keeps the
+        # intact original and discards the partial temp DB. __benign=1 requires that error
+        # lines exist AND none is outside the benign allowlist.
+        # Fallback path lives inside the chmod-700 remote dir (created above), not a
+        # world-writable /tmp, so a predictable name can't be pre-symlinked by another user.
+        cmd+="__rlog=\$(mktemp 2>/dev/null || echo $(pq "$remote_dump_dir")/.tpgrestore.\$\$);"
+        cmd+="pg_restore --verbose --no-owner --no-privileges $rcf -d $(pq "$tmpdb") $q_remote >\"\$__rlog\" 2>&1; __rc=\$?; cat \"\$__rlog\" >&2;"
+        cmd+="__benign=0; if [ \$__rc -ne 0 ] && [ \$__rc -le 128 ] && [ -s \"\$__rlog\" ] && grep -qE 'pg_restore: error:' \"\$__rlog\" && ! grep -E 'pg_restore: error:' \"\$__rlog\" | grep -qvE $(pq "$_PGRESTORE_BENIGN_RE"); then __benign=1; fi;"
+        cmd+="if [ \$__rc -ne 0 ] && [ \$__benign -ne 1 ]; then dropdb $rcf --if-exists -- $(pq "$tmpdb") 2>/dev/null; rm -f $q_remote \"\$__rlog\" 2>/dev/null; exit \$__rc; fi;"
+        cmd+="rm -f \"\$__rlog\" 2>/dev/null;"
+        cmd+="psql $rcf -c $(pq "$term_sql") postgres >/dev/null 2>&1;"
+        cmd+="psql $rcf -v ON_ERROR_STOP=1 -c $(pq "ALTER DATABASE $q_tgt RENAME TO $q_old;") postgres >/dev/null 2>&1 || { rm -f $q_remote 2>/dev/null; exit 1; };"
+        cmd+="psql $rcf -v ON_ERROR_STOP=1 -c $(pq "ALTER DATABASE $q_tmp RENAME TO $q_tgt;") postgres >/dev/null 2>&1 || { psql $rcf -c $(pq "ALTER DATABASE $q_old RENAME TO $q_tgt;") postgres >/dev/null 2>&1; dropdb $rcf --if-exists -- $(pq "$tmpdb") 2>/dev/null; rm -f $q_remote 2>/dev/null; exit 1; };"
+        cmd+="dropdb $rcf --if-exists -- $(pq "$olddb") 2>/dev/null;"
+        cmd+="rm -f $q_remote 2>/dev/null; exit \$__rc"
+    else
+        # Target does not exist: nothing to lose, restore directly.
+        cmd+="{ createdb $rcf$dbo -- $(pq "$TO_DATABASE") 2>/dev/null || createdb $rcf -- $(pq "$TO_DATABASE"); } || { rm -f $q_remote 2>/dev/null; exit 1; };"
+        cmd+="pg_restore --verbose --no-owner --no-privileges $rcf -d $(pq "$TO_DATABASE") $q_remote; __rc=\$?;"
+        cmd+="rm -f $q_remote 2>/dev/null;"
+        cmd+="exit \$__rc"
     fi
-    cmd+="createdb -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT $TO_DATABASE 2>/dev/null || true;"
-    cmd+="pg_restore --verbose --no-owner --no-privileges --clean --if-exists -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -d $TO_DATABASE '$remote';"
-    cmd+="rm -f '$remote'"
 
-    ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$cmd"
+    # stdin-free: command (with pgpass preamble) via stdin, keeping the password out of argv.
+    ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$cmd"
+    local rc=$?
 
-    # Apply data masking if enabled
-    apply_masking "TO"
+    # Apply data masking if enabled (must run after capturing restore status). Mirror
+    # restore_local: if the restore succeeded but masking failed, fail the whole
+    # operation — the remote target may hold unmasked data the user wanted masked.
+    apply_masking "TO"; local mrc=$?
+    if [ $rc -eq 0 ] && [ "$MASK" = true ] && [ $mrc -ne 0 ]; then
+        log_error "Remote restore succeeded but masking failed — target may contain UNMASKED data"
+        rc=1
+    fi
 
-    [ $? -eq 0 ] && log_success "Remote restore complete" || log_warn "Remote restore done with warnings"
+    [ $rc -eq 0 ] && log_success "Remote restore complete" || log_warn "Remote restore done with warnings"
+
+    return $rc
 }
 
 # ==============================================================================
@@ -1580,7 +2332,7 @@ cmd_fetch() {
         return 1
     fi
 
-    parse_connection "$FROM_CONNECTION" "FROM"
+    parse_connection "$FROM_CONNECTION" "FROM" || { log_error "Invalid source connection: $FROM_CONNECTION"; return 1; }
 
     if [ "$FROM_TYPE" != "ssh" ]; then
         log_error "fetch command requires SSH connection (ssh://...)"
@@ -1597,7 +2349,7 @@ cmd_fetch() {
         if [[ "$FROM_FILE" == *"*"* ]]; then
             # Glob pattern - find latest matching
             log_info "Finding latest match for: $FROM_FILE"
-            remote_file=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+            remote_file=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
                 "ls -t /tmp/t-pgsql/$FROM_FILE 2>/dev/null | head -1")
         else
             # Exact filename - check if it has path
@@ -1610,8 +2362,8 @@ cmd_fetch() {
     else
         # Auto-find latest dump for database (--from-file or --from-file latest)
         log_info "Finding latest dump for: $FROM_DATABASE"
-        remote_file=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-            "ls -t /tmp/t-pgsql/${FROM_DATABASE}_*.dump 2>/dev/null | head -1")
+        remote_file=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+            "ls -t /tmp/t-pgsql/$(pq "$FROM_DATABASE")_*.dump 2>/dev/null | head -1")
     fi
 
     if [ -z "$remote_file" ]; then
@@ -1620,7 +2372,7 @@ cmd_fetch() {
     fi
 
     # Check file exists
-    local exists=$(ssh -p "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+    local exists=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
         "[ -f '$remote_file' ] && echo 'yes' || echo 'no'")
 
     if [ "$exists" != "yes" ]; then
@@ -1638,7 +2390,7 @@ cmd_fetch() {
     local local_file="${OUTPUT_DIR}/$(basename $remote_file)"
 
     log_info "Downloading..."
-    scp -P "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}:${remote_file}" "$local_file"
+    scp_transfer "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}:${remote_file}" "$local_file"
 
     if [ $? -eq 0 ]; then
         local size=$(ls -lh "$local_file" | awk '{print $5}')
@@ -1686,73 +2438,133 @@ apply_masking() {
         database="$TO_DATABASE"
     fi
 
+    # Run SQL against the target (local/TCP or SSH). $1=sql, $2=extra psql flags.
+    # With flags (e.g. -tAq) the SQL is a single query passed via -c. WITHOUT flags
+    # it is the masking batch: fed via STDIN so psql executes each statement in its own
+    # autocommit transaction — a single bad rule can no longer roll back (silently unmask)
+    # all the other, valid masking statements. Uses the caller's connection locals.
+    local _MASK_PGPASS=""
+    _mask_run() {
+        local sql="$1" flags="$2"
+        if [ "$type" = "ssh" ]; then
+            local pre; pre="$(remote_pgpass_preamble "$user" "$password")"
+            if [ -n "$flags" ]; then
+                # stdin-free single query: command (with pgpass preamble) via stdin, not argv.
+                ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" \
+                    "${pre}psql $flags -U $(pq "$user") -h $(pq "$host") -p $(pq "$port") -d $(pq "$database") -c $(pq "$sql")" 2>/dev/null
+            else
+                # Batch: SQL is piped on ssh stdin (per-statement autocommit), so the command
+                # with its pgpass preamble must ride in argv here — transiently visible to `ps`.
+                # ON_ERROR_STOP=1 makes psql exit nonzero on a failed masking statement so the
+                # caller fails loudly instead of shipping unmasked data as success.
+                printf '%s' "$sql" | ssh -p "$TO_SSH_PORT" "${SSH_OPTS[@]}" "${TO_SSH_USER}@${TO_SSH_HOST}" \
+                    "${pre}psql -v ON_ERROR_STOP=1 -U $(pq "$user") -h $(pq "$host") -p $(pq "$port") -d $(pq "$database")" 2>/dev/null
+            fi
+        else
+            if [ -n "$flags" ]; then
+                PGPASSFILE="$_MASK_PGPASS" psql $flags -U "$user" -h "$host" -p "$port" -d "$database" -c "$sql" 2>/dev/null
+            else
+                printf '%s' "$sql" | PGPASSFILE="$_MASK_PGPASS" psql -v ON_ERROR_STOP=1 -U "$user" -h "$host" -p "$port" -d "$database" 2>/dev/null
+            fi
+        fi
+    }
+
+    if [ "$type" != "ssh" ]; then
+        _MASK_PGPASS="$(make_pgpass_file "$user" "$password")" || { log_error "Masking: credential setup failed"; return 0; }; reg_tmp "$_MASK_PGPASS"
+    fi
+
     local mask_sql=""
 
-    # Load rules from file if specified
+    # Explicit rules from a JSON file: {"table.column": "SQL_EXPRESSION", ...}
+    # Columns here are named by the user and assumed to exist.
     if [ -n "$MASK_RULES" ] && [ -f "$MASK_RULES" ]; then
         log_debug "Loading mask rules from: $MASK_RULES"
-
-        # Parse JSON rules file
-        # Format: {"table.column": "SQL_EXPRESSION", ...}
         while IFS=': ' read -r key value; do
             [[ "$key" =~ ^[[:space:]]*[\{\}] ]] && continue
             [[ -z "$key" ]] && continue
-
-            # Clean up JSON formatting
             key=$(echo "$key" | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
             value=$(echo "$value" | sed 's/^[[:space:]]*"//; s/"[[:space:]]*,*$//')
-
             [ -z "$key" ] || [ -z "$value" ] && continue
-
-            local table=$(echo "$key" | cut -d. -f1)
-            local column=$(echo "$key" | cut -d. -f2)
-
-            mask_sql+="UPDATE $table SET $column = $value;"
+            # Key is table.column or schema.table.column: the column is the LAST
+            # dotted segment; everything before it is the (possibly schema-qualified) table.
+            local column="${key##*.}"
+            local table="${key%.*}"
+            # Quote identifiers: a reserved-word / mixed-case / quoted table or column would
+            # otherwise be a syntax error (silently unmasked), or mask the wrong (case-folded)
+            # table. $value is a user-supplied SQL expression and is left as-is.
+            mask_sql+="UPDATE $(sqlid_table "$table") SET $(sqlid "$column") = $value;"
             log_debug "Mask rule: $table.$column = $value"
         done < "$MASK_RULES"
     fi
 
-    # Apply masking to specific tables if --mask-tables specified
+    # Auto-mask well-known sensitive columns for --mask-tables. CRITICAL: only
+    # emit an UPDATE for a column that actually EXISTS in the table. Blindly
+    # updating a missing column (e.g. 'phone') raised an error that rolled back
+    # the whole single-transaction batch, so nothing (not even email/password)
+    # was masked while the tool still reported success.
     if [ -n "$MASK_TABLES" ]; then
+        local in_list="'email','phone','password','password_hash','address','ssn','credit_card'"
         IFS=',' read -ra tables <<< "$MASK_TABLES"
+        local table existing found row col schematbl qt
         for table in "${tables[@]}"; do
-            table=$(echo "$table" | xargs)
-
-            # Default masking rules for common columns
-            mask_sql+="UPDATE $table SET email = CONCAT(LEFT(email, 2), '***@***.com') WHERE email IS NOT NULL;"
-            mask_sql+="UPDATE $table SET phone = '***-***-****' WHERE phone IS NOT NULL;"
-            mask_sql+="UPDATE $table SET password = '********' WHERE password IS NOT NULL;"
-            mask_sql+="UPDATE $table SET password_hash = 'MASKED' WHERE password_hash IS NOT NULL;"
-            mask_sql+="UPDATE $table SET address = '[MASKED]' WHERE address IS NOT NULL;"
-            mask_sql+="UPDATE $table SET ssn = '***-**-****' WHERE ssn IS NOT NULL;"
-            mask_sql+="UPDATE $table SET credit_card = '****-****-****-****' WHERE credit_card IS NOT NULL;"
-
-            log_debug "Auto-masking table: $table"
+            table=$(trim "$table")
+            [ -z "$table" ] && continue
+            # Return each match as schema.table.column so every UPDATE is SCHEMA-QUALIFIED
+            # to the exact table the column lives in. A bare name matching the same table in
+            # multiple schemas therefore masks EACH one correctly (and never emits a column
+            # that a search_path-resolved table lacks, which would abort under ON_ERROR_STOP).
+            # Restrict to ordinary/partitioned BASE TABLES the role can actually UPDATE:
+            # information_schema.columns also lists VIEWs and read-only relations, and an
+            # UPDATE against those aborts the whole batch under ON_ERROR_STOP (and masking a
+            # view is pointless — its base table is masked directly).
+            existing=$(_mask_run "SELECT c.table_schema || '.' || c.table_name || '.' || c.column_name FROM information_schema.columns c WHERE c.column_name IN ($in_list) AND (c.table_name = '$(sqllit "$table")' OR c.table_schema || '.' || c.table_name = '$(sqllit "$table")') AND EXISTS (SELECT 1 FROM pg_catalog.pg_class rc JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace WHERE rc.relname = c.table_name AND rn.nspname = c.table_schema AND rc.relkind IN ('r','p') AND has_table_privilege(rc.oid, 'UPDATE')) ORDER BY 1" "-tAq")
+            if [ -z "$existing" ]; then
+                log_warn "Masking: table '$table' has no known-sensitive columns (email/phone/password/password_hash/address/ssn/credit_card) — skipped"
+                continue
+            fi
+            found=""
+            while IFS= read -r row; do
+                [ -z "$row" ] && continue
+                col="${row##*.}"           # last segment = column
+                schematbl="${row%.*}"      # everything before = schema.table
+                qt="$(sqlid_table "$schematbl")"
+                case "$col" in
+                    email)         mask_sql+="UPDATE $qt SET \"email\" = CONCAT(LEFT(\"email\", 2), '***@***.com') WHERE \"email\" IS NOT NULL;" ;;
+                    phone)         mask_sql+="UPDATE $qt SET \"phone\" = '***-***-****' WHERE \"phone\" IS NOT NULL;" ;;
+                    password)      mask_sql+="UPDATE $qt SET \"password\" = '********' WHERE \"password\" IS NOT NULL;" ;;
+                    password_hash) mask_sql+="UPDATE $qt SET \"password_hash\" = 'MASKED' WHERE \"password_hash\" IS NOT NULL;" ;;
+                    address)       mask_sql+="UPDATE $qt SET \"address\" = '[MASKED]' WHERE \"address\" IS NOT NULL;" ;;
+                    ssn)           mask_sql+="UPDATE $qt SET \"ssn\" = '***-**-****' WHERE \"ssn\" IS NOT NULL;" ;;
+                    credit_card)   mask_sql+="UPDATE $qt SET \"credit_card\" = '****-****-****-****' WHERE \"credit_card\" IS NOT NULL;" ;;
+                esac
+                found="$found $row"
+            done <<< "$existing"
+            log_debug "Auto-masking '$table' ->$found"
         done
     fi
 
-    [ -z "$mask_sql" ] && { log_warn "No masking rules defined"; return 0; }
-
-    # Execute masking SQL
-    local result=0
-    if [ "$type" = "ssh" ]; then
-        local cmd="env PGPASSWORD='$password' psql -U $user -h $host -p $port -d $database -c \"$mask_sql\" 2>&1"
-        ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$cmd"
-        result=$?
-    else
-        env PGPASSWORD="$password" psql -U "$user" -h "$host" -p "$port" -d "$database" -c "$mask_sql" 2>&1
-        result=$?
+    if [ -z "$mask_sql" ]; then
+        [ -n "$_MASK_PGPASS" ] && rm -f "$_MASK_PGPASS"
+        # --mask was requested but nothing matched (no --mask-tables/--mask-rules, a
+        # missing/empty rules file, or no known-sensitive columns). Fail — do NOT ship
+        # data the user asked to mask, unmasked, as a success.
+        log_error "Masking requested but nothing was masked (check --mask-tables/--mask-rules); refusing to report success"
+        return 1
     fi
+
+    local result=0
+    _mask_run "$mask_sql" "" >/dev/null 2>&1; result=$?
+    [ -n "$_MASK_PGPASS" ] && rm -f "$_MASK_PGPASS"
 
     if [ $result -eq 0 ]; then
         log_success "Data masking applied"
-    else
-        log_warn "Data masking completed with warnings"
+        return 0
     fi
-
-    return 0
+    # A masking statement failed (ON_ERROR_STOP): fail loudly so the caller does not report
+    # a masked backup/restore while the target may still hold UNMASKED sensitive data.
+    log_error "Data masking FAILED (a masking statement errored) — target may contain UNMASKED data"
+    return 1
 }
-
 # ==============================================================================
 # STREAMING CLONE (no temp files)
 # ==============================================================================
@@ -1760,17 +2572,33 @@ clone_stream() {
     meta_start
     log_info "Starting streaming clone (no temp files)..."
 
+    # Filter values are eval'd into the dump command, so pq-escape each (see 55-dump).
     local exclude_opts=""
     if [ -n "$EXCLUDE_TABLES" ]; then
         IFS=',' read -ra arr <<< "$EXCLUDE_TABLES"
         for t in "${arr[@]}"; do
-            exclude_opts="$exclude_opts --exclude-table='$(echo $t | xargs)'"
+            exclude_opts="$exclude_opts --exclude-table=$(pq "$(trim "$t")")"
         done
     fi
     if [ -n "$EXCLUDE_SCHEMAS" ]; then
         IFS=',' read -ra arr <<< "$EXCLUDE_SCHEMAS"
         for s in "${arr[@]}"; do
-            exclude_opts="$exclude_opts --exclude-schema='$(echo $s | xargs)'"
+            exclude_opts="$exclude_opts --exclude-schema=$(pq "$(trim "$s")")"
+        done
+    fi
+
+    # Build include-only options (--only-table -> -t, --only-schema -> -n).
+    local only_opts=""
+    if [ -n "$ONLY_TABLES" ]; then
+        IFS=',' read -ra arr <<< "$ONLY_TABLES"
+        for t in "${arr[@]}"; do
+            only_opts="$only_opts -t $(pq "$(trim "$t")")"
+        done
+    fi
+    if [ -n "$ONLY_SCHEMAS" ]; then
+        IFS=',' read -ra arr <<< "$ONLY_SCHEMAS"
+        for s in "${arr[@]}"; do
+            only_opts="$only_opts -n $(pq "$(trim "$s")")"
         done
     fi
 
@@ -1778,63 +2606,108 @@ clone_stream() {
     local idx=0
 
     for to_conn in "${TO_CONNECTIONS[@]}"; do
-        parse_connection "$to_conn" "TO"
+        parse_connection "$to_conn" "TO" || { log_error "Invalid target connection: $to_conn"; result=1; idx=$((idx + 1)); continue; }
         get_password "TO" "$idx"
 
         log_info "Streaming: ${FROM_SSH_HOST:-$FROM_DB_HOST}/${FROM_DATABASE} → ${TO_SSH_HOST:-$TO_DB_HOST}/${TO_DATABASE}"
 
+        # Track temp .pgpass files created for local commands so we can clean up.
+        local stream_from_pgpass="" stream_to_pgpass=""
+
         # Build pg_dump command
         local dump_cmd=""
         if [ "$FROM_TYPE" = "ssh" ]; then
+            local from_rcmd=""
             if [ "$SUDO" = true ]; then
-                dump_cmd="ssh -p $FROM_SSH_PORT ${FROM_SSH_USER}@${FROM_SSH_HOST} 'sudo -u $FROM_DB_USER pg_dump -h $FROM_DB_HOST -p $FROM_DB_PORT -Fc $exclude_opts $FROM_DATABASE'"
+                from_rcmd="sudo -u $(pq "$FROM_DB_USER") pg_dump -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -Fc $exclude_opts $only_opts $(pq "$FROM_DATABASE")"
             else
-                dump_cmd="ssh -p $FROM_SSH_PORT ${FROM_SSH_USER}@${FROM_SSH_HOST} 'env PGPASSWORD=\"$FROM_DB_PASSWORD\" pg_dump -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -Fc $exclude_opts $FROM_DATABASE'"
+                from_rcmd="$(remote_pgpass_preamble "$FROM_DB_USER" "$FROM_DB_PASSWORD")pg_dump -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -Fc $exclude_opts $only_opts $(pq "$FROM_DATABASE")"
             fi
+            dump_cmd="ssh -p $(pq "$FROM_SSH_PORT") ${SSH_OPTS[*]} $(pq "${FROM_SSH_USER}@${FROM_SSH_HOST}") $(shq "$from_rcmd")"
         else
-            dump_cmd="env PGPASSWORD='$FROM_DB_PASSWORD' pg_dump -U $FROM_DB_USER -h $FROM_DB_HOST -p $FROM_DB_PORT -Fc $exclude_opts $FROM_DATABASE"
+            stream_from_pgpass="$(make_pgpass_file "$FROM_DB_USER" "$FROM_DB_PASSWORD")"; reg_tmp "$stream_from_pgpass"
+            dump_cmd="PGPASSFILE=$(pq "$stream_from_pgpass") pg_dump -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -Fc $exclude_opts $only_opts $(pq "$FROM_DATABASE")"
         fi
 
         # Build pg_restore command
         local restore_cmd=""
         if [ "$TO_TYPE" = "ssh" ]; then
-            # Prepare target database
-            local prep_cmd="export PGPASSWORD='$TO_DB_PASSWORD';"
-            if [ "$FORCE" = true ]; then
-                prep_cmd+="psql -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$TO_DATABASE' AND pid<>pg_backend_pid();\" postgres 2>/dev/null;"
-                prep_cmd+="dropdb -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT --if-exists $TO_DATABASE 2>/dev/null;"
+            # Prepare target database (password via remote PGPASSFILE, not argv)
+            local prep_pre; prep_pre="$(remote_pgpass_preamble "$TO_DB_USER" "$TO_DB_PASSWORD")"
+            # Refuse to stream into an existing DB without --force: pg_restore would
+            # append and DUPLICATE the existing rows.
+            local _st_check="SELECT 1 FROM pg_database WHERE datname='$(sqllit "$TO_DATABASE")'"
+            local _st_exists=$(ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" \
+                "${prep_pre}psql -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -tAc $(pq "$_st_check") postgres 2>/dev/null")
+            if [ "$_st_exists" = "1" ] && [ "$FORCE" != true ]; then
+                log_error "Target database '$TO_DATABASE' already exists. Use --force (stream clone would duplicate its data)."
+                return 1
             fi
-            prep_cmd+="createdb -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT $TO_DATABASE 2>/dev/null || true"
+            local prep_cmd="$prep_pre"
+            if [ "$FORCE" = true ]; then
+                local prep_term_sql="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$(sqllit "$TO_DATABASE")' AND pid<>pg_backend_pid();"
+                prep_cmd+="psql -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -c $(pq "$prep_term_sql") postgres 2>/dev/null;"
+                prep_cmd+="dropdb -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") --if-exists -- $(pq "$TO_DATABASE") 2>/dev/null;"
+            fi
+            prep_cmd+="createdb -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -- $(pq "$TO_DATABASE") 2>/dev/null || true"
 
-            ssh -p "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$prep_cmd"
+            # stdin-free prep step: command (with pgpass preamble) via stdin, not argv.
+            ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$prep_cmd"
 
-            restore_cmd="ssh -p $TO_SSH_PORT ${TO_SSH_USER}@${TO_SSH_HOST} 'env PGPASSWORD=\"$TO_DB_PASSWORD\" pg_restore --no-owner --no-privileges -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -d $TO_DATABASE'"
+            # NOTE: the dump|restore data pipe below carries the DB stream on ssh stdin/stdout,
+            # so the command (with its pgpass preamble) must ride in argv here — the password
+            # is transiently visible to a local `ps` for the duration of the stream. All other
+            # ssh calls use ssh_exec to keep it out of argv.
+            local to_rcmd="$(remote_pgpass_preamble "$TO_DB_USER" "$TO_DB_PASSWORD")pg_restore --no-owner --no-privileges -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -d $(pq "$TO_DATABASE")"
+            restore_cmd="ssh -p $(pq "$TO_SSH_PORT") ${SSH_OPTS[*]} $(pq "${TO_SSH_USER}@${TO_SSH_HOST}") $(shq "$to_rcmd")"
         else
-            # Prepare local target database
-            export PGPASSWORD="$TO_DB_PASSWORD"
+            # Prepare local target database (password via PGPASSFILE, not argv)
+            setup_local_pgpass "$TO_DB_USER" "$TO_DB_PASSWORD"
+            # Refuse to stream into an existing DB without --force (would duplicate data).
+            local _st_exists=$(psql -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" -tAc \
+                "SELECT 1 FROM pg_database WHERE datname='$(sqllit "$TO_DATABASE")'" postgres 2>/dev/null)
+            if [ "$_st_exists" = "1" ] && [ "$FORCE" != true ]; then
+                log_error "Target database '$TO_DATABASE' already exists. Use --force (stream clone would duplicate its data)."
+                cleanup_local_pgpass
+                return 1
+            fi
             if [ "$FORCE" = true ]; then
                 psql -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" \
-                    -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$TO_DATABASE' AND pid<>pg_backend_pid();" postgres >/dev/null 2>&1
-                dropdb -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" --if-exists "$TO_DATABASE" 2>/dev/null
+                    -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$(sqllit "$TO_DATABASE")' AND pid<>pg_backend_pid();" postgres >/dev/null 2>&1
+                dropdb -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" --if-exists -- "$TO_DATABASE" 2>/dev/null
             fi
-            createdb -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" "$TO_DATABASE" 2>/dev/null || true
+            createdb -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" -- "$TO_DATABASE" 2>/dev/null || true
+            cleanup_local_pgpass
 
-            restore_cmd="env PGPASSWORD='$TO_DB_PASSWORD' pg_restore --no-owner --no-privileges -U $TO_DB_USER -h $TO_DB_HOST -p $TO_DB_PORT -d $TO_DATABASE"
+            stream_to_pgpass="$(make_pgpass_file "$TO_DB_USER" "$TO_DB_PASSWORD")"; reg_tmp "$stream_to_pgpass"
+            restore_cmd="PGPASSFILE=$(pq "$stream_to_pgpass") pg_restore --no-owner --no-privileges -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -d $(pq "$TO_DATABASE")"
         fi
 
-        # Execute streaming pipe with buffer
-        log_debug "Executing: $dump_cmd | pv -q -B ${STREAM_BUFFER}M | $restore_cmd"
+        # Execute streaming pipe with buffer (redact secrets before logging)
+        log_debug "Executing: $(redact_cmd "$dump_cmd") | pv -q -B ${STREAM_BUFFER}M | $(redact_cmd "$restore_cmd")"
 
         if command -v pv &>/dev/null; then
-            # Use pv for buffering if available
-            eval "$dump_cmd" | pv -q -B "${STREAM_BUFFER}M" 2>/dev/null | eval "$restore_cmd"
+            # Use pv for buffering (and rate-limiting with --bwlimit) if available
+            local pv_rate=""; [ -n "$PV_RATE" ] && pv_rate="-L $PV_RATE"
+            eval "$dump_cmd" | pv -q -B "${STREAM_BUFFER}M" $pv_rate 2>/dev/null | eval "$restore_cmd"
         else
+            [ -n "$PV_RATE" ] && log_warn "--bwlimit for streaming requires 'pv' (not installed); transfer will NOT be rate-limited"
             # Direct pipe without buffer
             eval "$dump_cmd" | eval "$restore_cmd"
         fi
 
-        local pipe_result=${PIPESTATUS[0]}
-        [ $pipe_result -ne 0 ] && result=1
+        # Capture the full pipeline status: first element is pg_dump,
+        # last element is pg_restore (pv, if present, sits in between).
+        local pipe_status=("${PIPESTATUS[@]}")
+        local dump_rc=${pipe_status[0]}
+        local restore_rc=${pipe_status[$(( ${#pipe_status[@]} - 1 ))]}
+        if [ "$dump_rc" -ne 0 ] || [ "$restore_rc" -ne 0 ]; then
+            result=1
+        fi
+
+        # Remove any local temp .pgpass files created for this iteration.
+        [ -n "$stream_from_pgpass" ] && rm -f "$stream_from_pgpass"
+        [ -n "$stream_to_pgpass" ] && rm -f "$stream_to_pgpass"
 
         idx=$((idx + 1))
     done
@@ -1843,6 +2716,7 @@ clone_stream() {
 
     if [ $result -eq 0 ]; then
         log_success "Streaming clone complete ($elapsed)"
+        run_post_health_check
         local details=$(build_notify_details "STREAM-CLONE" "Success" "$elapsed")
         send_notification "success" "Streaming clone completed: ${FROM_DATABASE} → ${TO_DATABASE}" "$details"
     else
@@ -1872,11 +2746,27 @@ cmd_clone() {
     fi
 
     # Parse connections for health check
-    parse_connection "$FROM_CONNECTION" "FROM"
+    parse_connection "$FROM_CONNECTION" "FROM" || { log_error "Invalid source connection: $FROM_CONNECTION"; return 1; }
     get_password "FROM"
 
-    # Parse first target for health check
-    parse_connection "${TO_CONNECTIONS[0]}" "TO"
+    # Refuse a source==target clone for ANY target (not just the first): clone_stream/restore
+    # iterate every --to and, with --force, drop each before pg_dump finishes reading the
+    # source, permanently destroying it. Capture the source identity, then check every target.
+    local _f_type="$FROM_TYPE" _f_ssh="$FROM_SSH_HOST" _f_db="${FROM_DB_HOST}:${FROM_DB_PORT}/${FROM_DATABASE}"
+    local _i
+    for _i in "${!TO_CONNECTIONS[@]}"; do
+        parse_connection "${TO_CONNECTIONS[$_i]}" "TO" || { log_error "Invalid target connection: ${TO_CONNECTIONS[$_i]}"; return 1; }
+        if [ "$_f_type" = "$TO_TYPE" ] \
+           && [ "${_f_ssh}" = "${TO_SSH_HOST}" ] \
+           && [ "${_f_db}" = "${TO_DB_HOST}:${TO_DB_PORT}/${TO_DATABASE}" ]; then
+            log_error "Source and target #$((_i+1)) are the same database — refusing (this would destroy it)"
+            return 1
+        fi
+    done
+
+    # Re-parse the first target for the health check and downstream code (the loop left the
+    # TO_* globals pointing at the last target).
+    parse_connection "${TO_CONNECTIONS[0]}" "TO" || { log_error "Invalid target connection: ${TO_CONNECTIONS[0]}"; return 1; }
     get_password "TO" 0
 
     # Run health check before operation
@@ -1896,8 +2786,18 @@ cmd_clone() {
         return 0
     fi
 
+    # Migrate cluster globals (roles/tablespaces) to the target before restoring,
+    # so ownership and grants have something to resolve against.
+    if [ "$GLOBALS" = true ]; then
+        migrate_globals || log_warn "Continuing despite globals migration issues"
+    fi
+
     # Streaming mode: direct pipe without temp files
     if [ "$STREAM" = true ]; then
+        if [ "$MASK" = true ]; then
+            log_error "--mask is not supported with --stream (masking runs after a restore); omit --stream to mask"
+            return 1
+        fi
         clone_stream
         return $?
     fi
@@ -1908,13 +2808,7 @@ cmd_clone() {
     # Find latest archive (normalize path first)
     local norm_output_dir=$(cd "$OUTPUT_DIR" && pwd)
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-    local latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.tar.gz 2>/dev/null | head -1)
-
-    # Fallback to compressed dump files, then uncompressed .dump
-    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.dump.zst 2>/dev/null | head -1)
-    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.dump.xz 2>/dev/null | head -1)
-    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.dump.bz2 2>/dev/null | head -1)
-    [ -z "$latest" ] && latest=$(ls -t "${norm_output_dir}/${dump_base_name}_"*.dump 2>/dev/null | head -1)
+    local latest=$(list_dumps_for_base "$norm_output_dir" "$dump_base_name" | head -1)
     [ -z "$latest" ] && { log_error "Dump not found"; return 1; }
 
     FILE="$latest"
@@ -1940,6 +2834,160 @@ cmd_clone() {
         send_notification "failed" "Clone failed: ${FROM_DATABASE} → ${TO_DATABASE}" "$details"
         return 1
     fi
+}
+
+# ==============================================================================
+# MAJOR-VERSION LOGICAL MIGRATION (upgrade helper)
+#
+# This is the logical (dump + restore) path for moving a database to a newer
+# PostgreSQL major version. It is NOT a replacement for pg_upgrade (fast in-place)
+# or logical replication (near-zero downtime) — those remain the right tools for
+# large clusters or minimal-downtime cutovers. What this adds over a plain clone:
+# it also carries cluster-global objects (roles, tablespaces) and checks that the
+# target major version is not older than the source.
+# ==============================================================================
+
+# Numeric server version (e.g. 160014) for a parsed prefix (FROM/TO).
+# TCP/local only; prints nothing for SSH sources (preflight is then skipped).
+server_version_num() {
+    local prefix="$1"
+    local tvar="${prefix}_TYPE" uvar="${prefix}_DB_USER" hvar="${prefix}_DB_HOST"
+    local pvar="${prefix}_DB_PORT" wvar="${prefix}_DB_PASSWORD"
+    local v
+    if [ "${!tvar}" = "ssh" ]; then
+        # Query over SSH too (password via remote PGPASSFILE, command via ssh_exec stdin)
+        # so the upgrade version preflight is not silently skipped for SSH endpoints.
+        local shvar="${prefix}_SSH_HOST" spvar="${prefix}_SSH_PORT" suvar="${prefix}_SSH_USER"
+        local pre; pre="$(remote_pgpass_preamble "${!uvar}" "${!wvar}")"
+        local rcmd="${pre}psql -U $(pq "${!uvar}") -h $(pq "${!hvar}") -p $(pq "${!pvar}") -d postgres -tAc $(pq "SHOW server_version_num") 2>/dev/null"
+        v=$(ssh_exec "${!spvar}" "${!suvar}@${!shvar}" "$rcmd" | tr -d '[:space:]')
+        printf '%s' "$v"
+        return 0
+    fi
+    setup_local_pgpass "${!uvar}" "${!wvar}"
+    v=$(psql -U "${!uvar}" -h "${!hvar}" -p "${!pvar}" -d postgres -tAc "SHOW server_version_num" 2>/dev/null | tr -d '[:space:]')
+    cleanup_local_pgpass
+    printf '%s' "$v"
+}
+
+# Dump the source cluster's globals (roles, tablespaces) into $1.
+# Handles both local/TCP sources (pg_dumpall -h) and SSH sources (pg_dumpall run
+# on the remote host, output streamed back over ssh).
+dump_source_globals() {
+    local out="$1"
+    if [ "$FROM_TYPE" = "ssh" ]; then
+        local rcmd
+        if [ "$SUDO" = true ]; then
+            rcmd="sudo -u $(pq "$FROM_DB_USER") pg_dumpall --globals-only -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT")"
+        else
+            rcmd="$(remote_pgpass_preamble "$FROM_DB_USER" "$FROM_DB_PASSWORD")pg_dumpall --globals-only -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT")"
+        fi
+        ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$rcmd" > "$out" 2>/dev/null
+        return $?
+    fi
+    setup_local_pgpass "$FROM_DB_USER" "$FROM_DB_PASSWORD"
+    local rc=0
+    pg_dumpall --globals-only -U "$FROM_DB_USER" -h "$FROM_DB_HOST" -p "$FROM_DB_PORT" > "$out" 2>/dev/null || rc=$?
+    cleanup_local_pgpass
+    return $rc
+}
+
+# Apply a globals SQL file ($1) to the CURRENTLY-PARSED target (TO_* vars).
+# Handles both local/TCP and SSH targets. Roles/tablespaces are cluster-wide, so
+# they are applied on the target's 'postgres' database. Pre-existing roles produce
+# harmless "already exists" notices, which are tolerated (nonzero return).
+apply_globals_to_target() {
+    local gfile="$1" errout=""
+    # psql doesn't stop on statement errors, so capture stderr and decide from it:
+    # "already exists" notices (pre-existing roles) are benign; any OTHER error is real
+    # and must NOT be reported as a clean success.
+    if [ "$TO_TYPE" = "ssh" ]; then
+        local rcmd
+        if [ "$SUDO" = true ]; then
+            rcmd="sudo -u $(pq "$TO_DB_USER") psql -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -d postgres"
+        else
+            rcmd="$(remote_pgpass_preamble "$TO_DB_USER" "$TO_DB_PASSWORD")psql -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -d postgres"
+        fi
+        # Feed the globals as a quoted here-doc appended to the command (which itself,
+        # with the pgpass preamble, travels on ssh's stdin via ssh_exec — never argv).
+        # The delimiter is unquoted content: psql reads the here-doc, not ssh stdin.
+        rcmd+=" <<'__TPG_GLOBALS_EOF__'
+$(cat "$gfile")
+__TPG_GLOBALS_EOF__"
+        errout=$(ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$rcmd" 2>&1 >/dev/null)
+    else
+        setup_local_pgpass "$TO_DB_USER" "$TO_DB_PASSWORD"
+        errout=$(psql -U "$TO_DB_USER" -h "$TO_DB_HOST" -p "$TO_DB_PORT" -d postgres -f "$gfile" 2>&1 >/dev/null)
+        cleanup_local_pgpass
+    fi
+    if printf '%s\n' "$errout" | grep -i 'ERROR:' | grep -qiv 'already exists'; then
+        return 1
+    fi
+    return 0
+}
+
+# Migrate cluster globals from the source to EVERY target. The source globals are
+# dumped once; then applied to each --to target (local/TCP or SSH). Re-parses each
+# target into TO_* (cmd_restore re-parses again afterwards, so this is safe).
+migrate_globals() {
+    log_info "Migrating cluster globals (roles, tablespaces)..."
+    local gfile
+    # XXXXXX must be the TRAILING component: BSD/macOS mktemp does not substitute X's
+    # followed by a suffix (it would create a predictable, colliding literal filename for
+    # this sensitive globals file, which can contain role password hashes).
+    gfile="$(umask 077; mktemp "${TMPDIR:-/tmp}/t-pgsql-globals.XXXXXX")" || { log_error "mktemp failed"; return 1; }
+
+    if ! dump_source_globals "$gfile"; then
+        rm -f "$gfile"
+        log_error "Failed to dump globals from source"
+        return 1
+    fi
+
+    local idx=0 conn
+    for conn in "${TO_CONNECTIONS[@]}"; do
+        if ! parse_connection "$conn" "TO"; then
+            log_warn "Skipping globals for invalid target: $conn"
+            idx=$((idx+1)); continue
+        fi
+        get_password "TO" "$idx"
+        if apply_globals_to_target "$gfile"; then
+            log_success "Globals applied to ${TO_DATABASE}@${TO_DB_HOST}"
+        else
+            log_warn "Globals for ${TO_DATABASE}@${TO_DB_HOST} completed WITH ERRORS (beyond pre-existing roles) — review before relying on the migration"
+        fi
+        idx=$((idx+1))
+    done
+
+    rm -f "$gfile"
+    return 0
+}
+
+cmd_upgrade() {
+    log_info "Logical major-version migration (dump + globals + restore)."
+    log_warn "For large clusters or minimal downtime, pg_upgrade or logical replication are better-established methods."
+
+    [ -z "$FROM_CONNECTION" ] && { log_error "--from required"; return 1; }
+    [ ${#TO_CONNECTIONS[@]} -eq 0 ] && { log_error "--to required"; return 1; }
+
+    parse_connection "$FROM_CONNECTION" "FROM" || { log_error "Invalid source connection: $FROM_CONNECTION"; return 1; }
+    get_password "FROM"
+    parse_connection "${TO_CONNECTIONS[0]}" "TO" || { log_error "Invalid target connection: ${TO_CONNECTIONS[0]}"; return 1; }
+    get_password "TO" 0
+
+    # Version preflight (best effort; TCP/local only)
+    local sv tv
+    sv=$(server_version_num "FROM"); tv=$(server_version_num "TO")
+    if [ -n "$sv" ] && [ -n "$tv" ]; then
+        log_info "Source server_version_num=$sv  ->  target=$tv"
+        if [ "$(( tv / 10000 ))" -lt "$(( sv / 10000 ))" ]; then
+            log_error "Target major ($(( tv / 10000 ))) is OLDER than source major ($(( sv / 10000 ))); logical restore into an older major version is not supported."
+            return 1
+        fi
+    fi
+
+    # A migration always carries globals, then clones the database.
+    GLOBALS=true
+    cmd_clone
 }
 
 # ==============================================================================
@@ -1976,11 +3024,10 @@ cmd_meta() {
     if [ -z "$FILE" ]; then
         # Show latest (check tar.gz, compressed dumps, then plain dumps)
         local norm_output_dir=$(cd "$OUTPUT_DIR" 2>/dev/null && pwd)
-        FILE=$(ls -t "${norm_output_dir}/"*.tar.gz 2>/dev/null | head -1)
-        [ -z "$FILE" ] && FILE=$(ls -t "${norm_output_dir}/"*.dump.zst 2>/dev/null | head -1)
-        [ -z "$FILE" ] && FILE=$(ls -t "${norm_output_dir}/"*.dump.xz 2>/dev/null | head -1)
-        [ -z "$FILE" ] && FILE=$(ls -t "${norm_output_dir}/"*.dump.bz2 2>/dev/null | head -1)
-        [ -z "$FILE" ] && FILE=$(ls -t "${norm_output_dir}/"*.dump 2>/dev/null | head -1)
+        # Newest across ALL formats by mtime (not tar.gz-first, which showed stale meta).
+        FILE=$(ls -t "${norm_output_dir}/"*.tar.gz "${norm_output_dir}/"*.dump.zst \
+                     "${norm_output_dir}/"*.dump.xz "${norm_output_dir}/"*.dump.bz2 \
+                     "${norm_output_dir}/"*.dump 2>/dev/null | head -1)
     fi
 
     if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
@@ -1997,7 +3044,26 @@ cmd_meta() {
 # CLEAN
 # ==============================================================================
 cmd_clean() {
-    log_info "Cleaning dumps..."
+    # Determine which dumps to clean. cleanup_old_dumps keys off the dump base
+    # name (${DUMP_NAME:-$FROM_DATABASE}), so we must resolve a base name from
+    # one of: a positional db name, --from <connection>, or --dump-name.
+    if [ -z "$FROM_DATABASE" ]; then
+        if [ -n "$CLEAN_DB" ]; then
+            FROM_DATABASE="$CLEAN_DB"
+        elif [ -n "$FROM_CONNECTION" ]; then
+            parse_connection "$FROM_CONNECTION" "FROM" || { log_error "Invalid source connection: $FROM_CONNECTION"; return 1; }
+        elif [ -n "$DUMP_NAME" ]; then
+            FROM_DATABASE="$DUMP_NAME"
+        fi
+    fi
+
+    if [ -z "$FROM_DATABASE" ] && [ -z "$DUMP_NAME" ]; then
+        log_error "clean requires a database name, --from <connection>, or --dump-name <name> to determine which dumps to clean"
+        log_error "Example: $SCRIPT_NAME clean mydb --keep 5   (or --retention)"
+        return 1
+    fi
+
+    log_info "Cleaning dumps for: ${DUMP_NAME:-$FROM_DATABASE}"
     [ "$DRY_RUN" = true ] && { log_info "[DRY-RUN] Would clean"; return 0; }
     cleanup_old_dumps
     log_success "Done"
@@ -2007,6 +3073,26 @@ cmd_clean() {
 # BATCH SYSTEM
 # ==============================================================================
 
+# Shared awk helper prepended to every YAML value extractor. clean_value() strips
+# a YAML inline comment and the surrounding quotes from a raw value. A '#' inside
+# a quoted value is preserved; an unquoted ' #...' (or a leading '#') is treated
+# as a comment and removed along with any trailing whitespace.
+_YAML_AWK_LIB='
+function clean_value(v,   q, rest, idx) {
+    if (v ~ /^["'\'']/) {
+        q = substr(v, 1, 1)
+        rest = substr(v, 2)
+        idx = index(rest, q)
+        if (idx > 0) return substr(rest, 1, idx - 1)
+        return rest
+    }
+    sub(/[ \t]+#.*$/, "", v)
+    sub(/^#.*$/, "", v)
+    sub(/[ \t]+$/, "", v)
+    return v
+}
+'
+
 # Get a value from YAML file using awk
 # Usage: get_yaml_value "file" "section" "key"
 get_yaml_value() {
@@ -2014,16 +3100,15 @@ get_yaml_value() {
     local section="$2"
     local key="$3"
 
-    awk -v section="$section" -v key="$key" '
+    awk -v section="$section" -v key="$key" "$_YAML_AWK_LIB"'
     BEGIN { in_section=0; indent=0 }
     /^[a-zA-Z0-9_-]+:/ {
         if ($1 == section":") { in_section=1; indent=0 }
         else if (in_section && indent==0) { in_section=0 }
     }
     in_section && $1 == key":" {
-        gsub(/^[^:]+: */, "")
-        gsub(/^["'\'']|["'\'']$/, "")
-        print
+        sub(/^[^:]+: */, "")
+        print clean_value($0)
         exit
     }
     ' "$file"
@@ -2034,16 +3119,15 @@ get_yaml_value() {
 get_default_value() {
     local key="$1"
 
-    awk -v key="$key" '
+    awk -v key="$key" "$_YAML_AWK_LIB"'
     BEGIN { in_defaults=0 }
     /^defaults:/ { in_defaults=1; next }
     /^[a-zA-Z]/ { if ($0 !~ /^defaults:/) in_defaults=0 }
     in_defaults && /^  [a-zA-Z0-9_-]+:/ {
         gsub(/^ +/, "")
         if ($1 == key":") {
-            gsub(/^[^:]+: */, "")
-            gsub(/^["'\'']|["'\'']$/, "")
-            print
+            sub(/^[^:]+: */, "")
+            print clean_value($0)
             exit
         }
     }
@@ -2064,12 +3148,18 @@ get_job_value() {
 load_batch_defaults() {
     [ ! -f "$JOBS_FILE" ] && return 0
 
+    # YAML defaults only apply when the user did NOT pass the matching CLI flag,
+    # so explicit --parallel / --continue-on-error always win.
     local val
-    val=$(get_default_value "parallel")
-    [ -n "$val" ] && PARALLEL="$val" || true
+    if [ "$PARALLEL_SET" != true ]; then
+        val=$(get_default_value "parallel")
+        [ -n "$val" ] && PARALLEL="$val" || true
+    fi
 
-    val=$(get_default_value "continue_on_error")
-    [ "$val" = "true" ] && CONTINUE_ON_ERROR=true || true
+    if [ "$CONTINUE_ON_ERROR_SET" != true ]; then
+        val=$(get_default_value "continue_on_error")
+        [ "$val" = "true" ] && CONTINUE_ON_ERROR=true || true
+    fi
 }
 
 # Get profile configuration from jobs.yaml
@@ -2078,7 +3168,7 @@ get_profile_value() {
     local profile="$1"
     local key="$2"
 
-    awk -v profile="$profile" -v key="$key" '
+    awk -v profile="$profile" -v key="$key" "$_YAML_AWK_LIB"'
     BEGIN { in_profiles=0; in_profile=0; base_indent=0 }
     /^profiles:/ { in_profiles=1; next }
     /^[a-zA-Z]/ { if ($0 !~ /^profiles:/) { in_profiles=0; in_profile=0 } }
@@ -2091,9 +3181,8 @@ get_profile_value() {
     in_profile && /^    [a-zA-Z0-9_-]+:/ {
         gsub(/^ +/, "")
         if ($1 == key":") {
-            gsub(/^[^:]+: */, "")
-            gsub(/^["'\'']|["'\'']$/, "")
-            print
+            sub(/^[^:]+: */, "")
+            print clean_value($0)
             exit
         }
     }
@@ -2109,7 +3198,7 @@ get_job_field() {
 
     if [ -n "$subfield" ]; then
         # Nested field (e.g., from.database)
-        awk -v job="$job" -v field="$field" -v subfield="$subfield" '
+        awk -v job="$job" -v field="$field" -v subfield="$subfield" "$_YAML_AWK_LIB"'
         BEGIN { in_job=0; in_field=0 }
         /^  [a-zA-Z0-9_-]+:/ {
             gsub(/:.*/, "", $1)
@@ -2125,8 +3214,7 @@ get_job_field() {
                 if (val != "" && val !~ /^$/) {
                     # Its a string value, not nested
                     if (subfield == "_value_") {
-                        gsub(/^["'\'']|["'\'']$/, "", val)
-                        print val
+                        print clean_value(val)
                         exit
                     }
                 }
@@ -2137,16 +3225,15 @@ get_job_field() {
         in_job && in_field && /^      [a-zA-Z0-9_-]+:/ {
             gsub(/^ +/, "")
             if ($1 == subfield":") {
-                gsub(/^[^:]+: */, "")
-                gsub(/^["'\'']|["'\'']$/, "")
-                print
+                sub(/^[^:]+: */, "")
+                print clean_value($0)
                 exit
             }
         }
         ' "$JOBS_FILE"
     else
         # Simple field
-        awk -v job="$job" -v field="$field" '
+        awk -v job="$job" -v field="$field" "$_YAML_AWK_LIB"'
         BEGIN { in_job=0 }
         /^  [a-zA-Z0-9_-]+:/ {
             gsub(/:.*/, "", $1)
@@ -2156,9 +3243,8 @@ get_job_field() {
         in_job && /^    [a-zA-Z0-9_-]+:/ {
             gsub(/^ +/, "")
             if ($1 == field":") {
-                gsub(/^[^:]+: */, "")
-                gsub(/^["'\'']|["'\'']$/, "")
-                print
+                sub(/^[^:]+: */, "")
+                print clean_value($0)
                 exit
             }
         }
@@ -2186,7 +3272,8 @@ build_connection() {
     local db_user="" db_host="" db_port="" database=""
 
     if [ -n "$profile" ]; then
-        # Load from profile
+        # Load from profile (including database — it was omitted, so a job whose
+        # connection came entirely from a profile produced an empty database).
         type=$(get_profile_value "$profile" "type")
         ssh_user=$(get_profile_value "$profile" "ssh_user")
         ssh_host=$(get_profile_value "$profile" "ssh_host")
@@ -2194,6 +3281,14 @@ build_connection() {
         db_user=$(get_profile_value "$profile" "db_user")
         db_host=$(get_profile_value "$profile" "db_host")
         db_port=$(get_profile_value "$profile" "db_port")
+        database=$(get_profile_value "$profile" "database")
+
+        # A referenced-but-missing/empty profile must NOT silently fall back to
+        # postgres@localhost — that could dump/restore the WRONG (local) server.
+        if [ -z "${type}${ssh_host}${db_user}${db_host}${db_port}${database}" ]; then
+            log_error "Profile not found or empty: '$profile' (referenced by job's $direction)"
+            return 1
+        fi
     fi
 
     # Override with job-specific values
@@ -2205,6 +3300,13 @@ build_connection() {
     [ -n "$(get_job_field "$job" "$direction" "db_host")" ] && db_host=$(get_job_field "$job" "$direction" "db_host")
     [ -n "$(get_job_field "$job" "$direction" "db_port")" ] && db_port=$(get_job_field "$job" "$direction" "db_port")
     [ -n "$(get_job_field "$job" "$direction" "database")" ] && database=$(get_job_field "$job" "$direction" "database")
+
+    # Nothing was specified for this direction at all — return no connection instead
+    # of synthesizing a spurious "postgres@localhost/" (which added a bogus --to to
+    # every job and could aim an operation at the wrong local server).
+    if [ -z "$profile" ] && [ -z "${type}${ssh_host}${db_user}${db_host}${db_port}${database}" ]; then
+        return 0
+    fi
 
     # Set defaults
     [ -z "$db_user" ] && db_user="postgres"
@@ -2357,15 +3459,20 @@ parse_job_to_args() {
     local from_conn=$(build_connection "$job" "from")
     local to_conn=$(build_connection "$job" "to")
 
-    [ -n "$from_conn" ] && args+=" --from '$from_conn'"
-    [ -n "$to_conn" ] && args+=" --to '$to_conn'"
+    [ -n "$from_conn" ] && args+=" --from $(pq "$from_conn")"
+    [ -n "$to_conn" ] && args+=" --to $(pq "$to_conn")"
 
     # Password files
     local from_pw=$(get_password_file "$job" "from")
     local to_pw=$(get_password_file "$job" "to")
 
-    [ -n "$from_pw" ] && args+=" --from-password-file '$from_pw'"
-    [ -n "$to_pw" ] && args+=" --to-password-file '$to_pw'"
+    [ -n "$from_pw" ] && args+=" --from-password-file $(pq "$from_pw")"
+    [ -n "$to_pw" ] && args+=" --to-password-file $(pq "$to_pw")"
+
+    # Inline passwords are deliberately NOT emitted as argv flags here: run_job reads them
+    # via job_inline_passwords() and exports them as T_PGSQL_*_PASSWORD env vars for the
+    # re-exec'd child, so a plaintext password never lands on the child process argv (local
+    # `ps`) or in the job-args preview/log. (password_file flags remain — a path is not secret.)
 
     # Options (with defaults fallback)
     # Boolean flags
@@ -2379,26 +3486,26 @@ parse_job_to_args() {
     [ "$(get_job_value "$job" "notify_on_error")" = "true" ] && args+=" --notify-on-error"
 
     # Storage options
-    [ -n "$(get_job_value "$job" "output")" ] && args+=" --output '$(get_job_value "$job" "output")'"
-    [ -n "$(get_job_value "$job" "dump_name")" ] && args+=" --dump-name '$(get_job_value "$job" "dump_name")'"
-    [ -n "$(get_job_value "$job" "keep")" ] && args+=" --keep $(get_job_value "$job" "keep")"
-    [ -n "$(get_job_value "$job" "from_keep")" ] && args+=" --from-keep $(get_job_value "$job" "from_keep")"
-    [ -n "$(get_job_value "$job" "skip_if_recent")" ] && args+=" --skip-if-recent '$(get_job_value "$job" "skip_if_recent")'"
+    [ -n "$(get_job_value "$job" "output")" ] && args+=" --output $(pq "$(get_job_value "$job" "output")")"
+    [ -n "$(get_job_value "$job" "dump_name")" ] && args+=" --dump-name $(pq "$(get_job_value "$job" "dump_name")")"
+    [ -n "$(get_job_value "$job" "keep")" ] && args+=" --keep $(pq "$(get_job_value "$job" "keep")")"
+    [ -n "$(get_job_value "$job" "from_keep")" ] && args+=" --from-keep $(pq "$(get_job_value "$job" "from_keep")")"
+    [ -n "$(get_job_value "$job" "skip_if_recent")" ] && args+=" --skip-if-recent $(pq "$(get_job_value "$job" "skip_if_recent")")"
 
     # Filtering options
-    [ -n "$(get_job_value "$job" "exclude_table")" ] && args+=" --exclude-table '$(get_job_value "$job" "exclude_table")'"
-    [ -n "$(get_job_value "$job" "exclude_data")" ] && args+=" --exclude-data '$(get_job_value "$job" "exclude_data")'"
-    [ -n "$(get_job_value "$job" "exclude_schema")" ] && args+=" --exclude-schema '$(get_job_value "$job" "exclude_schema")'"
-    [ -n "$(get_job_value "$job" "only_table")" ] && args+=" --only-table '$(get_job_value "$job" "only_table")'"
-    [ -n "$(get_job_value "$job" "only_schema")" ] && args+=" --only-schema '$(get_job_value "$job" "only_schema")'"
+    [ -n "$(get_job_value "$job" "exclude_table")" ] && args+=" --exclude-table $(pq "$(get_job_value "$job" "exclude_table")")"
+    [ -n "$(get_job_value "$job" "exclude_data")" ] && args+=" --exclude-data $(pq "$(get_job_value "$job" "exclude_data")")"
+    [ -n "$(get_job_value "$job" "exclude_schema")" ] && args+=" --exclude-schema $(pq "$(get_job_value "$job" "exclude_schema")")"
+    [ -n "$(get_job_value "$job" "only_table")" ] && args+=" --only-table $(pq "$(get_job_value "$job" "only_table")")"
+    [ -n "$(get_job_value "$job" "only_schema")" ] && args+=" --only-schema $(pq "$(get_job_value "$job" "only_schema")")"
 
     # Compression options
-    [ -n "$(get_job_value "$job" "compress")" ] && args+=" --compress '$(get_job_value "$job" "compress")'"
-    [ -n "$(get_job_value "$job" "compress_level")" ] && args+=" --compress-level $(get_job_value "$job" "compress_level")"
-    [ -n "$(get_job_value "$job" "pg_compress_level")" ] && args+=" --pg-compress-level $(get_job_value "$job" "pg_compress_level")"
+    [ -n "$(get_job_value "$job" "compress")" ] && args+=" --compress $(pq "$(get_job_value "$job" "compress")")"
+    [ -n "$(get_job_value "$job" "compress_level")" ] && args+=" --compress-level $(pq "$(get_job_value "$job" "compress_level")")"
+    [ -n "$(get_job_value "$job" "pg_compress_level")" ] && args+=" --pg-compress-level $(pq "$(get_job_value "$job" "pg_compress_level")")"
 
     # Streaming options
-    [ -n "$(get_job_value "$job" "stream_buffer")" ] && args+=" --stream-buffer $(get_job_value "$job" "stream_buffer")"
+    [ -n "$(get_job_value "$job" "stream_buffer")" ] && args+=" --stream-buffer $(pq "$(get_job_value "$job" "stream_buffer")")"
 
     # Health check options
     [ "$(get_job_value "$job" "health_check")" = "true" ] && args+=" --health-check"
@@ -2408,23 +3515,23 @@ parse_job_to_args() {
 
     # Retention (GFS) options
     [ "$(get_job_value "$job" "retention")" = "true" ] && args+=" --retention"
-    [ -n "$(get_job_value "$job" "retention_daily")" ] && args+=" --retention-daily $(get_job_value "$job" "retention_daily")"
-    [ -n "$(get_job_value "$job" "retention_weekly")" ] && args+=" --retention-weekly $(get_job_value "$job" "retention_weekly")"
-    [ -n "$(get_job_value "$job" "retention_monthly")" ] && args+=" --retention-monthly $(get_job_value "$job" "retention_monthly")"
-    [ -n "$(get_job_value "$job" "retention_yearly")" ] && args+=" --retention-yearly $(get_job_value "$job" "retention_yearly")"
+    [ -n "$(get_job_value "$job" "retention_daily")" ] && args+=" --retention-daily $(pq "$(get_job_value "$job" "retention_daily")")"
+    [ -n "$(get_job_value "$job" "retention_weekly")" ] && args+=" --retention-weekly $(pq "$(get_job_value "$job" "retention_weekly")")"
+    [ -n "$(get_job_value "$job" "retention_monthly")" ] && args+=" --retention-monthly $(pq "$(get_job_value "$job" "retention_monthly")")"
+    [ -n "$(get_job_value "$job" "retention_yearly")" ] && args+=" --retention-yearly $(pq "$(get_job_value "$job" "retention_yearly")")"
 
     # Masking options
     [ "$(get_job_value "$job" "mask")" = "true" ] && args+=" --mask"
-    [ -n "$(get_job_value "$job" "mask_rules")" ] && args+=" --mask-rules '$(get_job_value "$job" "mask_rules")'"
-    [ -n "$(get_job_value "$job" "mask_tables")" ] && args+=" --mask-tables '$(get_job_value "$job" "mask_tables")'"
+    [ -n "$(get_job_value "$job" "mask_rules")" ] && args+=" --mask-rules $(pq "$(get_job_value "$job" "mask_rules")")"
+    [ -n "$(get_job_value "$job" "mask_tables")" ] && args+=" --mask-tables $(pq "$(get_job_value "$job" "mask_tables")")"
 
     # Logging options
-    [ -n "$(get_job_value "$job" "log")" ] && args+=" --log '$(get_job_value "$job" "log")'"
-    [ -n "$(get_job_value "$job" "log_level")" ] && args+=" --log-level '$(get_job_value "$job" "log_level")'"
+    [ -n "$(get_job_value "$job" "log")" ] && args+=" --log $(pq "$(get_job_value "$job" "log")")"
+    [ -n "$(get_job_value "$job" "log_level")" ] && args+=" --log-level $(pq "$(get_job_value "$job" "log_level")")"
 
     # Notify - telegram
     local telegram_config=$(get_job_telegram_config "$job")
-    [ -n "$telegram_config" ] && args+=" --notify '$telegram_config'"
+    [ -n "$telegram_config" ] && args+=" --notify $(pq "$telegram_config")"
 
     echo "$args"
 }
@@ -2439,22 +3546,65 @@ save_job() {
 
     # Build args string from current settings (use single quotes for values with special chars)
     local args=""
-    [ -n "$FROM_CONNECTION" ] && args="$args --from '$FROM_CONNECTION'"
+    [ -n "$FROM_CONNECTION" ] && args="$args --from $(pq "$FROM_CONNECTION")"
     for to in "${TO_CONNECTIONS[@]}"; do
-        args="$args --to '$to'"
+        args="$args --to $(pq "$to")"
     done
-    [ -n "$FROM_PASSWORD_FILE" ] && args="$args --from-password-file '$FROM_PASSWORD_FILE'"
+    [ -n "$FROM_PASSWORD_FILE" ] && args="$args --from-password-file $(pq "$FROM_PASSWORD_FILE")"
     for pf in "${TO_PASSWORD_FILES[@]}"; do
-        args="$args --to-password-file '$pf'"
+        args="$args --to-password-file $(pq "$pf")"
     done
-    [ -n "$PASSWORD_FILE" ] && args="$args --password-file '$PASSWORD_FILE'"
-    [ -n "$OUTPUT_DIR" ] && args="$args --output '$OUTPUT_DIR'"
+    [ -n "$PASSWORD_FILE" ] && args="$args --password-file $(pq "$PASSWORD_FILE")"
+    [ -n "$OUTPUT_DIR" ] && args="$args --output $(pq "$OUTPUT_DIR")"
     [ "$KEEP" -ge 0 ] && args="$args --keep $KEEP"
     [ "$FROM_KEEP" -gt 0 ] && args="$args --from-keep $FROM_KEEP"
-    [ -n "$EXCLUDE_TABLES" ] && args="$args --exclude-table '$EXCLUDE_TABLES'"
-    [ -n "$EXCLUDE_SCHEMAS" ] && args="$args --exclude-schema '$EXCLUDE_SCHEMAS'"
-    [ -n "$ONLY_TABLES" ] && args="$args --only-table '$ONLY_TABLES'"
-    [ -n "$ONLY_SCHEMAS" ] && args="$args --only-schema '$ONLY_SCHEMAS'"
+    [ -n "$EXCLUDE_TABLES" ] && args="$args --exclude-table $(pq "$EXCLUDE_TABLES")"
+    [ -n "$EXCLUDE_SCHEMAS" ] && args="$args --exclude-schema $(pq "$EXCLUDE_SCHEMAS")"
+    [ -n "$EXCLUDE_DATA" ] && args="$args --exclude-data $(pq "$EXCLUDE_DATA")"
+    [ -n "$ONLY_TABLES" ] && args="$args --only-table $(pq "$ONLY_TABLES")"
+    [ -n "$ONLY_SCHEMAS" ] && args="$args --only-schema $(pq "$ONLY_SCHEMAS")"
+
+    # Naming / skip
+    [ -n "$DUMP_NAME" ] && args="$args --dump-name $(pq "$DUMP_NAME")"
+    [ -n "$SKIP_IF_RECENT" ] && args="$args --skip-if-recent $(pq "$SKIP_IF_RECENT")"
+
+    # Compression (only when changed from defaults)
+    [ "$COMPRESS" != "gzip" ] && args="$args --compress $(pq "$COMPRESS")"
+    [ "$COMPRESS_LEVEL" != 6 ] && args="$args --compress-level $COMPRESS_LEVEL"
+    [ "$PG_COMPRESS_LEVEL_SET" = true ] && args="$args --pg-compress-level $PG_COMPRESS_LEVEL"
+
+    # Streaming
+    [ "$STREAM" = true ] && args="$args --stream"
+    [ "$STREAM_BUFFER" != 64 ] && args="$args --stream-buffer $STREAM_BUFFER"
+
+    # Retention (GFS)
+    if [ "$RETENTION" = true ]; then
+        args="$args --retention"
+        [ "$RETENTION_DAILY" != 7 ] && args="$args --retention-daily $RETENTION_DAILY"
+        [ "$RETENTION_WEEKLY" != 4 ] && args="$args --retention-weekly $RETENTION_WEEKLY"
+        [ "$RETENTION_MONTHLY" != 12 ] && args="$args --retention-monthly $RETENTION_MONTHLY"
+        [ "$RETENTION_YEARLY" != 3 ] && args="$args --retention-yearly $RETENTION_YEARLY"
+    fi
+
+    # Masking
+    [ "$MASK" = true ] && args="$args --mask"
+    [ -n "$MASK_RULES" ] && args="$args --mask-rules $(pq "$MASK_RULES")"
+    [ -n "$MASK_TABLES" ] && args="$args --mask-tables $(pq "$MASK_TABLES")"
+
+    # Health checks
+    [ "$HEALTH_CHECK_FAIL" = true ] && args="$args --health-check-fail"
+
+    # Notifications
+    for n in "${NOTIFY[@]}"; do
+        args="$args --notify $(pq "$n")"
+    done
+    [ "$NOTIFY_ON_ERROR" = true ] && args="$args --notify-on-error"
+
+    # Batch job filters
+    [ -n "$ONLY_JOBS" ] && args="$args --only $(pq "$ONLY_JOBS")"
+    [ -n "$EXCLUDE_JOBS" ] && args="$args --exclude $(pq "$EXCLUDE_JOBS")"
+
+    [ "$SUDO" = true ] && args="$args --sudo"
     [ "$FORCE" = true ] && args="$args --force"
     [ "$VERBOSE" = true ] && args="$args --verbose"
 
@@ -2464,22 +3614,31 @@ save_job() {
     # Check if job exists
     if grep -q "^  $job_name:" "$JOBS_FILE" 2>/dev/null; then
         # Update existing job
+        # Pass args via ENVIRON (NOT awk -v, which interprets backslash escapes and would
+        # mangle pq's \" / \\), and serialize it IDENTICALLY to the append path below
+        # (bare "    args:" + raw value, no double-quote wrapping which clean_value would
+        # truncate at the first embedded quote).
         local tmp_file=$(mktemp)
-        awk -v name="$job_name" -v cmd="$job_command" -v args="$args" '
+        JOBARGS="$args" awk -v name="$job_name" -v cmd="$job_command" '
         BEGIN { skip=0 }
-        /^  [a-zA-Z0-9_-]+:/ {
-            if ($1 == name":") {
-                skip=1
+        {
+            if ($0 ~ /^  [a-zA-Z0-9_-]+:/ && $1 == name":") {
                 print "  " name ":"
                 print "    command: " cmd
-                print "    args: \"" args "\""
+                print "    args:" ENVIRON["JOBARGS"]
+                skip=1
                 next
-            } else {
-                skip=0
             }
+            if (skip==1) {
+                # Skip only the old job body (indented deeper than the 2-space job
+                # key). Stop at the next 2-space job key OR any top-level (0-indent)
+                # line such as a "defaults:" section header — which the old code
+                # deleted, reparenting its keys and corrupting the file.
+                if ($0 ~ /^  [a-zA-Z0-9_-]+:/ || $0 ~ /^[^ ]/) { skip=0; print }
+                next
+            }
+            print
         }
-        skip==0 { print }
-        skip==1 && /^  [a-zA-Z0-9_-]+:/ { skip=0; print }
         ' "$JOBS_FILE" > "$tmp_file"
         mv "$tmp_file" "$JOBS_FILE"
         log_success "Updated job: $job_name"
@@ -2587,15 +3746,16 @@ remove_job() {
     local tmp_file=$(mktemp)
     awk -v name="$job_name" '
     BEGIN { skip=0 }
-    /^  [a-zA-Z0-9_-]+:/ {
-        if ($1 == name":") {
-            skip=1
+    {
+        if ($0 ~ /^  [a-zA-Z0-9_-]+:/ && $1 == name":") { skip=1; next }
+        if (skip==1) {
+            # Skip only the removed job body; stop at the next 2-space job key OR any
+            # top-level (0-indent) line (e.g. a "defaults:" header) — preserving it.
+            if ($0 ~ /^  [a-zA-Z0-9_-]+:/ || $0 ~ /^[^ ]/) { skip=0; print }
             next
-        } else {
-            skip=0
         }
+        print
     }
-    skip==0 { print }
     ' "$JOBS_FILE" > "$tmp_file"
 
     mv "$tmp_file" "$JOBS_FILE"
@@ -2614,18 +3774,43 @@ run_job() {
     local job_cmd=$(get_job_field "$job_name" "command")
 
     if [ -z "$job_cmd" ]; then
-        log_error "Job not found: $job_name"
+        log_error "Job $(pq "$job_name") not found or missing a 'command:' field"
         return 1
     fi
 
-    # Parse job args (supports both old and new format)
+    # The command word is re-exec'd via bash -c, so it MUST be one of the known
+    # subcommands — never an arbitrary string like "dump; rm -rf ...".
+    case "$job_cmd" in
+        dump|restore|clone|upgrade|fetch|batch|list|meta|clean) ;;
+        *) log_error "Job $(pq "$job_name") has an invalid command: $(pq "$job_cmd")"; return 1 ;;
+    esac
+
+    # Parse job args (supports both old and new format). Inline passwords are NOT in here
+    # (parse_job_to_args deliberately omits them); they travel via the environment below.
     local job_args=$(parse_job_to_args "$job_name")
 
-    log_info "Running job: $job_name"
-    log_debug "Command: $job_cmd $job_args"
+    # Read inline passwords to hand to the child via the ENVIRONMENT (not argv, so they stay
+    # off the child's process argv / ps). Empty values are treated as unset by get_password.
+    local _pw_both _pw_from _pw_to
+    _pw_both=$(get_job_value "$job_name" "password")
+    _pw_from=$(get_job_field "$job_name" "from" "password"); [ -z "$_pw_from" ] && _pw_from=$(get_job_value "$job_name" "from_password")
+    _pw_to=$(get_job_field "$job_name" "to" "password");     [ -z "$_pw_to" ]   && _pw_to=$(get_job_value "$job_name" "to_password")
 
-    # Execute the job using bash -c to properly handle quotes
-    bash -c "'$0' $job_cmd $job_args"
+    log_info "Running job: $job_name"
+    log_debug "Command: $job_cmd $(redact_args "$job_args")"
+
+    # Export so the re-exec'd child (which runs the dump and sends notifications)
+    # can attach a job-specific "re-run" button to a failure notification.
+    export CURRENT_JOB_NAME="$job_name"
+    export JOBS_FILE
+
+    # Execute via bash -c. Job passwords are passed as scoped env assignments (not argv).
+    # Fall back to any INHERITED T_PGSQL_*_PASSWORD when the job has none, so a passwordless
+    # job does not get an empty assignment that would shadow the documented ambient env var.
+    T_PGSQL_PASSWORD="${_pw_both:-$T_PGSQL_PASSWORD}" \
+    T_PGSQL_FROM_PASSWORD="${_pw_from:-$T_PGSQL_FROM_PASSWORD}" \
+    T_PGSQL_TO_PASSWORD="${_pw_to:-$T_PGSQL_TO_PASSWORD}" \
+        bash -c "'$0' $job_cmd $job_args"
 }
 
 cmd_batch() {
@@ -2637,6 +3822,12 @@ cmd_batch() {
     if [ -z "$target" ]; then
         if [ ! -f "$JOBS_FILE" ]; then
             log_error "Jobs file not found: $JOBS_FILE"
+            return 1
+        fi
+
+        # Interactive job selection cannot run under -y/--yes (no prompt).
+        if [ "$YES" = true ]; then
+            log_error "No job specified. With -y/--yes provide a job name (e.g. '$SCRIPT_NAME batch <job>' or 'batch all')"
             return 1
         fi
 
@@ -2696,10 +3887,12 @@ cmd_batch() {
             echo "Selected: $target"
         fi
         echo ""
-        read -p "Are you sure? (y/N): " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            log_warn "Cancelled"
-            return 0
+        if [ "$YES" != true ]; then
+            read -p "Are you sure? (y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                log_warn "Cancelled"
+                return 0
+            fi
         fi
         echo ""
     fi
@@ -2768,22 +3961,32 @@ cmd_batch() {
             local job_names=()
             local running=0
             local completed=0
+            local stop_launching=false
             local temp_dir=$(mktemp -d)
+            if [ -z "$temp_dir" ]; then
+                log_error "mktemp failed, cannot run parallel batch"
+                return 1
+            fi
 
             for job in $jobs; do
+                # Honor --continue-on-error: stop launching new jobs once one failed
+                [ "$stop_launching" = true ] && break
+
                 # Wait if we've reached max parallel jobs
                 while [ $running -ge $PARALLEL ]; do
                     for i in "${!pids[@]}"; do
                         if ! kill -0 "${pids[$i]}" 2>/dev/null; then
                             wait "${pids[$i]}" 2>/dev/null
-                            local exit_code=$?
+                            # Read status from the .exit file, not from wait
+                            local exit_code=$(cat "$temp_dir/${job_names[$i]}.exit" 2>/dev/null || echo "1")
                             completed=$((completed + 1))
 
-                            if [ $exit_code -eq 0 ]; then
+                            if [ "$exit_code" -eq 0 ]; then
                                 log_success "[${completed}/${total}] Completed: ${job_names[$i]}"
                             else
                                 log_error "[${completed}/${total}] Failed: ${job_names[$i]}"
                                 failed=$((failed + 1))
+                                [ "$CONTINUE_ON_ERROR" != true ] && stop_launching=true
                             fi
 
                             unset pids[$i]
@@ -2794,9 +3997,16 @@ cmd_batch() {
                     sleep 0.5
                 done
 
-                # Start new job in background
+                # A job may have FAILED while we were waiting for a free slot, setting
+                # stop_launching. The top-of-loop break only fires on the NEXT iteration, so
+                # without re-checking here we would launch one extra job after the stop.
+                [ "$stop_launching" = true ] && break
+
+                # Start new job in background.
+                # Always write the .exit file even when run_job fails: capture rc
+                # first, then persist it (a bare "echo $?" could reflect the redirect).
                 log_info "Starting: $job"
-                (run_job "$job" > "$temp_dir/$job.log" 2>&1; echo $? > "$temp_dir/$job.exit") &
+                (run_job "$job" > "$temp_dir/$job.log" 2>&1; rc=$?; echo "$rc" > "$temp_dir/$job.exit") &
                 pids+=($!)
                 job_names+=("$job")
                 running=$((running + 1))
@@ -2815,6 +4025,10 @@ cmd_batch() {
                     failed=$((failed + 1))
                 fi
             done
+
+            if [ "$stop_launching" = true ]; then
+                log_warn "Some jobs were not started (a job failed; use --continue-on-error to run all)"
+            fi
 
             rm -rf "$temp_dir"
         else
@@ -2851,25 +4065,564 @@ cmd_batch() {
             local summary="Completed: $((total - failed))/$total\nFailed: $failed\nDuration: $elapsed"
             send_notification "$status" "Batch completed: $total jobs" "$summary"
         fi
+
+        # Propagate failure so cron/CI sees a nonzero exit when any job failed.
+        [ $failed -gt 0 ] && return 1
+        return 0
     else
         run_job "$target"
     fi
 }
 
 # ==============================================================================
+# TELEGRAM BOT (commands + inline button listener)
+# ==============================================================================
+cmd_bot() {
+    local bot_token=""
+    local poll_interval=2
+    local bot_cooldown="1h"
+    local offset=0
+
+    # Get token from --token arg or from YAML defaults
+    if [ -n "$BOT_TOKEN" ]; then
+        bot_token="$BOT_TOKEN"
+    elif [ -f "$JOBS_FILE" ]; then
+        local tg_config=$(get_default_telegram_config)
+        if [ -n "$tg_config" ]; then
+            bot_token=$(echo "$tg_config" | cut -d: -f2-3)
+        fi
+    fi
+
+    if [ -z "$bot_token" ]; then
+        log_error "Telegram bot token required. Use --token or configure in YAML"
+        return 1
+    fi
+
+    [ -n "$BOT_COOLDOWN" ] && bot_cooldown="$BOT_COOLDOWN"
+
+    # Detect chat_id and thread_id from YAML for sending messages
+    local default_chat_id="" default_thread_id=""
+    if [ -f "$JOBS_FILE" ]; then
+        local tg_full=$(get_default_telegram_config)
+        if [ -n "$tg_full" ]; then
+            default_chat_id=$(echo "$tg_full" | cut -d: -f4)
+            default_thread_id=$(echo "$tg_full" | cut -d: -f5)
+        fi
+    fi
+
+    log_info "🤖 t-pgsql bot started (cooldown: ${bot_cooldown})"
+    log_info "Listening for commands and callbacks..."
+    log_info "Press Ctrl+C to stop"
+    # Fail-closed: without a configured chat_id the bot ignores every command/callback.
+    [ -z "$default_chat_id" ] && log_warn "No chat_id configured (telegram config in YAML) — the bot will IGNORE all commands until an allowed chat is set."
+
+    # Per-user temp files, created 600 (the response holds Telegram message content,
+    # so it must not be world-readable on a shared host).
+    local offset_file="${TMPDIR:-/tmp}/.t-pgsql-bot-offset-$(id -u)"
+    local tmp_resp="${TMPDIR:-/tmp}/.t-pgsql-bot-resp-$(id -u).json"
+    (umask 077; : >> "$offset_file"; : >> "$tmp_resp") 2>/dev/null
+    chmod 600 "$offset_file" "$tmp_resp" 2>/dev/null
+    [ -f "$offset_file" ] && offset=$(cat "$offset_file" 2>/dev/null || echo 0)
+
+    # Main polling loop (errexit already disabled globally)
+    set +e
+
+    while true; do
+        local response
+        response=$(tg_api "$bot_token" getUpdates --max-time 35 -X POST \
+            -d "offset=${offset}" \
+            -d "timeout=30" \
+            -d "allowed_updates=[\"message\",\"callback_query\"]" 2>&1)
+
+        # Validate response
+        if ! echo "$response" | grep -q '"ok":true' 2>/dev/null; then
+            log_warn "Telegram API error"
+            sleep "$poll_interval"
+            continue
+        fi
+
+        # Skip if empty result
+        if echo "$response" | grep -q '"result":\[\]' 2>/dev/null; then
+            continue
+        fi
+
+        # Save response
+        echo "$response" > "$tmp_resp"
+
+        # Use python3/jq to extract updates reliably, fallback to grep
+        local update_ids=""
+        if command -v python3 &>/dev/null; then
+            update_ids=$(python3 -c "
+import json,sys
+data=json.load(open('$tmp_resp'))
+def s(v):
+    # CRITICAL: strip the field/record delimiters from EVERY user-controlled value so a
+    # message text (or callback data / first_name) containing a newline or '|' cannot forge
+    # an extra '|'-delimited update line and bypass the chat-id authorization (or poison the
+    # poll offset). The bot only ever needs single-line '/command args' text, so collapsing
+    # these characters to spaces is lossless for its purpose.
+    return str(v).replace('\r',' ').replace('\n',' ').replace('|',' ')
+for u in data.get('result',[]):
+    uid=u['update_id']
+    # Detect type
+    if 'callback_query' in u:
+        cb=u['callback_query']
+        cb_chat=cb.get('message',{}).get('chat',{}).get('id','')
+        print(f\"{uid}|callback|{s(cb.get('id',''))}|{s(cb.get('data',''))}|{cb_chat}|{s(cb.get('from',{}).get('first_name',''))}\")
+    elif 'message' in u:
+        m=u['message']
+        chat_id=m['chat']['id']
+        thread=m.get('message_thread_id','')
+        print(f\"{uid}|message|{chat_id}|{s(m.get('text',''))}|{thread}\")
+" 2>/dev/null)
+        fi
+
+        if [ -z "$update_ids" ]; then
+            # Fallback: just advance offset past all updates
+            local max_uid
+            max_uid=$(grep -o '"update_id":[0-9]*' "$tmp_resp" 2>/dev/null | grep -o '[0-9]*' 2>/dev/null | sort -n | tail -1)
+            if [ -n "$max_uid" ]; then
+                offset=$((max_uid + 1))
+                echo "$offset" > "$offset_file"
+            fi
+            sleep "$poll_interval"
+            continue
+        fi
+
+        # Process each update line
+        while IFS='|' read -r uid utype field1 field2 field3 field4; do
+            [ -z "$uid" ] && continue
+
+            # Advance offset
+            offset=$((uid + 1))
+            echo "$offset" > "$offset_file"
+
+            if [ "$utype" = "callback" ]; then
+                local cb_id="$field1"
+                local cb_data="$field2"
+                local cb_chat="$field3"
+                local cb_user="$field4"
+
+                # Authorize the callback the same way messages are: only act on button
+                # presses coming from the configured chat. FAIL CLOSED — if no allowed chat
+                # is configured, reject everything rather than accepting any chat.
+                if [ -z "$default_chat_id" ] || [ "$cb_chat" != "$default_chat_id" ]; then
+                    log_warn "Ignoring callback from unauthorized chat: ${cb_chat}"
+                    bot_answer_callback "$bot_token" "$cb_id" "⛔ Not authorized"
+                    continue
+                fi
+
+                log_info "Callback from ${cb_user}: ${cb_data}"
+
+                local cb_action cb_yaml cb_job
+                cb_action=$(echo "$cb_data" | cut -d: -f1)
+                cb_yaml=$(echo "$cb_data" | cut -d: -f2)
+                cb_job=$(echo "$cb_data" | cut -d: -f3)
+
+                if [ "$cb_action" = "backup" ]; then
+                    local yaml_path
+                    yaml_path=$(bot_resolve_yaml "$cb_yaml")
+                    if [ ! -f "$yaml_path" ]; then
+                        bot_answer_callback "$bot_token" "$cb_id" "❌ YAML not found: ${cb_yaml}"
+                    else
+                        local skip_msg
+                        skip_msg=$(bot_check_cooldown "$yaml_path" "$cb_job" "$bot_cooldown")
+                        if [ -n "$skip_msg" ]; then
+                            bot_answer_callback "$bot_token" "$cb_id" "⏳ ${skip_msg}"
+                        else
+                            bot_answer_callback "$bot_token" "$cb_id" "🚀 Starting backup: ${cb_job}"
+                            bot_run_backup "$yaml_path" "$cb_job" "$bot_token" "$default_chat_id" "$default_thread_id"
+                        fi
+                    fi
+                else
+                    bot_answer_callback "$bot_token" "$cb_id" "❓ Unknown command"
+                fi
+
+            elif [ "$utype" = "message" ]; then
+                local chat_id="$field1"
+                local msg_text="$field2"
+                local msg_thread="$field3"
+
+                # Only respond in the configured group chat. FAIL CLOSED — with no allowed
+                # chat configured, ignore all commands rather than answering any chat.
+                if [ -z "$default_chat_id" ] || [ "$chat_id" != "$default_chat_id" ]; then
+                    continue
+                fi
+
+                # Use default thread_id if not present in message
+                [ -z "$msg_thread" ] && msg_thread="$default_thread_id"
+
+                # Only process commands
+                [[ "$msg_text" != /* ]] && continue
+
+                log_info "Command: ${msg_text} (chat: ${chat_id})"
+
+                case "$msg_text" in
+                    /help|/help@*)
+                        bot_cmd_help "$bot_token" "$chat_id" "$msg_thread"
+                        ;;
+                    /list\ *)
+                        local yaml_name="${msg_text#/list }"
+                        yaml_name="${yaml_name%%@*}"
+                        yaml_name=$(echo "$yaml_name" | tr -d ' ')
+                        bot_cmd_list_jobs "$bot_token" "$chat_id" "$msg_thread" "$yaml_name"
+                        ;;
+                    /list|/list@*)
+                        bot_cmd_list_yamls "$bot_token" "$chat_id" "$msg_thread"
+                        ;;
+                    /backup\ *)
+                        local args="${msg_text#/backup }"
+                        args="${args%%@*}"
+                        local b_yaml b_job
+                        b_yaml=$(echo "$args" | awk '{print $1}')
+                        b_job=$(echo "$args" | awk '{print $2}')
+                        bot_cmd_backup "$bot_token" "$chat_id" "$msg_thread" "$b_yaml" "$b_job" "$bot_cooldown"
+                        ;;
+                    /backup|/backup@*)
+                        bot_send_message "$bot_token" "$chat_id" "$msg_thread" "❌ Usage: /backup <yaml> <job>
+
+Example: /backup mydb nightly"
+                        ;;
+                esac
+            fi
+        done <<< "$update_ids"
+
+        sleep "$poll_interval"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Bot command: /help
+# ---------------------------------------------------------------------------
+bot_cmd_help() {
+    local bot_token="$1" chat_id="$2" thread_id="$3"
+
+    local text="🤖 *t-pgsql Bot Commands*
+
+/list — List all YAML files
+/list <yaml> — List jobs in a YAML
+/backup <yaml> <job> — Start a backup
+/help — Show this message
+
+📌 Cooldown: the same job cannot run again until ${BOT_COOLDOWN:-1h} has passed since its last backup.
+
+💡 Examples:
+\`/list mydb\`
+\`/backup mydb nightly\`"
+
+    bot_send_message "$bot_token" "$chat_id" "$thread_id" "$text"
+}
+
+# ---------------------------------------------------------------------------
+# Bot command: /list (all YAMLs)
+# ---------------------------------------------------------------------------
+bot_cmd_list_yamls() {
+    local bot_token="$1" chat_id="$2" thread_id="$3"
+
+    local text="📁 *YAML Files*
+"
+    local count=0
+    for f in "${SCRIPT_DIR}"/*.yaml; do
+        [ -f "$f" ] || continue
+        local name=$(basename "$f" .yaml)
+        local job_count
+        job_count=$(awk '/^jobs:/{found=1;next} found && /^  [a-zA-Z0-9_-]+:/{count++} found && /^[a-zA-Z]/ && !/^  /{exit} END{print count+0}' "$f") || true
+        text="${text}
+📄 \`${name}\` — ${job_count} job"
+        count=$((count + 1))
+    done
+
+    if [ $count -eq 0 ]; then
+        text="❌ No YAML files found."
+    else
+        text="${text}
+
+📌 Job details: \`/list <yaml>\`"
+    fi
+
+    bot_send_message "$bot_token" "$chat_id" "$thread_id" "$text"
+}
+
+# ---------------------------------------------------------------------------
+# Bot command: /list <yaml> (jobs in a YAML)
+# ---------------------------------------------------------------------------
+bot_cmd_list_jobs() {
+    local bot_token="$1" chat_id="$2" thread_id="$3" yaml_name="$4"
+
+    local yaml_path
+    yaml_path=$(bot_resolve_yaml "$yaml_name")
+
+    if [ ! -f "$yaml_path" ]; then
+        bot_send_message "$bot_token" "$chat_id" "$thread_id" "❌ YAML not found: ${yaml_name}
+
+Use /list to see available files."
+        return 0
+    fi
+
+    local display_name=$(basename "$yaml_path" .yaml)
+    local text="📄 *${display_name}* Jobs
+"
+
+    # Extract job names from YAML
+    local jobs_list
+    jobs_list=$(awk '/^jobs:/{found=1;next} found && /^  [a-zA-Z0-9_-]+:/{name=$1; gsub(/:$/,"",name); print name} found && /^[a-zA-Z]/ && !/^  /{exit}' "$yaml_path") || true
+
+    if [ -z "$jobs_list" ]; then
+        text="${text}
+⚠️ No jobs found in this YAML."
+    else
+        while IFS= read -r job_name; do
+            [ -z "$job_name" ] && continue
+            local cmd
+            cmd=$(JOBS_FILE="$yaml_path" get_job_field "$job_name" "command" 2>/dev/null) || true
+            local db_from
+            db_from=$(JOBS_FILE="$yaml_path" get_job_field "$job_name" "from" "database" 2>/dev/null) || true
+            text="${text}
+▫️ \`${job_name}\` �� ${cmd:-?} ${db_from:+($db_from)}"
+        done <<< "$jobs_list"
+
+        text="${text}
+
+📌 Backup: \`/backup ${display_name} <job>\`"
+    fi
+
+    bot_send_message "$bot_token" "$chat_id" "$thread_id" "$text"
+}
+
+# ---------------------------------------------------------------------------
+# Bot command: /backup <yaml> <job>
+# ---------------------------------------------------------------------------
+bot_cmd_backup() {
+    local bot_token="$1" chat_id="$2" thread_id="$3"
+    local yaml_name="$4" job_name="$5" bot_cooldown="$6"
+
+    if [ -z "$yaml_name" ] || [ -z "$job_name" ]; then
+        bot_send_message "$bot_token" "$chat_id" "$thread_id" "❌ Usage: /backup <yaml> <job>
+
+Example: \`/backup mydb nightly\`
+To see jobs: \`/list ${yaml_name:-<yaml>}\`"
+        return 0
+    fi
+
+    local yaml_path
+    yaml_path=$(bot_resolve_yaml "$yaml_name")
+
+    if [ ! -f "$yaml_path" ]; then
+        bot_send_message "$bot_token" "$chat_id" "$thread_id" "❌ YAML not found: ${yaml_name}"
+        return 0
+    fi
+
+    # Verify job exists
+    local job_cmd
+    job_cmd=$(JOBS_FILE="$yaml_path" get_job_field "$job_name" "command" 2>/dev/null) || true
+    if [ -z "$job_cmd" ]; then
+        bot_send_message "$bot_token" "$chat_id" "$thread_id" "❌ Job not found: ${job_name}
+
+\`/list ${yaml_name}\` to see available jobs."
+        return 0
+    fi
+
+    # Check cooldown
+    local skip_msg
+    skip_msg=$(bot_check_cooldown "$yaml_path" "$job_name" "$bot_cooldown")
+
+    if [ -n "$skip_msg" ]; then
+        bot_send_message "$bot_token" "$chat_id" "$thread_id" "⏳ ${skip_msg}"
+        log_info "Skipped: ${skip_msg}"
+    else
+        bot_send_message "$bot_token" "$chat_id" "$thread_id" "🚀 Starting backup: *${job_name}*
+YAML: ${yaml_name}"
+        log_info "Starting backup: yaml=${yaml_name} job=${job_name}"
+        bot_run_backup "$yaml_path" "$job_name" "$bot_token" "$chat_id" "$thread_id"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Bot helpers
+# ---------------------------------------------------------------------------
+
+# Resolve YAML name to full path
+bot_resolve_yaml() {
+    local name="$1"
+
+    # Already a full path
+    if [[ "$name" == *"/"* ]]; then
+        echo "$name"
+        return
+    fi
+
+    # Add .yaml extension if missing
+    [[ "$name" != *.yaml ]] && name="${name}.yaml"
+
+    echo "${SCRIPT_DIR}/${name}"
+}
+
+# Check cooldown for a job, returns skip message or empty
+bot_check_cooldown() {
+    local yaml_path="$1" job_name="$2" cooldown="$3"
+
+    local dump_name
+    dump_name=$(JOBS_FILE="$yaml_path" get_job_value "$job_name" "dump_name" 2>/dev/null) || true
+    [ -z "$dump_name" ] && dump_name="$job_name"
+
+    local output_dir
+    output_dir=$(JOBS_FILE="$yaml_path" get_job_value "$job_name" "output" 2>/dev/null) || true
+    [ -z "$output_dir" ] && output_dir="${SCRIPT_DIR}/../data/dumps"
+    output_dir="${output_dir/#\~/$HOME}"
+
+    [ ! -d "$output_dir" ] && return 0
+
+    local latest
+    latest=$(ls -t "$output_dir"/${dump_name}_*.tar.gz "$output_dir"/${dump_name}_*.dump.zst "$output_dir"/${dump_name}_*.dump "$output_dir"/${dump_name}_*.dump.xz "$output_dir"/${dump_name}_*.dump.bz2 2>/dev/null | head -1) || true
+
+    [ -z "$latest" ] && return 0
+
+    local file_epoch now_epoch diff_sec cooldown_sec
+    file_epoch=$(stat -c %Y "$latest" 2>/dev/null) || file_epoch=$(stat -f %m "$latest" 2>/dev/null) || true
+    [[ ! "$file_epoch" =~ ^[0-9]+$ ]] && return 0
+
+    now_epoch=$(date +%s)
+    diff_sec=$((now_epoch - file_epoch))
+    cooldown_sec=$(parse_time_to_seconds "$cooldown")
+
+    if [ $diff_sec -lt $cooldown_sec ]; then
+        local age_min=$((diff_sec / 60))
+        local remain_min=$(( (cooldown_sec - diff_sec) / 60 ))
+        echo "Last backup was ${age_min} min ago. Try again in ${remain_min} min. (cooldown: ${cooldown})"
+    fi
+}
+
+# Run backup job in background with notification
+bot_run_backup() {
+    local yaml_path="$1" job_name="$2"
+    local notify_token="$3" notify_chat="$4" notify_thread="$5"
+
+    (
+        local start_time=$(date +%s)
+        # Unique per-run temp log (a fixed /tmp path was symlink-clobberable: a
+        # pre-placed symlink would redirect this truncating write to an arbitrary file).
+        local log_file; log_file=$(mktemp "${TMPDIR:-/tmp}/.t-pgsql-bot-$(id -u)-XXXXXX" 2>/dev/null) || log_file="${TMPDIR:-/tmp}/.t-pgsql-bot-$(id -u)-$$.log"
+
+        # Run with --skip-if-recent 0 to bypass YAML's skip_if_recent
+        "$0" batch all --yaml "$yaml_path" --only "$job_name" --skip-if-recent 0 -y > "$log_file" 2>&1
+        local exit_code=$?
+
+        local end_time=$(date +%s)
+        local elapsed=$(( end_time - start_time ))
+        local mins=$(( elapsed / 60 ))
+        local secs=$(( elapsed % 60 ))
+        local duration="${mins}m ${secs}s"
+
+        # Send result notification
+        local result_text
+        if [ $exit_code -eq 0 ]; then
+            result_text="✅ *Backup complete*
+📄 Job: \`${job_name}\`
+⏱ Duration: ${duration}
+🕐 $(date '+%Y-%m-%d %H:%M:%S')"
+        else
+            # Get last error from log
+            local last_error
+            last_error=$(grep -i 'error\|fail' "$log_file" 2>/dev/null | tail -1 | sed 's/\x1b\[[0-9;]*m//g')
+            result_text="❌ *Backup failed*
+📄 Job: \`${job_name}\`
+⏱ Duration: ${duration}
+💬 ${last_error:-Unknown error}
+🕐 $(date '+%Y-%m-%d %H:%M:%S')"
+        fi
+
+        # Send to Telegram (token via tg_api stdin config, not argv). The failure text embeds
+        # raw log output, which routinely contains Markdown metacharacters -> parse_mode would
+        # 400 and drop the alert; bot_send_message falls back to plain text.
+        bot_send_message "$notify_token" "$notify_chat" "$notify_thread" "$result_text"
+    ) &
+    log_info "Backup started in background (PID: $!)"
+}
+
+# Send message to Telegram. Tries Markdown, then falls back to PLAIN TEXT if the API rejects
+# it (an interpolated name / raw error text with a Markdown metacharacter yields HTTP 400,
+# which would otherwise silently drop the message).
+bot_send_message() {
+    local token="$1" chat_id="$2" thread_id="$3" text="$4"
+
+    local base_args=(-X POST
+        -d "chat_id=${chat_id}"
+        --data-urlencode "text=${text}"
+        -d "disable_web_page_preview=true")
+    [ -n "$thread_id" ] && base_args+=(-d "message_thread_id=${thread_id}")
+
+    local resp
+    resp=$(tg_api "$token" sendMessage "${base_args[@]}" -d "parse_mode=Markdown" 2>&1)
+    echo "$resp" | grep -q '"ok":true' && return 0
+    # Plain-text retry so the message still gets delivered.
+    tg_api "$token" sendMessage "${base_args[@]}" > /dev/null 2>&1
+}
+
+# Answer callback query (inline button popup)
+bot_answer_callback() {
+    local token="$1"
+    local callback_id="$2"
+    local text="$3"
+
+    tg_api "$token" answerCallbackQuery -X POST \
+        -d "callback_query_id=${callback_id}" \
+        -d "text=${text}" \
+        -d "show_alert=true" > /dev/null 2>&1
+}
+
+# Helper: parse time string to seconds (1h, 30m, 2d)
+parse_time_to_seconds() {
+    local time_str="$1"
+    case "$time_str" in
+        *h) echo $(( ${time_str%h} * 3600 )) ;;
+        *m) echo $(( ${time_str%m} * 60 )) ;;
+        *d) echo $(( ${time_str%d} * 86400 )) ;;
+        *)  echo $(( time_str * 3600 )) ;;  # Default: hours
+    esac
+}
+
+# ==============================================================================
 # UTILITIES
 # ==============================================================================
+
+# Copy a file over SSH with optional bandwidth limit (--bwlimit), retries
+# (--retries) and stalled-link detection (SSH_OPTS). Usage: scp_transfer PORT SRC DST
+scp_transfer() {
+    local port="$1" src="$2" dst="$3"
+    local args=(-P "$port" "${SSH_OPTS[@]}")
+    [ -n "$BWLIMIT_KBIT" ] && args+=(-l "$BWLIMIT_KBIT")
+
+    local attempt=1 max=$(( RETRIES + 1 ))
+    while :; do
+        if scp "${args[@]}" "$src" "$dst"; then
+            return 0
+        fi
+        if [ "$attempt" -ge "$max" ]; then
+            log_error "scp failed after ${attempt} attempt(s)"
+            return 1
+        fi
+        log_warn "scp attempt ${attempt}/${max} failed; retrying in $(( attempt * 3 ))s..."
+        sleep $(( attempt * 3 ))
+        attempt=$(( attempt + 1 ))
+    done
+}
+
 compress_file() {
-    local file="$1"
+    local file="$1" lvl="$COMPRESS_LEVEL"
     log_info "Compressing ($COMPRESS)..."
 
+    # Clamp the level to each tool's valid range so a multi-digit value is not silently
+    # split into repeated single-digit flags (e.g. bzip2 -22 is parsed as -2 -2 = level 2).
+    [ "$lvl" -lt 1 ] && lvl=1
     case "$COMPRESS" in
-        zstd)  zstd -${COMPRESS_LEVEL} --rm "$file" ;;
-        xz)    xz -${COMPRESS_LEVEL} "$file" ;;
-        bzip2) bzip2 -${COMPRESS_LEVEL} "$file" ;;
+        zstd)  [ "$lvl" -gt 19 ] && lvl=19; zstd -"$lvl" --rm "$file" ;;
+        xz)    [ "$lvl" -gt 9 ] && lvl=9; xz -"$lvl" "$file" ;;
+        bzip2) [ "$lvl" -gt 9 ] && lvl=9; bzip2 -"$lvl" "$file" ;;
     esac
 
-    [ $? -eq 0 ] && log_success "Compressed" || log_error "Compression failed"
+    local rc=$?
+    [ $rc -eq 0 ] && log_success "Compressed" || log_error "Compression failed"
+    return $rc
 }
 
 cleanup_old_dumps() {
@@ -2885,20 +4638,16 @@ cleanup_old_dumps() {
     [ "$KEEP" -le 0 ] && return 0
 
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-    # Count all dump formats: tar.gz, compressed dumps, and plain dumps
-    local count=$(find "$OUTPUT_DIR" \( -name "${dump_base_name}_*.tar.gz" -o -name "${dump_base_name}_*.dump" -o -name "${dump_base_name}_*.dump.zst" -o -name "${dump_base_name}_*.dump.xz" -o -name "${dump_base_name}_*.dump.bz2" \) -type f 2>/dev/null | wc -l)
+    # Count all dump formats (tar.gz, compressed dumps, plain dumps) belonging
+    # to exactly this base name (a prefix-overlapping db is not counted).
+    local count=$(list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name" | wc -l | tr -d ' ')
 
     if [ "$count" -gt "$KEEP" ]; then
         local del=$((count - KEEP))
         log_info "Deleting $del old dump(s)..."
 
-        # Use ls for macOS compatibility - list all dump formats sorted by time
-        { ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null; \
-          ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.zst 2>/dev/null; \
-          ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.xz 2>/dev/null; \
-          ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.bz2 2>/dev/null; \
-          ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump 2>/dev/null; } | \
-            sort -t_ -k2 -r | tail -n "$del" | \
+        # list_dumps_for_base is newest-first; tail -n takes the oldest to delete.
+        list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name" | tail -n "$del" | \
             while read f; do
                 rm -f "$f"
                 log_debug "Deleted: $f"
@@ -2913,85 +4662,84 @@ cleanup_gfs() {
 
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
     local keep_files=""
-    # List all dump formats sorted by time
-    local all_files=$( { ls -t "$OUTPUT_DIR"/${dump_base_name}_*.tar.gz 2>/dev/null; \
-                         ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.zst 2>/dev/null; \
-                         ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.xz 2>/dev/null; \
-                         ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump.bz2 2>/dev/null; \
-                         ls -t "$OUTPUT_DIR"/${dump_base_name}_*.dump 2>/dev/null; } | sort -t_ -k2 -r )
+    # List all dump formats for exactly this base name, newest first
+    # (a prefix-overlapping db is excluded by the anchored match).
+    local all_files=$(list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name")
 
     [ -z "$all_files" ] && return 0
 
-    local today=$(date +%Y%m%d)
-    local daily_kept=0
-    local weekly_kept=0
-    local monthly_kept=0
-    local yearly_kept=0
+    # FLOOR: unconditionally keep the single newest dump, regardless of the configured
+    # retention counts (even if all four are 0) — GFS must never delete the just-created
+    # backup and leave the base with nothing.
+    local _newest; _newest=$(printf '%s\n' "$all_files" | head -1)
+    [ -n "$_newest" ] && keep_files="$keep_files
+$_newest"
 
-    # Process each file
-    while read -r file; do
+    local now_date=$(date +%Y%m%d)
+    # GFS = keep the NEWEST backup of each recent day/week/month/year, up to N of each.
+    # Process files in DATE order from the FILENAME (newest first), independent of mtime,
+    # so the first file of a period bucket really is that bucket's newest. Counts DAYS
+    # (not files-per-day), works for any weekday (not only Sunday/month-end), and keeps
+    # future-dated, calendar-invalid, or unnameable files as a safety net.
+    local sorted
+    sorted=$(while read -r f; do
+        [ -z "$f" ] && continue
+        local b=$(basename "$f")
+        if [[ "$b" =~ _([0-9]{8})_([0-9]{6})(_[0-9]+)?\. ]]; then
+            printf '%s%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$f"
+        else
+            printf 'ZZZZZZZZZZZZZZ\t%s\n' "$f"   # unnameable -> sorts last, always kept
+        fi
+    done <<< "$all_files" | sort -rk1,1)
+
+    local seen_day=" " seen_week=" " seen_month=" " seen_year=" "
+    local daily_kept=0 weekly_kept=0 monthly_kept=0 yearly_kept=0
+
+    while IFS=$'\t' read -r stamp file; do
         [ -z "$file" ] && continue
+        local file_date="${stamp:0:8}"
+        # Unnameable: keep (safety).
+        if [ "$stamp" = "ZZZZZZZZZZZZZZ" ]; then keep_files="$keep_files
+$file"; continue; fi
 
-        local fname=$(basename "$file")
-        # Extract date from filename: database_YYYYMMDD_HHMMSS.{tar.gz,dump,dump.zst,dump.xz,dump.bz2}
-        local file_date=$(echo "$fname" | sed -n 's/.*_\([0-9]\{8\}\)_[0-9]\{6\}\.\(tar\.gz\|dump\|dump\.zst\|dump\.xz\|dump\.bz2\)/\1/p')
-
-        [ -z "$file_date" ] && continue
-
-        local keep=false
-        local reason=""
-
-        # Calculate days ago
-        local file_epoch=$(date -j -f "%Y%m%d" "$file_date" "+%s" 2>/dev/null || date -d "$file_date" "+%s" 2>/dev/null)
-        local today_epoch=$(date "+%s")
-        local days_ago=$(( (today_epoch - file_epoch) / 86400 ))
-
-        # Daily: keep last N days
-        if [ $daily_kept -lt $RETENTION_DAILY ] && [ $days_ago -lt $RETENTION_DAILY ]; then
-            keep=true
-            reason="daily"
-            daily_kept=$((daily_kept + 1))
+        # Round-trip the date: BSD 'date' rolls an invalid day (20260231 -> 20260303),
+        # so a value that doesn't reformat back to itself is calendar-invalid -> keep,
+        # don't count. Future-dated files are also kept without consuming quota.
+        local rt=$(date -j -f "%Y%m%d" "$file_date" "+%Y%m%d" 2>/dev/null || date -d "$file_date" "+%Y%m%d" 2>/dev/null)
+        if [ "$rt" != "$file_date" ] || [ "$file_date" -gt "$now_date" ]; then
+            keep_files="$keep_files
+$file"; continue
         fi
 
-        # Weekly: keep if it's a Sunday (day 0) or last file of the week
-        local day_of_week=$(date -j -f "%Y%m%d" "$file_date" "+%u" 2>/dev/null || date -d "$file_date" "+%u" 2>/dev/null)
-        if [ "$day_of_week" = "7" ] && [ $weekly_kept -lt $RETENTION_WEEKLY ]; then
-            keep=true
-            reason="weekly"
-            weekly_kept=$((weekly_kept + 1))
+        local wk=$(date -j -f "%Y%m%d" "$file_date" "+%G-%V" 2>/dev/null || date -d "$file_date" "+%G-%V" 2>/dev/null)
+        local mo="${file_date:0:6}" yr="${file_date:0:4}"
+        local keep=false reason=""
+
+        if [ "$daily_kept" -lt "$RETENTION_DAILY" ] && [[ "$seen_day" != *" $file_date "* ]]; then
+            seen_day="$seen_day$file_date "; daily_kept=$((daily_kept+1)); keep=true; reason="daily"
         fi
-
-        # Monthly: keep if it's last day of month or first file of the month
-        local day_of_month=$(echo "$file_date" | cut -c7-8)
-        local year_month=$(echo "$file_date" | cut -c1-6)
-        local next_month_first=$(date -j -f "%Y%m%d" "${file_date}" "+%Y%m01" 2>/dev/null | xargs -I{} date -j -v+1m -f "%Y%m%d" {} "+%Y%m%d" 2>/dev/null)
-        local last_day_of_month=$(date -j -v-1d -f "%Y%m%d" "$next_month_first" "+%d" 2>/dev/null || echo "28")
-
-        if [ "$day_of_month" = "$last_day_of_month" ] && [ $monthly_kept -lt $RETENTION_MONTHLY ]; then
-            keep=true
-            reason="monthly"
-            monthly_kept=$((monthly_kept + 1))
+        if [ "$weekly_kept" -lt "$RETENTION_WEEKLY" ] && [ -n "$wk" ] && [[ "$seen_week" != *" $wk "* ]]; then
+            seen_week="$seen_week$wk "; weekly_kept=$((weekly_kept+1)); keep=true; reason="${reason:+$reason,}weekly"
         fi
-
-        # Yearly: keep if it's Dec 31
-        local month_day=$(echo "$file_date" | cut -c5-8)
-        if [ "$month_day" = "1231" ] && [ $yearly_kept -lt $RETENTION_YEARLY ]; then
-            keep=true
-            reason="yearly"
-            yearly_kept=$((yearly_kept + 1))
+        if [ "$monthly_kept" -lt "$RETENTION_MONTHLY" ] && [[ "$seen_month" != *" $mo "* ]]; then
+            seen_month="$seen_month$mo "; monthly_kept=$((monthly_kept+1)); keep=true; reason="${reason:+$reason,}monthly"
+        fi
+        if [ "$yearly_kept" -lt "$RETENTION_YEARLY" ] && [[ "$seen_year" != *" $yr "* ]]; then
+            seen_year="$seen_year$yr "; yearly_kept=$((yearly_kept+1)); keep=true; reason="${reason:+$reason,}yearly"
         fi
 
         if [ "$keep" = true ]; then
-            keep_files="$keep_files $file"
-            log_debug "Keep ($reason): $fname"
+            keep_files="$keep_files
+$file"
+            log_debug "Keep ($reason): $(basename "$file")"
         fi
-    done <<< "$all_files"
+    done <<< "$sorted"
 
     # Delete files not in keep list
     local deleted=0
     while read -r file; do
         [ -z "$file" ] && continue
-        if ! echo "$keep_files" | grep -q "$file"; then
+        if ! printf '%s\n' "$keep_files" | grep -Fxq "$file"; then
             rm -f "$file"
             log_debug "Deleted: $(basename "$file")"
             deleted=$((deleted + 1))
@@ -3005,6 +4753,11 @@ cleanup_gfs() {
 # ==============================================================================
 # ARGUMENT PARSER
 # ==============================================================================
+# Abort with a clear message when a value-taking option is missing its value.
+# (Without this, "shift 2" fails atomically on a trailing valueless flag and,
+# with errexit off, the while-loop would spin forever.)
+_need_val() { log_error "Option requires a value: $1"; exit 1; }
+
 parse_args() {
     [ $# -eq 0 ] && { show_help; exit 0; }
 
@@ -3012,7 +4765,7 @@ parse_args() {
     case "$1" in
         -h|--help) show_help; exit 0 ;;
         --version) show_version; exit 0 ;;
-        --batch) BATCH_JOB="$2"; shift 2 ;;
+        --batch) BATCH_JOB="$2"; shift 2 || _need_val "$1" ;;
         -*) log_error "Command required. Use --help for usage."; exit 1 ;;
         *) COMMAND="$1"; shift ;;
     esac
@@ -3053,37 +4806,45 @@ parse_args() {
         shift
     fi
 
+    # Handle clean subcommand optional positional db/base name (clean <db>)
+    if [ "$COMMAND" = "clean" ] && [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+        CLEAN_DB="$1"
+        shift
+    fi
+
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --from) FROM_CONNECTION="$2"; shift 2 ;;
-            --to) TO_CONNECTIONS+=("$2"); shift 2 ;;
+            --from) FROM_CONNECTION="$2"; shift 2 || _need_val "$1" ;;
+            --to) TO_CONNECTIONS+=("$2"); shift 2 || _need_val "$1" ;;
 
-            --password) PASSWORD="$2"; shift 2 ;;
-            --from-password) FROM_PASSWORD="$2"; shift 2 ;;
-            --to-password) TO_PASSWORD="$2"; shift 2 ;;
-            --password-file) PASSWORD_FILE="$2"; shift 2 ;;
-            --from-password-file) FROM_PASSWORD_FILE="$2"; shift 2 ;;
-            --to-password-file) TO_PASSWORD_FILES+=("$2"); shift 2 ;;
-            --config) CONFIG_FILE="$2"; shift 2 ;;
+            --password) PASSWORD="$2"; shift 2 || _need_val "$1" ;;
+            --from-password) FROM_PASSWORD="$2"; shift 2 || _need_val "$1" ;;
+            --to-password) TO_PASSWORD="$2"; shift 2 || _need_val "$1" ;;
+            --password-file) PASSWORD_FILE="$2"; shift 2 || _need_val "$1" ;;
+            --from-password-file) FROM_PASSWORD_FILE="$2"; shift 2 || _need_val "$1" ;;
+            --to-password-file) TO_PASSWORD_FILES+=("$2"); shift 2 || _need_val "$1" ;;
+            --config) CONFIG_FILE="$2"; shift 2 || _need_val "$1" ;;
 
-            --exclude-table) EXCLUDE_TABLES="$2"; shift 2 ;;
-            --exclude-schema) EXCLUDE_SCHEMAS="$2"; shift 2 ;;
-            --exclude-data) EXCLUDE_DATA="$2"; shift 2 ;;
-            --only-table) ONLY_TABLES="$2"; shift 2 ;;
-            --only-schema) ONLY_SCHEMAS="$2"; shift 2 ;;
+            --exclude-table) EXCLUDE_TABLES="$2"; shift 2 || _need_val "$1" ;;
+            --exclude-schema) EXCLUDE_SCHEMAS="$2"; shift 2 || _need_val "$1" ;;
+            --exclude-data) EXCLUDE_DATA="$2"; shift 2 || _need_val "$1" ;;
+            --only-table) ONLY_TABLES="$2"; shift 2 || _need_val "$1" ;;
+            --only-schema) ONLY_SCHEMAS="$2"; shift 2 || _need_val "$1" ;;
 
-            --compress) COMPRESS="$2"; shift 2 ;;
-            --compress-level) COMPRESS_LEVEL="$2"; shift 2 ;;
-            --pg-compress-level) PG_COMPRESS_LEVEL="$2"; shift 2 ;;
+            --compress) COMPRESS="$2"; COMPRESS_SET=true; shift 2 || _need_val "$1" ;;
+            --compress-level) COMPRESS_LEVEL="$2"; shift 2 || _need_val "$1" ;;
+            --pg-compress-level) PG_COMPRESS_LEVEL="$2"; PG_COMPRESS_LEVEL_SET=true; shift 2 || _need_val "$1" ;;
 
-            --output) OUTPUT_DIR="$2"; shift 2 ;;
-            --keep) KEEP="$2"; shift 2 ;;
-            --from-keep) FROM_KEEP="$2"; shift 2 ;;
-            --dump-name) DUMP_NAME="$2"; shift 2 ;;
-            --skip-if-recent) SKIP_IF_RECENT="$2"; shift 2 ;;
+            --output) OUTPUT_DIR="$2"; OUTPUT_DIR_SET=true; shift 2 || _need_val "$1" ;;
+            --keep) KEEP="$2"; KEEP_SET=true; shift 2 || _need_val "$1" ;;
+            --from-keep) FROM_KEEP="$2"; FROM_KEEP_SET=true; shift 2 || _need_val "$1" ;;
+            --dump-name) DUMP_NAME="$2"; shift 2 || _need_val "$1" ;;
+            --skip-if-recent) SKIP_IF_RECENT="$2"; shift 2 || _need_val "$1" ;;
             --from-file)
-                # Optional value: --from-file or --from-file <pattern>
-                if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
+                # Optional value: --from-file or --from-file <pattern>.
+                # Reject any following token that starts with a dash (long OR
+                # short flag) so e.g. "--from-file -v" does not swallow -v.
+                if [[ -n "$2" && ! "$2" =~ ^- ]]; then
                     FROM_FILE="$2"
                     shift 2
                 else
@@ -3093,35 +4854,43 @@ parse_args() {
                 ;;
 
             --retention) RETENTION=true; shift ;;
-            --retention-daily) RETENTION_DAILY="$2"; shift 2 ;;
-            --retention-weekly) RETENTION_WEEKLY="$2"; shift 2 ;;
-            --retention-monthly) RETENTION_MONTHLY="$2"; shift 2 ;;
-            --retention-yearly) RETENTION_YEARLY="$2"; shift 2 ;;
+            --retention-daily) RETENTION_DAILY="$2"; shift 2 || _need_val "$1" ;;
+            --retention-weekly) RETENTION_WEEKLY="$2"; shift 2 || _need_val "$1" ;;
+            --retention-monthly) RETENTION_MONTHLY="$2"; shift 2 || _need_val "$1" ;;
+            --retention-yearly) RETENTION_YEARLY="$2"; shift 2 || _need_val "$1" ;;
 
             --health-check) HEALTH_CHECK=true; shift ;;
             --health-check-after) HEALTH_CHECK_AFTER=true; shift ;;
             --no-health-check) HEALTH_CHECK=false; shift ;;
             --health-check-fail) HEALTH_CHECK_FAIL=true; shift ;;
 
-            --notify) NOTIFY+=("$2"); shift 2 ;;
+            --notify) NOTIFY+=("$2"); shift 2 || _need_val "$1" ;;
             --notify-on-error) NOTIFY_ON_ERROR=true; shift ;;
+            --token) BOT_TOKEN="$2"; shift 2 || _need_val "$1" ;;
+            --cooldown) BOT_COOLDOWN="$2"; shift 2 || _need_val "$1" ;;
 
             --mask) MASK=true; shift ;;
-            --mask-rules) MASK_RULES="$2"; shift 2 ;;
-            --mask-tables) MASK_TABLES="$2"; shift 2 ;;
+            --mask-rules) MASK_RULES="$2"; shift 2 || _need_val "$1" ;;
+            --mask-tables) MASK_TABLES="$2"; shift 2 || _need_val "$1" ;;
 
             --stream) STREAM=true; shift ;;
-            --stream-buffer) STREAM_BUFFER="$2"; shift 2 ;;
+            --stream-buffer) STREAM_BUFFER="$2"; shift 2 || _need_val "$1" ;;
 
             --sudo) SUDO=true; shift ;;
+            --globals) GLOBALS=true; shift ;;
+            --pg-bindir) PG_BINDIR="$2"; shift 2 || _need_val "$1" ;;
+            --bwlimit) BWLIMIT="$2"; shift 2 || _need_val "$1" ;;
+            --retries) RETRIES="$2"; shift 2 || _need_val "$1" ;;
 
-            --parallel) PARALLEL="$2"; shift 2 ;;
-            --continue-on-error) CONTINUE_ON_ERROR=true; shift ;;
-            --only) ONLY_JOBS="$2"; shift 2 ;;
-            --exclude) EXCLUDE_JOBS="$2"; shift 2 ;;
+            --parallel) PARALLEL="$2"; PARALLEL_SET=true; shift 2 || _need_val "$1" ;;
+            --continue-on-error) CONTINUE_ON_ERROR=true; CONTINUE_ON_ERROR_SET=true; shift ;;
+            --only-jobs) ONLY_JOBS="$2"; shift 2 || _need_val "$1" ;;
+            --exclude-jobs) EXCLUDE_JOBS="$2"; shift 2 || _need_val "$1" ;;
+            --only) ONLY_JOBS="$2"; shift 2 || _need_val "$1" ;;        # deprecated alias for --only-jobs
+            --exclude) EXCLUDE_JOBS="$2"; shift 2 || _need_val "$1" ;;  # deprecated alias for --exclude-jobs
             --notify-summary) NOTIFY_SUMMARY=true; shift ;;
-            --save) SAVE_JOB="$2"; shift 2 ;;
-            --batch) BATCH_JOB="$2"; shift 2 ;;
+            --save) SAVE_JOB="$2"; shift 2 || _need_val "$1" ;;
+            --batch) BATCH_JOB="$2"; shift 2 || _need_val "$1" ;;
             --yaml)
                 if [[ "$2" == *".yaml" ]]; then
                     # Already has .yaml extension
@@ -3133,12 +4902,12 @@ parse_args() {
                     # Just a name, use SCRIPT_DIR
                     JOBS_FILE="${SCRIPT_DIR}/${2}.yaml"
                 fi
-                shift 2 ;;
+                shift 2 || _need_val "$1" ;;
 
-            --file) FILE="$2"; shift 2 ;;
+            --file) FILE="$2"; shift 2 || _need_val "$1" ;;
 
-            --log) LOG_FILE="$2"; shift 2 ;;
-            --log-level) LOG_LEVEL="$2"; shift 2 ;;
+            --log) LOG_FILE="$2"; shift 2 || _need_val "$1" ;;
+            --log-level) LOG_LEVEL="$2"; shift 2 || _need_val "$1" ;;
             -v|--verbose) VERBOSE=true; shift ;;
             -q|--quiet) QUIET=true; shift ;;
             -y|--yes) YES=true; shift ;;
@@ -3157,7 +4926,16 @@ parse_args() {
 # MAIN
 # ==============================================================================
 main() {
+    install_cleanup_trap
     parse_args "$@"
+
+    # Use a specific PostgreSQL client version if requested (affects all LOCAL
+    # pg_dump/pg_restore/psql/createdb/pg_dumpall calls; not SSH-remote ones).
+    [ -n "$PG_BINDIR" ] && export PATH="$PG_BINDIR:$PATH"
+
+    # Bound how long libpq waits to establish a connection, so an unreachable host
+    # fails fast instead of hanging a backup/cron run. Override via the env var.
+    export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
 
     [ -n "$LOG_FILE" ] && mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -3166,24 +4944,86 @@ main() {
         load_config "$CONFIG_FILE" || exit 1
     fi
 
+    # Validate numeric options BEFORE any are used. Several land unquoted in
+    # eval'd/arithmetic contexts (pg_dump -Z<level>, $(( bwlimit )), retention
+    # counts), so a non-integer value is both a correctness and an injection risk.
+    local _n _v
+    # Count-type options must be NON-negative — a negative count is nonsensical and, for
+    # RETENTION_*, would make cleanup_gfs delete every dump. (Rejects '+', leading zeros/octal.)
+    for _n in PARALLEL COMPRESS_LEVEL PG_COMPRESS_LEVEL STREAM_BUFFER RETRIES \
+              RETENTION_DAILY RETENTION_WEEKLY RETENTION_MONTHLY RETENTION_YEARLY; do
+        _v="${!_n}"
+        if ! [[ "$_v" =~ ^(0|[1-9][0-9]*)$ ]]; then
+            log_error "Invalid value for a numeric option (${_n}='${_v}'): expected a non-negative integer"
+            exit 1
+        fi
+    done
+    # KEEP / FROM_KEEP keep the signed form (-1 = keep all).
+    for _n in KEEP FROM_KEEP; do
+        _v="${!_n}"
+        if ! [[ "$_v" =~ ^-?(0|[1-9][0-9]*)$ ]]; then
+            log_error "Invalid value for a numeric option (${_n}='${_v}'): expected an integer"
+            exit 1
+        fi
+    done
+
+    # --cooldown (bot) is a time string; validate its format so it can't reach the
+    # bot's $(( )) arithmetic as an injection payload.
+    if ! [[ "$BOT_COOLDOWN" =~ ^[0-9]+[hmd]?$ ]]; then
+        log_error "Invalid --cooldown '$BOT_COOLDOWN' (use e.g. 1h, 30m, 2d)"
+        exit 1
+    fi
+
+    # Validate --compress type (an unknown type used to be silently accepted and
+    # falsely reported as "Compressed", shipping an uncompressed dump).
+    case "$COMPRESS" in
+        gzip|zstd|xz|bzip2|none) ;;
+        *) log_error "Invalid --compress '$COMPRESS' (use gzip|zstd|xz|bzip2|none)"; exit 1 ;;
+    esac
+
+    # Resolve --bwlimit (human units) to scp's Kbit/s. Strict pattern so the value
+    # can never reach the arithmetic below as an injection payload. 10m=MByte/s,
+    # 500k=KByte/s, bare number = KByte/s.
+    if [ -n "$BWLIMIT" ]; then
+        if [[ "$BWLIMIT" =~ ^[0-9]+[mMkK]?$ ]]; then
+            case "$BWLIMIT" in
+                *m|*M) BWLIMIT_KBIT=$(( ${BWLIMIT%[mM]} * 1024 * 8 )); PV_RATE="$BWLIMIT" ;;
+                *k|*K) BWLIMIT_KBIT=$(( ${BWLIMIT%[kK]} * 8 )); PV_RATE="$BWLIMIT" ;;
+                *)     BWLIMIT_KBIT=$(( BWLIMIT * 8 )); PV_RATE="${BWLIMIT}k" ;;
+            esac
+        else
+            log_error "Invalid --bwlimit '$BWLIMIT' (use e.g. 10m, 500k)"
+            exit 1
+        fi
+    fi
+
     # Handle --save: save current command as a job
     if [ -n "$SAVE_JOB" ]; then
         save_job "$SAVE_JOB" "$COMMAND"
         return 0
     fi
 
-    # Handle batch with --batch argument (alternative to 'batch' command)
+    # Handle batch with --batch argument (alternative to 'batch' command).
+    # Only treat --batch as the action when no positional command was given
+    # (or the command IS 'batch'); otherwise --batch conflicts with the command.
     if [ -n "$BATCH_JOB" ]; then
-        cmd_batch "$BATCH_JOB"
-        return 0
+        if [ -z "$COMMAND" ] || [ "$COMMAND" = "batch" ]; then
+            cmd_batch "$BATCH_JOB"
+            return $?
+        else
+            log_error "--batch cannot be combined with the '$COMMAND' command"
+            exit 1
+        fi
     fi
 
     case "$COMMAND" in
         dump)    cmd_dump ;;
         restore) cmd_restore ;;
         clone)   cmd_clone ;;
+        upgrade) cmd_upgrade ;;
         fetch)   cmd_fetch ;;
         batch)   cmd_batch "$BATCH_JOB" ;;
+        bot)     cmd_bot ;;
         list)    cmd_list ;;
         meta)    cmd_meta ;;
         clean)   cmd_clean ;;

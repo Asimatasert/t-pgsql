@@ -1,3 +1,13 @@
+t-pgsql (3.9.0-1) unstable; urgency=medium
+
+  * Packaging and audit remediation:
+    - Synced package version across Homebrew, Arch and Debian metadata
+    - Declared curl runtime dependency (used for notifications)
+    - Hardened release workflow (real sha256, correct Formula patterns,
+      push to default branch, build .deb from debian/ dir)
+
+ -- Asim Atasert <asimatasert@outlook.com>  Thu, 02 Jul 2026 12:00:00 +0300
+
 t-pgsql (3.7.1-1) unstable; urgency=medium
 
   * Bug fixes:

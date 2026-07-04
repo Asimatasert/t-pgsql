@@ -2,7 +2,7 @@
 
 Advanced CLI tool for backing up, restoring, and synchronizing PostgreSQL databases.
 
-**Documentation:** [Türkçe](README_TR.md) | [Español](README_ES.md) | [Русский](README_RU.md) | [Deutsch](README_DE.md)
+**Documentation:** [Español](README_ES.md) | [Русский](README_RU.md) | [Deutsch](README_DE.md)
 
 ## Features
 
@@ -16,7 +16,7 @@ Advanced CLI tool for backing up, restoring, and synchronizing PostgreSQL databa
 ### Batch & Automation
 - **Batch Jobs**: Run multiple jobs from `jobs.yaml`
 - **Parallel Execution**: Run jobs concurrently (`--parallel N`)
-- **Job Filtering**: Run specific jobs (`--only`) or skip jobs (`--exclude`)
+- **Job Filtering**: Run specific jobs (`--only-jobs`) or skip jobs (`--exclude-jobs`)
 - **Notifications**: Telegram, Slack, Webhook, Email with summary support
 
 ### Data Management
@@ -108,6 +108,70 @@ man t-pgsql
 - Bash 4.0+
 - Optional: `pv` (for streaming buffer)
 
+## Docker
+
+A `Dockerfile` is included. The PostgreSQL client major version is a build arg —
+set it to your **target** server's version so cross-version dumps use the right
+tools (e.g. dumping a PG16 server for restore into PG18 → build with `PG_MAJOR=18`).
+
+```bash
+# Build with the desired client version
+docker build --build-arg PG_MAJOR=18 -t t-pgsql:18 .
+
+# One-off dump (mount a dumps volume)
+docker run --rm -v "$PWD/dumps:/data/dumps" \
+  t-pgsql:18 dump --from "postgres@db.example.com/mydb" --output /data/dumps -y
+
+# Run the Telegram bot as a service (see docker-compose.yml)
+docker compose up -d --build
+```
+
+Mount your `jobs.yaml`, password files and SSH key into `/data` (and the SSH key
+under `/home/tpgsql/.ssh`). The image runs as a non-root user.
+
+## Major-version upgrades (logical)
+
+The `upgrade` command performs a **logical** major-version migration (e.g. PG16 → PG18):
+it migrates cluster globals (roles, tablespaces), checks that the target is not an older
+major version, then clones the database.
+
+```bash
+# Run from a host/container whose pg_dump matches the TARGET version (18 here).
+t-pgsql upgrade \
+  --from "postgres@old-16-host:5432/appdb" \
+  --to   "postgres@new-18-host:5432/appdb" -y
+
+# Or add globals to a plain clone, and pick client tools explicitly:
+t-pgsql clone --from ... --to ... --globals --pg-bindir /usr/lib/postgresql/18/bin
+```
+
+**Honest scope:** this is the dump/restore path, suitable for small/medium databases or
+a clean logical rebuild. For large clusters or minimal-downtime cutovers, `pg_upgrade`
+(in-place) and logical replication remain the better-established tools — this command
+does not replace them. Globals migration works for local/TCP and SSH sources, and is
+applied to every `--to` target.
+
+## Development (modular sources)
+
+`t-pgsql` is a **generated single file** assembled from small modules under `src/`
+(header, globals, logging, dump, restore, clone, upgrade, batch, bot, args, main, …),
+concatenated in the order listed in `src/build.manifest`.
+
+```bash
+# Edit a module, then rebuild the single file:
+$EDITOR src/55-dump.sh
+./build.sh            # or: make build
+
+# Verify the committed t-pgsql is in sync with src/ (CI runs this):
+./build.sh --check    # or: make check-build
+```
+
+Do **not** hand-edit `t-pgsql` — changes belong in `src/`. Distribution is unchanged:
+one executable file is still installed/shipped (packaging, completions and `SCRIPT_DIR`
+behaviour are identical). Because everything runs in a single Bash process with one
+shared global namespace, splitting the file is purely a code-organisation change — there
+is no runtime coupling or synchronisation concern.
+
 ## Quick Start
 
 ```bash
@@ -115,7 +179,7 @@ man t-pgsql
 ./t-pgsql dump --from "postgres@localhost/mydb" --password-file .secrets/db.pass
 
 # Dump from remote server
-./t-pgsql dump --from "ssh://user@192.168.1.100/postgres@localhost/mydb" --from-password-file .secrets/remote.pass
+./t-pgsql dump --from "ssh://user@192.0.2.20/postgres@localhost/mydb" --from-password-file .secrets/remote.pass
 
 # Restore a dump
 ./t-pgsql restore --file ./dumps/mydb_20250101.tar.gz --to "postgres@localhost/mydb_copy" --to-password-file .secrets/local.pass
@@ -139,7 +203,7 @@ man t-pgsql
 | `localhost/mydb` | Default user with localhost |
 | `postgres@localhost/mydb` | With postgres user |
 | `postgres@localhost:5432/mydb` | With explicit port |
-| `asimatasert@localhost/test123` | Custom user |
+| `dbadmin@localhost/test123` | Custom user |
 
 ### SSH (Remote) Connection
 
@@ -149,15 +213,15 @@ ssh://[ssh_user@]ssh_host[:ssh_port]/[db_user@]db_host[:db_port]/database
 
 | Example | Description |
 |---------|-------------|
-| `ssh://awsm3@192.168.1.100/mydb` | Simple format (db: localhost, user: postgres) |
-| `ssh://awsm3@192.168.1.100/postgres@localhost/mydb` | With DB user specified |
-| `ssh://awesome@192.168.1.31/postgres@localhost/rftt-template` | Full format |
-| `ssh://asimatasert@server:2222/postgres@localhost:5433/prod` | Custom ports |
+| `ssh://ubuntu@192.0.2.20/mydb` | Simple format (db: localhost, user: postgres) |
+| `ssh://ubuntu@192.0.2.20/postgres@localhost/mydb` | With DB user specified |
+| `ssh://dbadmin@192.0.2.10/postgres@localhost/appdb` | Full format |
+| `ssh://dbadmin@server:2222/postgres@localhost:5433/prod` | Custom ports |
 
 ### Connection Structure
 
 ```
-ssh://awesome@192.168.1.31/postgres@localhost/workarea
+ssh://dbadmin@192.0.2.10/postgres@localhost/appdb
        |        |            |        |       |
        |        |            |        |       +-- Database name
        |        |            |        +---------- DB host (inside SSH)
@@ -186,7 +250,7 @@ Creates a database backup.
 
 # Dump from remote server
 ./t-pgsql dump \
-  --from "ssh://awesome@192.168.1.31/postgres@localhost/rftt-template" \
+  --from "ssh://dbadmin@192.0.2.10/postgres@localhost/appdb" \
   --from-password-file .secrets/from.pass \
   --output ./dumps
 
@@ -221,7 +285,7 @@ Creates a database backup.
   --dump-name myapp-backup  # Creates: myapp-backup_YYYYMMDD_HHMMSS.dump
 ```
 
-**Output:** `./dumps/database_YYYYMMDD_HHMMSS.tar.gz`
+**Output:** `<script dir>/../data/dumps/database_YYYYMMDD_HHMMSS.tar.gz` (default output directory; override with `--output`)
 
 The tar archive contains:
 - `database_YYYYMMDD_HHMMSS.dump` - PostgreSQL dump file (or custom name)
@@ -274,8 +338,8 @@ Performs dump + restore in a single command.
 ```bash
 # Clone from remote to local
 ./t-pgsql clone \
-  --from "ssh://awesome@192.168.1.31/postgres@localhost/rftt-template" \
-  --to "asimatasert@localhost/test123" \
+  --from "ssh://dbadmin@192.0.2.10/postgres@localhost/appdb" \
+  --to "dbadmin@localhost/test123" \
   --from-password-file .secrets/from.pass \
   --to-password-file .secrets/to.pass \
   --force
@@ -358,7 +422,7 @@ Dumps in: /Users/user/t-pgsql/dumps
 
 FILE                                      SIZE DATE
 ---------------------------------------------------------------------------
-rftt-template_20251230_225325.tar.gz     39MiB 2025-12-30 22:54
+appdb_20251230_225325.tar.gz     39MiB 2025-12-30 22:54
 mydb_20251229_143022.tar.gz              15MiB 2025-12-29 14:30
 ```
 
@@ -383,13 +447,13 @@ timing:
 
 source:
   type: ssh
-  host: 192.168.1.31
+  host: 192.0.2.10
   port: 5432
-  database: rftt-template
+  database: appdb
   user: postgres
 
 file:
-  name: rftt-template_20251230_225325.dump
+  name: appdb_20251230_225325.dump
   size: "41M"
   compression: gzip
   compress_level: 6
@@ -400,10 +464,10 @@ operation:
   exit_code: 0
 
 environment:
-  script_version: "3.0.0"
-  executed_by: asimatasert
+  script_version: "3.9.0"
+  executed_by: dbadmin
   executed_on: macbookair
-  working_dir: /Users/asimatasert/t-pgsql/t-pgsql
+  working_dir: /opt/t-pgsql/t-pgsql
 ```
 
 ---
@@ -438,19 +502,19 @@ Save any command with `--save <name>`:
 
 ```bash
 ./t-pgsql clone \
-  --from "ssh://awesome@192.168.1.31/postgres@localhost/rftt-template" \
-  --to "asimatasert@localhost/test123" \
+  --from "ssh://dbadmin@192.0.2.10/postgres@localhost/appdb" \
+  --to "dbadmin@localhost/test123" \
   --from-password-file .secrets/from.pass \
   --to-password-file .secrets/to.pass \
   --force \
-  --save rftt_sync
+  --save nightly-sync
 ```
 
 ### Running Jobs
 
 ```bash
 # Run a single job
-./t-pgsql batch rftt_sync
+./t-pgsql batch nightly-sync
 
 # Run all jobs sequentially
 ./t-pgsql batch all
@@ -466,10 +530,10 @@ Save any command with `--save <name>`:
 ./t-pgsql batch all --parallel 4 --continue-on-error
 
 # Run only specific jobs
-./t-pgsql batch all --only "job1,job2,job3"
+./t-pgsql batch all --only-jobs "job1,job2,job3"
 
 # Exclude specific jobs
-./t-pgsql batch all --exclude "slow_job,optional_job"
+./t-pgsql batch all --exclude-jobs "slow_job,optional_job"
 
 # Send summary notification after batch
 ./t-pgsql batch all --notify telegram:TOKEN:CHAT --notify-summary
@@ -478,7 +542,7 @@ Save any command with `--save <name>`:
 ./t-pgsql batch all \
   --yaml sync-myproductions \
   --parallel 3 \
-  --exclude "slow_backup" \
+  --exclude-jobs "slow_backup" \
   --continue-on-error \
   --notify-summary
 ```
@@ -496,8 +560,8 @@ Save any command with `--save <name>`:
 ./t-pgsql jobs list --yaml /path/to/custom.yaml
 
 # Show specific job details
-./t-pgsql jobs show rftt_sync
-./t-pgsql jobs show rftt_sync --yaml sync-30
+./t-pgsql jobs show nightly-sync
+./t-pgsql jobs show nightly-sync --yaml sync-30
 
 # Remove a job
 ./t-pgsql jobs remove old_job
@@ -506,8 +570,8 @@ Save any command with `--save <name>`:
 # Output:
 # Available jobs:
 # ===============
-#   - rftt_sync
-#   - workarea_sync
+#   - nightly-sync
+#   - appdb_sync
 #   - daily_backup
 ```
 
@@ -913,7 +977,7 @@ When multiple password sources are available, t-pgsql uses this priority:
 
 | Parameter | Description | Default | Required | Example |
 |-----------|-------------|---------|----------|---------|
-| `--output <dir>` | Output directory for dumps | `./data/dumps` | No | `/backups/daily` |
+| `--output <dir>` | Output directory for dumps | `<script dir>/../data/dumps` | No | `/backups/daily` |
 | `--keep <N>` | Number of local dumps to keep | `-1` (all) | No | `7`, `0` (delete), `-1` (all) |
 | `--from-keep <N>` | Number of dumps to keep on source | `1` | No | `3`, `0` (delete), `-1` (all) |
 | `--dump-name <name>` | Custom dump filename (without timestamp) | Database name | No | `myapp-backup` |
@@ -1023,7 +1087,7 @@ When multiple password sources are available, t-pgsql uses this priority:
 ```bash
 # Clone from prod to dev
 ./t-pgsql clone \
-  --from "ssh://asimatasert@prod.example.com/postgres@localhost/production" \
+  --from "ssh://dbadmin@prod.example.com/postgres@localhost/production" \
   --to "postgres@localhost/development" \
   --from-password-file .secrets/prod.pass \
   --to-password-file .secrets/local.pass \
@@ -1041,7 +1105,7 @@ When multiple password sources are available, t-pgsql uses this priority:
 
 ```bash
 ./t-pgsql clone \
-  --from "ssh://asimatasert@prod/postgres@localhost/app" \
+  --from "ssh://dbadmin@prod/postgres@localhost/app" \
   --to "postgres@localhost/dev" \
   --to "postgres@localhost/staging" \
   --to "postgres@localhost/test" \
@@ -1069,7 +1133,6 @@ t-pgsql/
 ├── t-pgsql              # Main script
 ├── jobs.yaml           # Batch job definitions
 ├── README.md           # This document
-├── README_TR.md        # Turkish documentation
 ├── .secrets/           # Password files
 │   ├── from.pass
 │   └── to.pass
@@ -1086,7 +1149,7 @@ t-pgsql/
 
 ```bash
 # Test SSH access
-ssh awesome@192.168.1.31 "echo ok"
+ssh dbadmin@192.0.2.10 "echo ok"
 
 # Run with verbose mode
 ./t-pgsql dump --from "ssh://..." -v

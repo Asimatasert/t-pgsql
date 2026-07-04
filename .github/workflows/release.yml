@@ -17,35 +17,25 @@ jobs:
 
       - name: Get version
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        run: |
+          # Strip everything up to the first digit so the version is digit-first
+          VERSION=$(echo "${GITHUB_REF#refs/tags/}" | sed 's/^[^0-9]*//')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends debhelper dpkg-dev build-essential
 
       - name: Build Debian package
+        id: deb
         run: |
-          mkdir -p build/deb/DEBIAN
-          mkdir -p build/deb/usr/bin
-          mkdir -p build/deb/usr/share/man/man1
-          mkdir -p build/deb/usr/share/zsh/vendor-completions
-          mkdir -p build/deb/usr/share/bash-completion/completions
-          mkdir -p build/deb/usr/share/fish/vendor_completions.d
-          cp t-pgsql build/deb/usr/bin/
-          chmod 755 build/deb/usr/bin/t-pgsql
-          cp man/t-pgsql.1 build/deb/usr/share/man/man1/
-          cp completions/_t-pgsql build/deb/usr/share/zsh/vendor-completions/
-          cp completions/t-pgsql.bash build/deb/usr/share/bash-completion/completions/t-pgsql
-          cp completions/t-pgsql.fish build/deb/usr/share/fish/vendor_completions.d/
-          cat > build/deb/DEBIAN/control << EOF
-          Package: t-pgsql
-          Version: ${{ steps.version.outputs.VERSION }}
-          Section: database
-          Priority: optional
-          Architecture: all
-          Depends: postgresql-client, openssh-client, bash (>= 4.0)
-          Maintainer: Asim Atasert <asimatasert@outlook.com>
-          Description: PostgreSQL database sync and clone tool
-           Advanced CLI tool for backing up, restoring, and synchronizing
-           PostgreSQL databases with SSH tunnel support.
-          EOF
-          dpkg-deb --build build/deb t-pgsql_${{ steps.version.outputs.VERSION }}_all.deb
+          # Build straight from the repo's debian/ dir so the packaged
+          # control fields, changelog and any copyright are the real ones.
+          dpkg-buildpackage -us -uc -b
+          DEB=$(ls ../t-pgsql_*_all.deb | head -n1)
+          cp "$DEB" "$GITHUB_WORKSPACE/"
+          echo "DEB_FILE=$(basename "$DEB")" >> $GITHUB_OUTPUT
 
       - name: Create tarball
         run: |
@@ -63,7 +53,7 @@ jobs:
         with:
           files: |
             t-pgsql
-            t-pgsql_${{ steps.version.outputs.VERSION }}_all.deb
+            ${{ steps.deb.outputs.DEB_FILE }}
             dist/t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz
             dist/t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz.sha256
           generate_release_notes: true
@@ -76,26 +66,39 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout default branch
         uses: actions/checkout@v4
+        with:
+          # Check out the branch (not the detached tag) so we can push back.
+          ref: master
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get version and SHA
         id: info
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          VERSION=$(echo "${GITHUB_REF#refs/tags/}" | sed 's/^[^0-9]*//')
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          SHA=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/v${VERSION}.tar.gz" | sha256sum | cut -d' ' -f1)
+          SHA=$(curl -fsSL "https://github.com/${{ github.repository }}/archive/refs/tags/v${VERSION}.tar.gz" | sha256sum | cut -d' ' -f1)
           echo "SHA256=$SHA" >> $GITHUB_OUTPUT
 
       - name: Update Formula
         run: |
-          sed -i "s|REPLACE_WITH_ACTUAL_SHA256|${{ steps.info.outputs.SHA256 }}|g" Formula/t-pgsql.rb
-          sed -i "s|v1.0.0|v${{ steps.info.outputs.VERSION }}|g" Formula/t-pgsql.rb
+          VERSION="${{ steps.info.outputs.VERSION }}"
+          SHA256="${{ steps.info.outputs.SHA256 }}"
+          # Update the url version, the sha256 and the test assertion using
+          # patterns that actually exist in Formula/t-pgsql.rb.
+          sed -i -E "s|archive/refs/tags/v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz|archive/refs/tags/v${VERSION}.tar.gz|" Formula/t-pgsql.rb
+          sed -i -E "s|sha256 \"[a-f0-9]{64}\"|sha256 \"${SHA256}\"|" Formula/t-pgsql.rb
+          sed -i -E "s|assert_match \"v[0-9]+\.[0-9]+\.[0-9]+\"|assert_match \"v${VERSION}\"|" Formula/t-pgsql.rb
 
-      - name: Commit Formula update
+      - name: Commit and push Formula update
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add Formula/t-pgsql.rb
-          git commit -m "Update Homebrew formula to v${{ steps.info.outputs.VERSION }}" || true
-          git push || true
+          if git diff --cached --quiet; then
+            echo "Formula already up to date; nothing to commit."
+          else
+            git commit -m "Update Homebrew formula to v${{ steps.info.outputs.VERSION }}"
+            git push origin HEAD:master
+          fi
