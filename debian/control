@@ -11,7 +11,7 @@ Rules-Requires-Root: no
 
 Package: t-pgsql
 Architecture: all
-Depends: ${misc:Depends}, postgresql-client, openssh-client, bash (>= 4.0)
+Depends: ${misc:Depends}, postgresql-client, openssh-client, curl, bash (>= 4.0)
 Description: PostgreSQL database sync and clone tool
  Advanced CLI tool for backing up, restoring, and synchronizing
  PostgreSQL databases. Features include:

@@ -2,7 +2,7 @@
 
 Продвинутый CLI-инструмент для резервного копирования, восстановления и синхронизации баз данных PostgreSQL.
 
-**Документация:** [English](README.md) | [Türkçe](README_TR.md) | [Español](README_ES.md) | [Deutsch](README_DE.md)
+**Документация:** [English](README.md) | [Español](README_ES.md) | [Deutsch](README_DE.md)
 
 ## Возможности
 
@@ -42,7 +42,7 @@ sudo ln -s $(pwd)/t-pgsql /usr/local/bin/t-pgsql
 ./t-pgsql dump --from "postgres@localhost/mydb" --password-file .secrets/db.pass
 
 # Дамп с удалённого сервера
-./t-pgsql dump --from "ssh://user@192.168.1.100/postgres@localhost/mydb" --from-password-file .secrets/remote.pass
+./t-pgsql dump --from "ssh://user@192.0.2.20/postgres@localhost/mydb" --from-password-file .secrets/remote.pass
 
 # Восстановить дамп
 ./t-pgsql restore --file ./dumps/mydb_20250101.tar.gz --to "postgres@localhost/mydb_copy" --to-password-file .secrets/local.pass
@@ -75,8 +75,8 @@ ssh://[ssh_user@]ssh_host[:ssh_port]/[db_user@]db_host[:db_port]/database
 
 | Пример | Описание |
 |--------|----------|
-| `ssh://user@192.168.1.100/mydb` | Простой формат (db: localhost, user: postgres) |
-| `ssh://user@192.168.1.100/postgres@localhost/mydb` | С указанием пользователя БД |
+| `ssh://user@192.0.2.20/mydb` | Простой формат (db: localhost, user: postgres) |
+| `ssh://user@192.0.2.20/postgres@localhost/mydb` | С указанием пользователя БД |
 | `ssh://user@server:2222/postgres@localhost:5433/prod` | Пользовательские порты |
 
 ---
