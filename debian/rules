@@ -3,9 +3,19 @@
 %:
 	dh $@
 
+# t-pgsql ships pre-built (the single script is committed); there is nothing to
+# compile or test, so skip dh_auto_build/dh_auto_test (which would otherwise run the
+# repo Makefile's default 'help' target and fail the package build).
+override_dh_auto_build:
+
+override_dh_auto_test:
+
+# Install into the package staging dir. In an override, dh does NOT pre-set DESTDIR,
+# so it must be the debhelper package directory debian/t-pgsql (an empty DESTDIR would
+# silently install to the build host's real /usr and ship an empty package).
 override_dh_auto_install:
-	install -D -m 0755 t-pgsql $(DESTDIR)/usr/bin/t-pgsql
-	install -D -m 0644 completions/_t-pgsql $(DESTDIR)/usr/share/zsh/vendor-completions/_t-pgsql
-	install -D -m 0644 completions/t-pgsql.bash $(DESTDIR)/usr/share/bash-completion/completions/t-pgsql
-	install -D -m 0644 completions/t-pgsql.fish $(DESTDIR)/usr/share/fish/vendor_completions.d/t-pgsql.fish
-	install -D -m 0644 man/t-pgsql.1 $(DESTDIR)/usr/share/man/man1/t-pgsql.1
+	install -D -m 0755 t-pgsql debian/t-pgsql/usr/bin/t-pgsql
+	install -D -m 0644 completions/_t-pgsql debian/t-pgsql/usr/share/zsh/vendor-completions/_t-pgsql
+	install -D -m 0644 completions/t-pgsql.bash debian/t-pgsql/usr/share/bash-completion/completions/t-pgsql
+	install -D -m 0644 completions/t-pgsql.fish debian/t-pgsql/usr/share/fish/vendor_completions.d/t-pgsql.fish
+	install -D -m 0644 man/t-pgsql.1 debian/t-pgsql/usr/share/man/man1/t-pgsql.1
