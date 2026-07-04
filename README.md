@@ -8,8 +8,9 @@ Advanced CLI tool for backing up, restoring, and synchronizing PostgreSQL databa
 
 ### Core Operations
 - **Dump**: Backup from local or remote database
-- **Restore**: Restore backup to local or remote database
+- **Restore**: Restore backup to local or remote database (default-safe on `--force`)
 - **Clone**: Single command dump + restore (full sync)
+- **Upgrade**: Logical major-version migration (e.g. PG16 → PG18) with globals
 - **Fetch**: Download existing dump from remote server
 - **Streaming**: Direct pipe clone without temp files (`--stream`)
 
@@ -17,17 +18,21 @@ Advanced CLI tool for backing up, restoring, and synchronizing PostgreSQL databa
 - **Batch Jobs**: Run multiple jobs from `jobs.yaml`
 - **Parallel Execution**: Run jobs concurrently (`--parallel N`)
 - **Job Filtering**: Run specific jobs (`--only-jobs`) or skip jobs (`--exclude-jobs`)
+- **Telegram Bot**: Trigger and monitor backups from a chat (`bot` command)
 - **Notifications**: Telegram, Slack, Webhook, Email with summary support
 
 ### Data Management
 - **Data Masking**: Anonymize sensitive data after restore (`--mask`)
 - **Table Filtering**: Include/exclude tables or schemas
 - **GFS Retention**: Grandfather-Father-Son backup rotation policy
+- **Encoding-safe**: Preserves the source database's encoding/locale on restore
 
 ### Security & Reliability
+- **Safe restore**: `--force` restores into a temp database and swaps it in only on success — a failed/corrupt restore never destroys the existing data
 - **Health Checks**: Verify connections before operations
 - **SSH Tunnel**: Secure access to remote databases
-- **Password Security**: Read from files or environment variables
+- **Password Security**: Kept out of process argv (`.pgpass`/env); read from files or environment
+- **Transfer control**: Bandwidth limit (`--bwlimit`) and retries (`--retries`) for large/flaky links
 - **Metadata**: Track timing, source, and operation details
 
 ## Installation
@@ -418,7 +423,7 @@ Lists dump files.
 **Example output:**
 
 ```
-Dumps in: /Users/user/t-pgsql/dumps
+Dumps in: /opt/t-pgsql/data/dumps
 
 FILE                                      SIZE DATE
 ---------------------------------------------------------------------------
@@ -520,8 +525,8 @@ Save any command with `--save <name>`:
 ./t-pgsql batch all
 
 # Use different YAML file
-./t-pgsql batch all --yaml sync-30     # Uses ~/bin/sync-30.yaml
-./t-pgsql batch all --yaml /path/to/custom.yaml
+./t-pgsql batch all --yaml sync-30     # bare name -> <script-dir>/sync-30.yaml
+./t-pgsql batch all --yaml /path/to/custom.yaml   # path or *.yaml -> used as-is
 
 # Run jobs in parallel (3 concurrent jobs)
 ./t-pgsql batch all --parallel 3
@@ -555,8 +560,7 @@ Save any command with `--save <name>`:
 ./t-pgsql jobs list
 
 # List jobs from custom YAML file
-./t-pgsql jobs list --yaml sync-30
-./t-pgsql jobs list --yaml ~/bin/aschenbrenner
+./t-pgsql jobs list --yaml sync-30                 # -> <script-dir>/sync-30.yaml
 ./t-pgsql jobs list --yaml /path/to/custom.yaml
 
 # Show specific job details
@@ -574,6 +578,32 @@ Save any command with `--save <name>`:
 #   - appdb_sync
 #   - daily_backup
 ```
+
+---
+
+### bot
+
+Runs a long-lived Telegram bot that lets you trigger and monitor backups from a chat. It long-polls Telegram (`getUpdates`) and only acts on the **configured chat** (fail-closed — with no chat configured it ignores every command).
+
+```bash
+# Token from --token, or defaults.notify.telegram in the YAML, or $TELEGRAM_BOT_TOKEN
+./t-pgsql bot --yaml sync-30 --token "123456:ABC..." --cooldown 1h
+```
+
+**Chat commands:**
+
+| Command | Action |
+|---------|--------|
+| `/help` | Show available commands |
+| `/list` | List YAML files in the script directory |
+| `/list <yaml>` | List the jobs defined in a YAML |
+| `/backup <yaml> <job>` | Start a backup job in the background and report the result |
+
+Failure notifications include an inline **"Re-run Backup"** button. `--cooldown` (default `1h`, format `<N>[h|m|d]`) throttles how often the same job can be re-triggered by the button or `/backup`. The chat id and (optional) forum thread are read from the YAML's `defaults.notify.telegram` or `TELEGRAM_CHAT_ID` / `TELEGRAM_THREAD_ID`.
+
+> Run it under a process manager (systemd, `docker compose`, `tmux`) — see the [Docker](#docker) section for a compose service.
+
+---
 
 ### jobs.yaml Format
 
@@ -712,7 +742,10 @@ jobs:
 
 ### Data Masking
 
-Anonymize sensitive data after restore for development/testing environments:
+Anonymize sensitive data after restore for development/testing environments. Masking runs **after** the restore (so it is not supported with `--stream`). It is fail-safe: if `--mask` matched **nothing** — or any masking statement errors — the operation **fails** rather than reporting an unmasked copy as success.
+
+- `--mask-tables` auto-masks a fixed set of known-sensitive columns (`email`, `phone`, `password`, `password_hash`, `address`, `ssn`, `credit_card`) — but only the columns that actually **exist** in each named updatable base table. A bare table name matching several schemas masks the table in each schema (schema-qualified). Identifiers are always quoted, so reserved-word / mixed-case table names work.
+- `--mask-rules` applies your own SQL expressions from a JSON file (see below).
 
 ```bash
 # Auto-mask common fields in specified tables
@@ -925,6 +958,27 @@ When multiple password sources are available, t-pgsql uses this priority:
 
 ---
 
+## Config File (`--config`)
+
+`--config <file>` loads **per-run defaults** for a single command (distinct from the jobs YAML set via `--yaml`). It is a simple `key: value` file; **CLI flags and environment variables always win** over the file.
+
+```yaml
+# db.conf — loaded with:  t-pgsql dump --config db.conf
+from: "ssh://user@prod/postgres@localhost/app"
+to: "postgres@localhost/dev"
+from_password_file: ~/.secrets/prod.pass    # ~ expands for PATH keys only
+output: ~/backups
+keep: 7
+compress: zstd
+exclude_table: "logs,sessions"
+notify: "telegram:TOKEN:CHAT"               # repeatable
+verbose: true
+```
+
+Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_password`, `password_file`/`from_password_file`/`to_password_file`, `output`, `keep`, `from_keep`, `compress`, `exclude_table`/`exclude_data`/`exclude_schema`, `only_table`/`only_schema`, `notify` (repeatable), and booleans `verbose`/`force`/`sudo`. `~` is expanded only for path-type keys — never for passwords or connection strings.
+
+---
+
 ## Complete Parameter Reference
 
 ### Connection Parameters
@@ -947,8 +1001,8 @@ When multiple password sources are available, t-pgsql uses this priority:
 | `--to-password <pass>` | Password for target connection only | - | No | `dstpass` |
 | `--password-file <file>` | Read password from file (both connections) | - | No | `.secrets/db.pass` |
 | `--from-password-file <file>` | Read source password from file | - | No | `.secrets/from.pass` |
-| `--to-password-file <file>` | Read target password from file | - | No | `.secrets/to.pass` |
-| `--config <file>` | Configuration file with credentials | - | No | `config.yaml` |
+| `--to-password-file <file>` | Read target password from file. Repeatable — matched to each `--to` by position, or given once to apply to all targets. | - | No | `.secrets/to.pass` |
+| `--config <file>` | Per-run defaults file (see [Config File](#config-file---config)) | - | No | `db.conf` |
 
 **Environment Variables:**
 - `T_PGSQL_PASSWORD` - Password for both connections
@@ -1026,19 +1080,48 @@ When multiple password sources are available, t-pgsql uses this priority:
 
 | Parameter | Description | Default | Required | Example |
 |-----------|-------------|---------|----------|---------|
-| `--stream` | Stream mode (no temp files) | `false` | No | - |
-| `--stream-buffer <MB>` | Buffer size in megabytes | `64` | No | `128` |
+| `--stream` | Stream mode (no temp files); pipes `pg_dump \| pg_restore` directly | `false` | No | - |
+| `--stream-buffer <MB>` | In-flight buffer size in megabytes (`pv`) | `64` | No | `128` |
+
+> **Security note:** Unlike every other path, `--stream` carries the remote `pg_restore` command (with its `.pgpass` preamble) in the ssh argv, so the credential is briefly visible to `ps` on the remote host for the duration of the stream. Use `--sudo` (peer auth) or the non-stream clone if that matters. `--mask` is not supported with `--stream` (masking runs after a full restore).
+
+### Transfer & Reliability Parameters
+
+Apply to SSH/scp transfers (and the `--stream` pipe when `pv` is installed).
+
+| Parameter | Description | Default | Required | Example |
+|-----------|-------------|---------|----------|---------|
+| `--bwlimit <rate>` | Throttle transfer bandwidth. `10m` = 10 MB/s, `500k` = 500 KB/s, bare number = KB/s. scp uses its `-l`; streaming uses `pv -L` (requires `pv`). | unlimited | No | `10m` |
+| `--retries <N>` | Extra retry attempts for a failed scp transfer (exponential-ish backoff) | `0` | No | `3` |
 
 ### Batch Parameters
 
 | Parameter | Description | Default | Required | Example |
 |-----------|-------------|---------|----------|---------|
-| `--save <name>` | Save current command as a job | - | No | `daily_backup` |
-| `--batch <name\|all>` | Run saved job(s) | - | No | `daily_backup`, `all` |
-| `--parallel <N>` | Number of parallel jobs | `1` | No | `4` |
-| `--continue-on-error` | Continue batch on job failure | `false` | No | - |
-| `--only <jobs>` | Run only these jobs from batch | - | No | `job1,job2` |
-| `--exclude <jobs>` | Skip these jobs from batch | - | No | `slow_job` |
+| `--yaml <name>` | Jobs YAML file. A bare name resolves to `<script-dir>/<name>.yaml`; a value containing `/` or ending in `.yaml` is used as-is | `<script-dir>/jobs.yaml` | No | `sync-30`, `./jobs/prod.yaml` |
+| `--save <name>` | Save the current command + flags as a job (instead of running) | - | No | `daily_backup` |
+| `--batch <name\|all>` | Run saved job(s); equivalent to `t-pgsql batch <name\|all>` | - | No | `daily_backup`, `all` |
+| `--parallel <N>` | Number of jobs to run in parallel | `1` | No | `4` |
+| `--continue-on-error` | Continue the batch even if a job fails | `false` | No | - |
+| `--only-jobs <jobs>` | Run only these jobs (comma-separated) | - | No | `job1,job2` |
+| `--exclude-jobs <jobs>` | Skip these jobs (comma-separated) | - | No | `slow_job` |
+| `--only <jobs>` | Deprecated alias for `--only-jobs` | - | No | `job1,job2` |
+| `--exclude <jobs>` | Deprecated alias for `--exclude-jobs` | - | No | `slow_job` |
+| `--skip-if-recent <time>` | Skip a job if a dump exists within the window | - | No | `24h`, `30m`, `2d`, `today` |
+
+### Migration Parameters (`upgrade` / `clone`)
+
+| Parameter | Description | Default | Required | Example |
+|-----------|-------------|---------|----------|---------|
+| `--globals` | Also migrate cluster globals (roles, tablespaces) via `pg_dumpall --globals-only`; pre-existing roles are tolerated. Forced on by `upgrade`. | `false` | No | - |
+| `--pg-bindir <dir>` | Prepend `<dir>` to `PATH` to pick a specific PostgreSQL client version for **local** `pg_dump`/`pg_restore`/`psql`/`createdb`/`pg_dumpall` (not SSH-remote) | - | No | `/usr/lib/postgresql/18/bin` |
+
+### Bot Parameters
+
+| Parameter | Description | Default | Required | Example |
+|-----------|-------------|---------|----------|---------|
+| `--token <token>` | Telegram bot token (else read from `defaults.notify.telegram` in the YAML, or `TELEGRAM_BOT_TOKEN`) | - | No | `123:ABC...` |
+| `--cooldown <time>` | Minimum interval between button/`/backup`-triggered runs of the same job. Format `<N>[h\|m\|d]`. | `1h` | No | `30m`, `2d` |
 
 ### General Parameters
 
@@ -1055,6 +1138,21 @@ When multiple password sources are available, t-pgsql uses this priority:
 | `--no-meta` | Don't write metadata to archives | `false` | No | - |
 | `-h, --help` | Show help message | - | No | - |
 | `--version` | Show version number | - | No | - |
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `T_PGSQL_PASSWORD` | Password for both source and target |
+| `T_PGSQL_FROM_PASSWORD` | Source connection password |
+| `T_PGSQL_TO_PASSWORD` | Target connection password |
+| `T_PGSQL_OUTPUT_DIR` | Default output directory for dumps (overridden by `--output`) |
+| `PGCONNECT_TIMEOUT` | libpq connection timeout in seconds (default `10`) |
+| `TELEGRAM_BOT_TOKEN` | Resolves the bare `--notify telegram` channel and the `bot` token |
+| `TELEGRAM_CHAT_ID` | Chat id for the bare `--notify telegram` channel |
+| `TELEGRAM_THREAD_ID` | Optional forum-topic thread id for Telegram notifications |
+
+> Passwords passed via environment variables (or scoped inline, e.g. `T_PGSQL_PASSWORD=secret t-pgsql ...`) are never placed on a process argv, so they are not visible to `ps`.
 
 ### Internal Default Values
 
