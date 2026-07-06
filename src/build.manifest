@@ -16,7 +16,9 @@
 66-stream.sh
 68-clone.sh
 70-upgrade.sh
+71-explain.sh
 72-list-meta-clean.sh
+73-doctor.sh
 75-yaml.sh
 76-jobs.sh
 78-batch.sh

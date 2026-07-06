@@ -18,10 +18,13 @@ _t-pgsql() {
                 'upgrade:Logical major-version migration'
                 'fetch:Fetch existing dump from remote'
                 'batch:Run multiple jobs'
+                'bot:Telegram bot (listen for commands)'
                 'jobs:Manage saved jobs'
                 'list:List dump files'
                 'meta:Show metadata'
                 'clean:Clean old dumps'
+                'doctor:Check environment and backup health'
+                'explain:Explain what a command is for'
                 'version:Show version'
                 'help:Show help'
             )

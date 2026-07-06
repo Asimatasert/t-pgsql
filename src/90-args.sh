@@ -60,6 +60,12 @@ parse_args() {
         shift
     fi
 
+    # Handle explain subcommand optional positional topic (explain <topic>)
+    if [ "$COMMAND" = "explain" ] && [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+        EXPLAIN_TARGET="$1"
+        shift
+    fi
+
     while [[ $# -gt 0 ]]; do
         case $1 in
             --from) FROM_CONNECTION="$2"; shift 2 || _need_val "$1" ;;
