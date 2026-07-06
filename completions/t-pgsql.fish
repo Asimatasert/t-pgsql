@@ -1,7 +1,7 @@
 # Fish completion for t-pgsql
 
 # Commands
-set -l commands dump restore clone upgrade fetch batch jobs list meta clean version help
+set -l commands dump restore clone upgrade fetch batch bot jobs list meta clean doctor explain version help
 
 # Disable file completion by default
 complete -c t-pgsql -f

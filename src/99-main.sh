@@ -115,6 +115,8 @@ main() {
         list)    cmd_list ;;
         meta)    cmd_meta ;;
         clean)   cmd_clean ;;
+        doctor)  cmd_doctor ;;
+        explain) cmd_explain ;;
         jobs)
             case "$JOBS_ACTION" in
                 show)   show_job "$JOBS_TARGET" ;;
