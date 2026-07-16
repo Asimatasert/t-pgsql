@@ -41,7 +41,7 @@ cmd_fetch() {
         # Auto-find latest dump for database (--from-file or --from-file latest)
         log_info "Finding latest dump for: $FROM_DATABASE"
         remote_file=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-            "ls -t /tmp/t-pgsql/$(pq "$FROM_DATABASE")_*.dump 2>/dev/null | head -1")
+            "ls -t /tmp/t-pgsql/$(pq "$FROM_DATABASE")_*.dump* 2>/dev/null | head -1")
     fi
 
     if [ -z "$remote_file" ]; then

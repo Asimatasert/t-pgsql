@@ -81,6 +81,20 @@ BWLIMIT_KBIT=""               # derived: scp -l wants Kbit/s
 PV_RATE=""                    # derived: pv -L rate for streaming clone
 RETRIES=0                     # extra retries for scp transfers on failure
 
+# Where external compression (zstd/xz/bzip2) runs for SSH dumps:
+#   target (default) = copy the raw dump, compress locally (old behavior)
+#   source           = compress on the source host first, then copy the small
+#                      file — a 20x+ transfer saving on slow uplinks
+COMPRESS_WHERE="target"
+COMPRESS_WHERE_SET=false      # true if --compress-where passed on CLI
+
+# Before an SSH dump with --from-keep 0, purge leftover dumps of the same job
+# older than this from the source temp dir. Failed or interrupted runs never
+# reach the post-transfer cleanup, so their dumps would otherwise pile up in
+# /tmp forever. 0 disables.
+FROM_STALE="72h"
+FROM_STALE_SET=false          # true if --from-stale passed on CLI
+
 # Migration / upgrade
 GLOBALS=false                 # also migrate cluster globals (roles, tablespaces)
 PG_BINDIR=""                  # dir prepended to PATH so a specific PostgreSQL

@@ -21,7 +21,7 @@
 # ==============================================================================
 # VERSION & PATHS
 # ==============================================================================
-VERSION="3.9.0"
+VERSION="3.10.0"
 SCRIPT_NAME="t-pgsql"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -119,6 +119,20 @@ BWLIMIT=""                    # human rate: 10m (MByte/s), 500k (KByte/s), or ba
 BWLIMIT_KBIT=""               # derived: scp -l wants Kbit/s
 PV_RATE=""                    # derived: pv -L rate for streaming clone
 RETRIES=0                     # extra retries for scp transfers on failure
+
+# Where external compression (zstd/xz/bzip2) runs for SSH dumps:
+#   target (default) = copy the raw dump, compress locally (old behavior)
+#   source           = compress on the source host first, then copy the small
+#                      file — a 20x+ transfer saving on slow uplinks
+COMPRESS_WHERE="target"
+COMPRESS_WHERE_SET=false      # true if --compress-where passed on CLI
+
+# Before an SSH dump with --from-keep 0, purge leftover dumps of the same job
+# older than this from the source temp dir. Failed or interrupted runs never
+# reach the post-transfer cleanup, so their dumps would otherwise pile up in
+# /tmp forever. 0 disables.
+FROM_STALE="72h"
+FROM_STALE_SET=false          # true if --from-stale passed on CLI
 
 # Migration / upgrade
 GLOBALS=false                 # also migrate cluster globals (roles, tablespaces)
@@ -1067,6 +1081,12 @@ COMPRESSION:
                                   compression is disabled so data is compressed once.
     --pg-compress-level <0-9>     Advanced: override pg_dump's built-in -Z level
                                   (only affects the gzip type; default: 6)
+    --compress-where <where>      For SSH dumps with zstd/xz/bzip2 (default: target):
+                                  target = copy the raw dump, compress locally
+                                  source = compress on the source host first, then
+                                  copy the much smaller file (best on slow uplinks).
+                                  Falls back to target if the tool is missing there.
+                                  gzip is unaffected (pg_dump -Z compresses in-place).
 
 STORAGE:
     --output <dir>                Output directory (default: env T_PGSQL_OUTPUT_DIR,
@@ -1075,6 +1095,11 @@ STORAGE:
     --keep <N>                    Keep last N local dumps (-1=all, 0=none)
     --from-keep <N>               For SSH sources: how many dumps to keep in the remote
                                   /tmp staging dir (default: 1, -1=all, 0=delete)
+    --from-stale <time>           With --from-keep 0: before dumping, purge this job's
+                                  leftover dumps older than <time> from the remote
+                                  staging dir — failed runs never reach the normal
+                                  cleanup and would pile up there (default: 72h,
+                                  0 disables). Examples: 48h, 2d
     --skip-if-recent <time>       Skip if dump exists within timeframe
                                   Examples: 24h, 12h, 1d, today
     --from-file [pattern]         Fetch existing dump (for fetch command)
@@ -1675,7 +1700,9 @@ load_config() {
             output) [ "$OUTPUT_DIR_SET" != true ] && OUTPUT_DIR="$value" ;;
             keep) [ "$KEEP_SET" != true ] && KEEP="$value" ;;
             from_keep|from-keep) [ "$FROM_KEEP_SET" != true ] && FROM_KEEP="$value" ;;
+            from_stale|from-stale) [ "$FROM_STALE_SET" != true ] && FROM_STALE="$value" ;;
             compress) [ "$COMPRESS_SET" != true ] && COMPRESS="$value" ;;
+            compress_where|compress-where) [ "$COMPRESS_WHERE_SET" != true ] && COMPRESS_WHERE="$value" ;;
             exclude_table|exclude-table) [ -z "$EXCLUDE_TABLES" ] && EXCLUDE_TABLES="$value" ;;
             exclude_schema|exclude-schema) [ -z "$EXCLUDE_SCHEMAS" ] && EXCLUDE_SCHEMAS="$value" ;;
             exclude_data|exclude-data) [ -z "$EXCLUDE_DATA" ] && EXCLUDE_DATA="$value" ;;
@@ -1820,6 +1847,7 @@ cmd_dump() {
     esac
 
     local result=0
+    local remote_compressed=false comp_ext=""
 
     if [ "$FROM_TYPE" = "ssh" ]; then
         log_info "Dumping via SSH..."
@@ -1827,6 +1855,20 @@ cmd_dump() {
         ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "mkdir -p $(pq "$remote_dump_dir") && chmod 700 $(pq "$remote_dump_dir")"
         local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
         local remote_file="${remote_dump_dir}/${dump_base_name}_${ts}.dump"
+
+        # Purge leftovers from failed/interrupted runs (--from-stale). Post-transfer
+        # cleanup never runs when a run dies mid-way, so its dump would sit in the
+        # source temp dir forever. Only with --from-keep 0: a positive keep policy
+        # manages its own retention, and -1 means keep everything on the source.
+        local stale_min=$(( $(parse_time_to_seconds "$FROM_STALE") / 60 ))
+        if [ "$FROM_KEEP" -eq 0 ] && [ "$stale_min" -gt 0 ]; then
+            local stale_out
+            stale_out=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+                "find $(pq "$remote_dump_dir") -maxdepth 1 -name $(pq "${dump_base_name}_*.dump*") -mmin +${stale_min} -print -delete 2>/dev/null")
+            if [ -n "$stale_out" ]; then
+                log_info "Purged $(echo "$stale_out" | wc -l | tr -d ' ') stale source dump(s) older than ${FROM_STALE}"
+            fi
+        fi
 
         local cmd=""
         if [ "$SUDO" = true ]; then
@@ -1846,11 +1888,62 @@ cmd_dump() {
         ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cmd"
         result=$?
 
+        # Source-side compression (--compress-where source): shrink the dump on
+        # the source host BEFORE the copy, so a slow uplink moves the compressed
+        # artifact instead of the raw dump. Falls back to the old transfer-then-
+        # compress path if the tool is missing or compression fails — never
+        # blocks the backup. gzip needs nothing here: pg_dump -Z already
+        # compressed it in-format on the source.
+        if [ $result -eq 0 ] && [ "$COMPRESS_WHERE" = "source" ]; then
+            case "$COMPRESS" in
+                zstd|xz|bzip2)
+                    local clvl="$COMPRESS_LEVEL" ccmd=""
+                    [ "$clvl" -lt 1 ] && clvl=1
+                    case "$COMPRESS" in
+                        zstd)  [ "$clvl" -gt 19 ] && clvl=19; comp_ext="zst"; ccmd="zstd -q -${clvl} --rm -f $(pq "$remote_file")" ;;
+                        xz)    [ "$clvl" -gt 9 ]  && clvl=9;  comp_ext="xz";  ccmd="xz -${clvl} -f $(pq "$remote_file")" ;;
+                        bzip2) [ "$clvl" -gt 9 ]  && clvl=9;  comp_ext="bz2"; ccmd="bzip2 -${clvl} -f $(pq "$remote_file")" ;;
+                    esac
+                    if ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "command -v $(pq "$COMPRESS") >/dev/null 2>&1"; then
+                        log_info "Compressing on source ($COMPRESS)..."
+                        if ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$ccmd"; then
+                            remote_file="${remote_file}.${comp_ext}"
+                            remote_compressed=true
+                        else
+                            log_warn "Source-side compression failed; transferring raw and compressing on target"
+                        fi
+                    else
+                        log_warn "'$COMPRESS' not found on source host; transferring raw and compressing on target"
+                    fi
+                    ;;
+            esac
+        fi
+
         if [ $result -eq 0 ]; then
             log_info "Transferring..."
             if ! scp_transfer "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}:${remote_file}" "$dump_file"; then
                 log_error "Transfer failed; leaving the source dump in place"
                 result=1
+            fi
+
+            # The local name was reserved as a plain .dump path; when the bytes
+            # arrived already compressed, rename to the real extension so
+            # metadata, retention and restore see what the file actually is.
+            if [ $result -eq 0 ] && [ "$remote_compressed" = true ]; then
+                local final_file="${dump_file}.${comp_ext}" _m=0
+                while [ -e "$final_file" ]; do
+                    _m=$((_m + 1))
+                    [ "$_m" -gt 10000 ] && { log_error "Too many colliding dumps for ${dump_file}.${comp_ext}"; result=1; break; }
+                    final_file="${dump_file}.${_m}.${comp_ext}"
+                done
+                if [ $result -eq 0 ]; then
+                    if mv "$dump_file" "$final_file"; then
+                        dump_file="$final_file"
+                    else
+                        log_error "Could not rename transferred dump to $final_file"
+                        result=1
+                    fi
+                fi
             fi
 
             # Cleanup based on FROM_KEEP — ONLY after a successful transfer, so a
@@ -1861,7 +1954,7 @@ cmd_dump() {
             elif [ $result -eq 0 ] && [ "$FROM_KEEP" -gt 0 ]; then
                 log_info "Keeping last $FROM_KEEP dump(s) on source..."
                 local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-                local cleanup_cmd="cd $(pq "$remote_dump_dir") && ls -t $(pq "$dump_base_name")_*.dump 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
+                local cleanup_cmd="cd $(pq "$remote_dump_dir") && ls -t $(pq "$dump_base_name")_*.dump* 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
                 ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
             elif [ $result -eq 0 ]; then
                 log_info "Keeping source dump (--from-keep -1)"
@@ -1886,7 +1979,8 @@ cmd_dump() {
         # External compression must happen BEFORE metadata is written, and
         # dump_file must be advanced to the compressed artifact so meta_write
         # sees an existing file (and DUMP_FILE reflects what really exists).
-        if [ "$COMPRESS" != "gzip" ] && [ "$COMPRESS" != "none" ]; then
+        # Skipped when the file already arrived compressed from the source.
+        if [ "$remote_compressed" != true ] && [ "$COMPRESS" != "gzip" ] && [ "$COMPRESS" != "none" ]; then
             if compress_file "$dump_file"; then
                 case "$COMPRESS" in
                     zstd)  dump_file="${dump_file}.zst" ;;
@@ -2363,7 +2457,7 @@ cmd_fetch() {
         # Auto-find latest dump for database (--from-file or --from-file latest)
         log_info "Finding latest dump for: $FROM_DATABASE"
         remote_file=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-            "ls -t /tmp/t-pgsql/$(pq "$FROM_DATABASE")_*.dump 2>/dev/null | head -1")
+            "ls -t /tmp/t-pgsql/$(pq "$FROM_DATABASE")_*.dump* 2>/dev/null | head -1")
     fi
 
     if [ -z "$remote_file" ]; then
@@ -3572,6 +3666,8 @@ save_job() {
     [ "$COMPRESS" != "gzip" ] && args="$args --compress $(pq "$COMPRESS")"
     [ "$COMPRESS_LEVEL" != 6 ] && args="$args --compress-level $COMPRESS_LEVEL"
     [ "$PG_COMPRESS_LEVEL_SET" = true ] && args="$args --pg-compress-level $PG_COMPRESS_LEVEL"
+    [ "$COMPRESS_WHERE" != "target" ] && args="$args --compress-where $(pq "$COMPRESS_WHERE")"
+    [ "$FROM_STALE" != "72h" ] && args="$args --from-stale $(pq "$FROM_STALE")"
 
     # Streaming
     [ "$STREAM" = true ] && args="$args --stream"
@@ -4834,10 +4930,12 @@ parse_args() {
             --compress) COMPRESS="$2"; COMPRESS_SET=true; shift 2 || _need_val "$1" ;;
             --compress-level) COMPRESS_LEVEL="$2"; shift 2 || _need_val "$1" ;;
             --pg-compress-level) PG_COMPRESS_LEVEL="$2"; PG_COMPRESS_LEVEL_SET=true; shift 2 || _need_val "$1" ;;
+            --compress-where) COMPRESS_WHERE="$2"; COMPRESS_WHERE_SET=true; shift 2 || _need_val "$1" ;;
 
             --output) OUTPUT_DIR="$2"; OUTPUT_DIR_SET=true; shift 2 || _need_val "$1" ;;
             --keep) KEEP="$2"; KEEP_SET=true; shift 2 || _need_val "$1" ;;
             --from-keep) FROM_KEEP="$2"; FROM_KEEP_SET=true; shift 2 || _need_val "$1" ;;
+            --from-stale) FROM_STALE="$2"; FROM_STALE_SET=true; shift 2 || _need_val "$1" ;;
             --dump-name) DUMP_NAME="$2"; shift 2 || _need_val "$1" ;;
             --skip-if-recent) SKIP_IF_RECENT="$2"; shift 2 || _need_val "$1" ;;
             --from-file)
@@ -4980,6 +5078,18 @@ main() {
         gzip|zstd|xz|bzip2|none) ;;
         *) log_error "Invalid --compress '$COMPRESS' (use gzip|zstd|xz|bzip2|none)"; exit 1 ;;
     esac
+
+    case "$COMPRESS_WHERE" in
+        source|target) ;;
+        *) log_error "Invalid --compress-where '$COMPRESS_WHERE' (use source|target)"; exit 1 ;;
+    esac
+
+    # --from-stale is a time string that feeds $(( )) arithmetic and a remote
+    # find(1) argument; validate the format so nothing else can reach either.
+    if ! [[ "$FROM_STALE" =~ ^[0-9]+[hmd]?$ ]]; then
+        log_error "Invalid --from-stale '$FROM_STALE' (use e.g. 72h, 2d, or 0 to disable)"
+        exit 1
+    fi
 
     # Resolve --bwlimit (human units) to scp's Kbit/s. Strict pattern so the value
     # can never reach the arithmetic below as an injection payload. 10m=MByte/s,

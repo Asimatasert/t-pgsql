@@ -127,6 +127,7 @@ cmd_dump() {
     esac
 
     local result=0
+    local remote_compressed=false comp_ext=""
 
     if [ "$FROM_TYPE" = "ssh" ]; then
         log_info "Dumping via SSH..."
@@ -134,6 +135,20 @@ cmd_dump() {
         ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "mkdir -p $(pq "$remote_dump_dir") && chmod 700 $(pq "$remote_dump_dir")"
         local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
         local remote_file="${remote_dump_dir}/${dump_base_name}_${ts}.dump"
+
+        # Purge leftovers from failed/interrupted runs (--from-stale). Post-transfer
+        # cleanup never runs when a run dies mid-way, so its dump would sit in the
+        # source temp dir forever. Only with --from-keep 0: a positive keep policy
+        # manages its own retention, and -1 means keep everything on the source.
+        local stale_min=$(( $(parse_time_to_seconds "$FROM_STALE") / 60 ))
+        if [ "$FROM_KEEP" -eq 0 ] && [ "$stale_min" -gt 0 ]; then
+            local stale_out
+            stale_out=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+                "find $(pq "$remote_dump_dir") -maxdepth 1 -name $(pq "${dump_base_name}_*.dump*") -mmin +${stale_min} -print -delete 2>/dev/null")
+            if [ -n "$stale_out" ]; then
+                log_info "Purged $(echo "$stale_out" | wc -l | tr -d ' ') stale source dump(s) older than ${FROM_STALE}"
+            fi
+        fi
 
         local cmd=""
         if [ "$SUDO" = true ]; then
@@ -153,11 +168,62 @@ cmd_dump() {
         ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cmd"
         result=$?
 
+        # Source-side compression (--compress-where source): shrink the dump on
+        # the source host BEFORE the copy, so a slow uplink moves the compressed
+        # artifact instead of the raw dump. Falls back to the old transfer-then-
+        # compress path if the tool is missing or compression fails — never
+        # blocks the backup. gzip needs nothing here: pg_dump -Z already
+        # compressed it in-format on the source.
+        if [ $result -eq 0 ] && [ "$COMPRESS_WHERE" = "source" ]; then
+            case "$COMPRESS" in
+                zstd|xz|bzip2)
+                    local clvl="$COMPRESS_LEVEL" ccmd=""
+                    [ "$clvl" -lt 1 ] && clvl=1
+                    case "$COMPRESS" in
+                        zstd)  [ "$clvl" -gt 19 ] && clvl=19; comp_ext="zst"; ccmd="zstd -q -${clvl} --rm -f $(pq "$remote_file")" ;;
+                        xz)    [ "$clvl" -gt 9 ]  && clvl=9;  comp_ext="xz";  ccmd="xz -${clvl} -f $(pq "$remote_file")" ;;
+                        bzip2) [ "$clvl" -gt 9 ]  && clvl=9;  comp_ext="bz2"; ccmd="bzip2 -${clvl} -f $(pq "$remote_file")" ;;
+                    esac
+                    if ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "command -v $(pq "$COMPRESS") >/dev/null 2>&1"; then
+                        log_info "Compressing on source ($COMPRESS)..."
+                        if ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$ccmd"; then
+                            remote_file="${remote_file}.${comp_ext}"
+                            remote_compressed=true
+                        else
+                            log_warn "Source-side compression failed; transferring raw and compressing on target"
+                        fi
+                    else
+                        log_warn "'$COMPRESS' not found on source host; transferring raw and compressing on target"
+                    fi
+                    ;;
+            esac
+        fi
+
         if [ $result -eq 0 ]; then
             log_info "Transferring..."
             if ! scp_transfer "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}:${remote_file}" "$dump_file"; then
                 log_error "Transfer failed; leaving the source dump in place"
                 result=1
+            fi
+
+            # The local name was reserved as a plain .dump path; when the bytes
+            # arrived already compressed, rename to the real extension so
+            # metadata, retention and restore see what the file actually is.
+            if [ $result -eq 0 ] && [ "$remote_compressed" = true ]; then
+                local final_file="${dump_file}.${comp_ext}" _m=0
+                while [ -e "$final_file" ]; do
+                    _m=$((_m + 1))
+                    [ "$_m" -gt 10000 ] && { log_error "Too many colliding dumps for ${dump_file}.${comp_ext}"; result=1; break; }
+                    final_file="${dump_file}.${_m}.${comp_ext}"
+                done
+                if [ $result -eq 0 ]; then
+                    if mv "$dump_file" "$final_file"; then
+                        dump_file="$final_file"
+                    else
+                        log_error "Could not rename transferred dump to $final_file"
+                        result=1
+                    fi
+                fi
             fi
 
             # Cleanup based on FROM_KEEP — ONLY after a successful transfer, so a
@@ -168,7 +234,7 @@ cmd_dump() {
             elif [ $result -eq 0 ] && [ "$FROM_KEEP" -gt 0 ]; then
                 log_info "Keeping last $FROM_KEEP dump(s) on source..."
                 local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-                local cleanup_cmd="cd $(pq "$remote_dump_dir") && ls -t $(pq "$dump_base_name")_*.dump 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
+                local cleanup_cmd="cd $(pq "$remote_dump_dir") && ls -t $(pq "$dump_base_name")_*.dump* 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
                 ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
             elif [ $result -eq 0 ]; then
                 log_info "Keeping source dump (--from-keep -1)"
@@ -193,7 +259,8 @@ cmd_dump() {
         # External compression must happen BEFORE metadata is written, and
         # dump_file must be advanced to the compressed artifact so meta_write
         # sees an existing file (and DUMP_FILE reflects what really exists).
-        if [ "$COMPRESS" != "gzip" ] && [ "$COMPRESS" != "none" ]; then
+        # Skipped when the file already arrived compressed from the source.
+        if [ "$remote_compressed" != true ] && [ "$COMPRESS" != "gzip" ] && [ "$COMPRESS" != "none" ]; then
             if compress_file "$dump_file"; then
                 case "$COMPRESS" in
                     zstd)  dump_file="${dump_file}.zst" ;;
