@@ -494,6 +494,29 @@ Cleans old dump files.
 
 ---
 
+### doctor
+
+Runs local, read-only health checks and prints `✓ / ! / ✗` findings: required and optional tools, the output directory and free disk space, how fresh each database's newest dump is, whether the newest archives are readable, and the jobs file. Add `--from`/`--to` to also test connectivity. Exits non-zero if it finds a problem — handy in CI or a cron pre-flight.
+
+```bash
+./t-pgsql doctor
+./t-pgsql doctor --from "ssh://user@host/postgres@localhost/appdb"
+```
+
+---
+
+### explain
+
+Explains what a command is for and when to use it, with key options and examples — a built-in, offline reference.
+
+```bash
+./t-pgsql explain                 # list all topics
+./t-pgsql explain clone           # focused help for a command
+./t-pgsql explain masking         # also: stream, retention, doctor, ...
+```
+
+---
+
 ### jobs
 
 Lists saved batch jobs.

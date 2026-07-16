@@ -27,6 +27,8 @@ COMMANDS:
                   clean <db> --keep <N>        Clean by database name
                   clean --from <conn> --keep <N>
                   clean --dump-name <name> --retention
+    doctor      Check the environment and backup health (add --from/--to to test connectivity)
+    explain     Explain what a command is for: explain [dump|restore|clone|upgrade|...]
     version     Show version
 
 CONNECTION:

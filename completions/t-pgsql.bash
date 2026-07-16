@@ -4,7 +4,7 @@ _t_pgsql() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="dump restore clone upgrade fetch batch jobs list meta clean version help"
+    local commands="dump restore clone upgrade fetch batch bot jobs list meta clean doctor explain version help"
 
     local opts="
         --from --to

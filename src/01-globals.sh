@@ -135,6 +135,7 @@ FILE=""
 
 # Clean (optional positional database/base-name for the "clean" command)
 CLEAN_DB=""
+EXPLAIN_TARGET=""
 
 # Custom dump base name (also usable by "clean")
 DUMP_NAME=""
