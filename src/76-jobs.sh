@@ -34,6 +34,8 @@ save_job() {
     [ "$COMPRESS" != "gzip" ] && args="$args --compress $(pq "$COMPRESS")"
     [ "$COMPRESS_LEVEL" != 6 ] && args="$args --compress-level $COMPRESS_LEVEL"
     [ "$PG_COMPRESS_LEVEL_SET" = true ] && args="$args --pg-compress-level $PG_COMPRESS_LEVEL"
+    [ "$COMPRESS_WHERE" != "target" ] && args="$args --compress-where $(pq "$COMPRESS_WHERE")"
+    [ "$FROM_STALE" != "72h" ] && args="$args --from-stale $(pq "$FROM_STALE")"
 
     # Streaming
     [ "$STREAM" = true ] && args="$args --stream"

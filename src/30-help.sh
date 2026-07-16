@@ -72,6 +72,12 @@ COMPRESSION:
                                   compression is disabled so data is compressed once.
     --pg-compress-level <0-9>     Advanced: override pg_dump's built-in -Z level
                                   (only affects the gzip type; default: 6)
+    --compress-where <where>      For SSH dumps with zstd/xz/bzip2 (default: target):
+                                  target = copy the raw dump, compress locally
+                                  source = compress on the source host first, then
+                                  copy the much smaller file (best on slow uplinks).
+                                  Falls back to target if the tool is missing there.
+                                  gzip is unaffected (pg_dump -Z compresses in-place).
 
 STORAGE:
     --output <dir>                Output directory (default: env T_PGSQL_OUTPUT_DIR,
@@ -80,6 +86,11 @@ STORAGE:
     --keep <N>                    Keep last N local dumps (-1=all, 0=none)
     --from-keep <N>               For SSH sources: how many dumps to keep in the remote
                                   /tmp staging dir (default: 1, -1=all, 0=delete)
+    --from-stale <time>           With --from-keep 0: before dumping, purge this job's
+                                  leftover dumps older than <time> from the remote
+                                  staging dir — failed runs never reach the normal
+                                  cleanup and would pile up there (default: 72h,
+                                  0 disables). Examples: 48h, 2d
     --skip-if-recent <time>       Skip if dump exists within timeframe
                                   Examples: 24h, 12h, 1d, today
     --from-file [pattern]         Fetch existing dump (for fetch command)

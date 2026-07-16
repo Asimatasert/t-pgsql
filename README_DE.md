@@ -1026,6 +1026,7 @@ Die unterstützten Schlüssel spiegeln die Flags wider: `from`, `to`, `password`
 | `--compress <type>` | Komprimierungsalgorithmus | `gzip` | Nein | `zstd`, `xz`, `bzip2`, `none` |
 | `--compress-level <1-9>` | Komprimierungsstufe | `6` | Nein | `9` |
 | `--pg-compress-level <0-9>` | Interne Komprimierung von pg_dump | `6` | Nein | `0` (keine Komprimierung) |
+| `--compress-where <where>` | Bei SSH-Dumps: zstd/xz/bzip2 auf dem `source`-Host vor dem Kopieren ausführen oder auf dem `target` danach. `source` überträgt eine viel kleinere Datei über langsame Uplinks; fällt auf `target` zurück, wenn das Tool auf der Quelle fehlt | `target` | Nein | `source` |
 
 ### Speicherparameter
 
@@ -1034,6 +1035,7 @@ Die unterstützten Schlüssel spiegeln die Flags wider: `from`, `to`, `password`
 | `--output <dir>` | Ausgabeverzeichnis für Dumps | `<script dir>/../data/dumps` | Nein | `/backups/daily` |
 | `--keep <N>` | Anzahl der lokal zu behaltenden Dumps | `-1` (alle) | Nein | `7`, `0` (löschen), `-1` (alle) |
 | `--from-keep <N>` | Anzahl der auf der Quelle zu behaltenden Dumps | `1` | Nein | `3`, `0` (löschen), `-1` (alle) |
+| `--from-stale <time>` | Mit `--from-keep 0`: vor dem Dump liegengebliebene Dumps dieses Jobs, die älter als `<time>` sind, aus dem Staging-Verzeichnis der Quelle löschen (fehlgeschlagene Läufe erreichen die normale Bereinigung nie) | `72h` | Nein | `48h`, `2d`, `0` (aus) |
 | `--dump-name <name>` | Benutzerdefinierter Dump-Dateiname (ohne Zeitstempel) | Datenbankname | Nein | `myapp-backup` |
 | `--skip-if-recent <time>` | Überspringen, wenn innerhalb des Zeitrahmens ein Dump existiert | - | Nein | `24h`, `12h`, `1d`, `today` |
 | `--file <path>` | Bestimmte Dump-Datei für die Wiederherstellung | - | Nein | `./dumps/backup.tar.gz` |

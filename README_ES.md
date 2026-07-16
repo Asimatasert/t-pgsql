@@ -1026,6 +1026,7 @@ Las claves admitidas reflejan las opciones: `from`, `to`, `password`/`from_passw
 | `--compress <type>` | Algoritmo de compresión | `gzip` | No | `zstd`, `xz`, `bzip2`, `none` |
 | `--compress-level <1-9>` | Nivel de compresión | `6` | No | `9` |
 | `--pg-compress-level <0-9>` | Compresión interna de pg_dump | `6` | No | `0` (sin compresión) |
+| `--compress-where <where>` | Para dumps SSH: ejecutar zstd/xz/bzip2 en el host `source` antes de la copia, o en el `target` después. `source` transfiere un archivo mucho más pequeño por enlaces lentos; recurre a `target` si la herramienta falta en el origen | `target` | No | `source` |
 
 ### Parámetros de almacenamiento
 
@@ -1034,6 +1035,7 @@ Las claves admitidas reflejan las opciones: `from`, `to`, `password`/`from_passw
 | `--output <dir>` | Directorio de salida para los dumps | `<script dir>/../data/dumps` | No | `/backups/daily` |
 | `--keep <N>` | Número de dumps locales a conservar | `-1` (todos) | No | `7`, `0` (eliminar), `-1` (todos) |
 | `--from-keep <N>` | Número de dumps a conservar en el origen | `1` | No | `3`, `0` (eliminar), `-1` (todos) |
+| `--from-stale <time>` | Con `--from-keep 0`: antes del dump, purgar del directorio de staging del origen los dumps de este job más antiguos que `<time>` (las ejecuciones fallidas nunca llegan a la limpieza normal) | `72h` | No | `48h`, `2d`, `0` (desactivado) |
 | `--dump-name <name>` | Nombre de archivo de dump personalizado (sin marca de tiempo) | Nombre de la base de datos | No | `myapp-backup` |
 | `--skip-if-recent <time>` | Omite si existe un dump dentro del periodo | - | No | `24h`, `12h`, `1d`, `today` |
 | `--file <path>` | Archivo de dump específico para restaurar | - | No | `./dumps/backup.tar.gz` |

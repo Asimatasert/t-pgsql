@@ -283,6 +283,13 @@ Creates a database backup.
   --from-password-file .secrets/prod.pass \
   --from-keep 3  # Keep last 3 dumps
 
+# Slow uplink? Compress on the source host, then transfer the small file
+./t-pgsql dump \
+  --from "ssh://user@server/postgres@localhost/prod" \
+  --from-password-file .secrets/prod.pass \
+  --compress zstd \
+  --compress-where source  # 20 GB raw dump can shrink to ~1 GB before the copy
+
 # Custom dump name
 ./t-pgsql dump \
   --from "postgres@localhost/mydb" \
@@ -469,7 +476,7 @@ operation:
   exit_code: 0
 
 environment:
-  script_version: "3.9.0"
+  script_version: "3.10.0"
   executed_by: dbadmin
   executed_on: macbookair
   working_dir: /opt/t-pgsql/t-pgsql
@@ -1026,6 +1033,7 @@ Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_pa
 | `--compress <type>` | Compression algorithm | `gzip` | No | `zstd`, `xz`, `bzip2`, `none` |
 | `--compress-level <1-9>` | Compression level | `6` | No | `9` |
 | `--pg-compress-level <0-9>` | pg_dump internal compression | `6` | No | `0` (no compression) |
+| `--compress-where <where>` | For SSH dumps: run zstd/xz/bzip2 on the `source` host before the copy, or on the `target` after it. `source` moves a much smaller file over slow uplinks; falls back to `target` if the tool is missing on the source | `target` | No | `source` |
 
 ### Storage Parameters
 
@@ -1034,6 +1042,7 @@ Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_pa
 | `--output <dir>` | Output directory for dumps | `<script dir>/../data/dumps` | No | `/backups/daily` |
 | `--keep <N>` | Number of local dumps to keep | `-1` (all) | No | `7`, `0` (delete), `-1` (all) |
 | `--from-keep <N>` | Number of dumps to keep on source | `1` | No | `3`, `0` (delete), `-1` (all) |
+| `--from-stale <time>` | With `--from-keep 0`: purge this job's leftover dumps older than `<time>` from the source staging dir before dumping (failed runs never reach the normal cleanup) | `72h` | No | `48h`, `2d`, `0` (off) |
 | `--dump-name <name>` | Custom dump filename (without timestamp) | Database name | No | `myapp-backup` |
 | `--skip-if-recent <time>` | Skip if dump exists within timeframe | - | No | `24h`, `12h`, `1d`, `today` |
 | `--file <path>` | Specific dump file for restore | - | No | `./dumps/backup.tar.gz` |

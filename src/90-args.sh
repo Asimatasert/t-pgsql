@@ -82,10 +82,12 @@ parse_args() {
             --compress) COMPRESS="$2"; COMPRESS_SET=true; shift 2 || _need_val "$1" ;;
             --compress-level) COMPRESS_LEVEL="$2"; shift 2 || _need_val "$1" ;;
             --pg-compress-level) PG_COMPRESS_LEVEL="$2"; PG_COMPRESS_LEVEL_SET=true; shift 2 || _need_val "$1" ;;
+            --compress-where) COMPRESS_WHERE="$2"; COMPRESS_WHERE_SET=true; shift 2 || _need_val "$1" ;;
 
             --output) OUTPUT_DIR="$2"; OUTPUT_DIR_SET=true; shift 2 || _need_val "$1" ;;
             --keep) KEEP="$2"; KEEP_SET=true; shift 2 || _need_val "$1" ;;
             --from-keep) FROM_KEEP="$2"; FROM_KEEP_SET=true; shift 2 || _need_val "$1" ;;
+            --from-stale) FROM_STALE="$2"; FROM_STALE_SET=true; shift 2 || _need_val "$1" ;;
             --dump-name) DUMP_NAME="$2"; shift 2 || _need_val "$1" ;;
             --skip-if-recent) SKIP_IF_RECENT="$2"; shift 2 || _need_val "$1" ;;
             --from-file)

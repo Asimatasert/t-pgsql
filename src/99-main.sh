@@ -57,6 +57,18 @@ main() {
         *) log_error "Invalid --compress '$COMPRESS' (use gzip|zstd|xz|bzip2|none)"; exit 1 ;;
     esac
 
+    case "$COMPRESS_WHERE" in
+        source|target) ;;
+        *) log_error "Invalid --compress-where '$COMPRESS_WHERE' (use source|target)"; exit 1 ;;
+    esac
+
+    # --from-stale is a time string that feeds $(( )) arithmetic and a remote
+    # find(1) argument; validate the format so nothing else can reach either.
+    if ! [[ "$FROM_STALE" =~ ^[0-9]+[hmd]?$ ]]; then
+        log_error "Invalid --from-stale '$FROM_STALE' (use e.g. 72h, 2d, or 0 to disable)"
+        exit 1
+    fi
+
     # Resolve --bwlimit (human units) to scp's Kbit/s. Strict pattern so the value
     # can never reach the arithmetic below as an injection payload. 10m=MByte/s,
     # 500k=KByte/s, bare number = KByte/s.
