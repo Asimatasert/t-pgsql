@@ -1,3 +1,14 @@
+t-pgsql (3.10.0-1) unstable; urgency=medium
+
+  * New features for SSH dumps:
+    - --compress-where source|target: compress on the source host before
+      the transfer (falls back to target-side if the tool is missing)
+    - --from-stale <time>: purge leftover staging dumps from failed runs
+      on the source before dumping (default 72h, with --from-keep 0)
+    - Widened retention/fetch globs to match compressed staging artifacts
+
+ -- Asim Atasert <asimatasert@outlook.com>  Wed, 16 Jul 2026 15:00:00 +0300
+
 t-pgsql (3.9.0-1) unstable; urgency=medium
 
   * Packaging and audit remediation:
