@@ -1,6 +1,6 @@
 pkgbase = t-pgsql
 	pkgdesc = PostgreSQL database sync, backup and clone tool with notifications
-	pkgver = 3.11.0
+	pkgver = 3.11.1
 	pkgrel = 1
 	url = https://github.com/Asimatasert/t-pgsql
 	arch = any
@@ -12,7 +12,7 @@ pkgbase = t-pgsql
 	optdepends = zsh: for zsh completion support
 	optdepends = bash-completion: for bash completion support
 	optdepends = fish: for fish completion support
-	source = t-pgsql-3.11.0.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v3.11.0.tar.gz
-	sha256sums = dc02b5219cf71cb811cb830329877a0a33c8143069c42cd729be8904d5ef1fec
+	source = t-pgsql-3.11.1.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v3.11.1.tar.gz
+	sha256sums = 85f20e9400c480a26085c44b1eafcbfc4bbbc4e1f010de483a0f929be71fcbe8
 
 pkgname = t-pgsql
