@@ -438,6 +438,10 @@ parse_job_to_args() {
     # Streaming options
     [ -n "$(get_job_value "$job" "stream_buffer")" ] && args+=" --stream-buffer $(pq "$(get_job_value "$job" "stream_buffer")")"
 
+    # Transfer options
+    [ -n "$(get_job_value "$job" "bwlimit")" ] && args+=" --bwlimit $(pq "$(get_job_value "$job" "bwlimit")")"
+    [ -n "$(get_job_value "$job" "retries")" ] && args+=" --retries $(pq "$(get_job_value "$job" "retries")")"
+
     # Health check options
     [ "$(get_job_value "$job" "health_check")" = "true" ] && args+=" --health-check"
     [ "$(get_job_value "$job" "health_check_after")" = "true" ] && args+=" --health-check-after"
