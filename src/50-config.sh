@@ -52,6 +52,8 @@ load_config() {
             from_stale|from-stale) [ "$FROM_STALE_SET" != true ] && FROM_STALE="$value" ;;
             compress) [ "$COMPRESS_SET" != true ] && COMPRESS="$value" ;;
             compress_where|compress-where) [ "$COMPRESS_WHERE_SET" != true ] && COMPRESS_WHERE="$value" ;;
+            bwlimit) [ -z "$BWLIMIT" ] && BWLIMIT="$value" ;;
+            retries) [ "$RETRIES" = 0 ] && RETRIES="$value" ;;
             exclude_table|exclude-table) [ -z "$EXCLUDE_TABLES" ] && EXCLUDE_TABLES="$value" ;;
             exclude_schema|exclude-schema) [ -z "$EXCLUDE_SCHEMAS" ] && EXCLUDE_SCHEMAS="$value" ;;
             exclude_data|exclude-data) [ -z "$EXCLUDE_DATA" ] && EXCLUDE_DATA="$value" ;;

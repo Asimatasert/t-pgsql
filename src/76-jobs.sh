@@ -41,6 +41,10 @@ save_job() {
     [ "$STREAM" = true ] && args="$args --stream"
     [ "$STREAM_BUFFER" != 64 ] && args="$args --stream-buffer $STREAM_BUFFER"
 
+    # Transfer
+    [ -n "$BWLIMIT" ] && args="$args --bwlimit $(pq "$BWLIMIT")"
+    [ "$RETRIES" != 0 ] && args="$args --retries $RETRIES"
+
     # Retention (GFS)
     if [ "$RETENTION" = true ]; then
         args="$args --retention"

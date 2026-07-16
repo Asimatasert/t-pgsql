@@ -1,3 +1,11 @@
+t-pgsql (3.11.1-1) unstable; urgency=medium
+
+  * Fix: bwlimit and retries were CLI-only — a bwlimit/retries key in a jobs
+    YAML or config file was silently ignored. Both are now mapped in the
+    batch YAML runner, config loader and job serializer.
+
+ -- Asim Atasert <asimatasert@outlook.com>  Wed, 16 Jul 2026 16:30:00 +0300
+
 t-pgsql (3.11.0-1) unstable; urgency=medium
 
   * New commands:
