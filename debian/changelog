@@ -1,3 +1,14 @@
+t-pgsql (3.12.0-1) unstable; urgency=medium
+
+  * New: two-tier retention. --archive-output <dir> / --archive-keep <N>
+    (also job YAML archive_output/archive_keep) move dumps that age out of
+    --keep to a second directory instead of deleting them, with their own
+    retention cap there.
+  * Fix: --keep/GFS cleanup now also removes the matching .meta sidecar
+    file when a dump is deleted (previously left orphaned).
+
+ -- Asim Atasert <asimatasert@outlook.com>  Fri, 31 Jul 2026 15:45:00 +0300
+
 t-pgsql (3.11.1-1) unstable; urgency=medium
 
   * Fix: bwlimit and retries were CLI-only — a bwlimit/retries key in a jobs
