@@ -34,7 +34,7 @@ load_config() {
         # or connection strings (a password that happens to start with ~ was being
         # silently rewritten into a home-dir path).
         case "$key" in
-            output|log|log_level|*_file|*-file) value="${value/#\~/$HOME}" ;;
+            output|archive_output|archive-output|log|log_level|*_file|*-file) value="${value/#\~/$HOME}" ;;
         esac
 
         case "$key" in
@@ -48,6 +48,8 @@ load_config() {
             to_password_file|to-password-file) [ ${#TO_PASSWORD_FILES[@]} -eq 0 ] && TO_PASSWORD_FILES+=("$value") ;;
             output) [ "$OUTPUT_DIR_SET" != true ] && OUTPUT_DIR="$value" ;;
             keep) [ "$KEEP_SET" != true ] && KEEP="$value" ;;
+            archive_output|archive-output) [ "$ARCHIVE_OUTPUT_SET" != true ] && ARCHIVE_OUTPUT="$value" ;;
+            archive_keep|archive-keep) [ "$ARCHIVE_KEEP_SET" != true ] && ARCHIVE_KEEP="$value" ;;
             from_keep|from-keep) [ "$FROM_KEEP_SET" != true ] && FROM_KEEP="$value" ;;
             from_stale|from-stale) [ "$FROM_STALE_SET" != true ] && FROM_STALE="$value" ;;
             compress) [ "$COMPRESS_SET" != true ] && COMPRESS="$value" ;;

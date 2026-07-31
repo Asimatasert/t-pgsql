@@ -61,15 +61,47 @@ cleanup_old_dumps() {
 
     if [ "$count" -gt "$KEEP" ]; then
         local del=$((count - KEEP))
-        log_info "Deleting $del old dump(s)..."
 
-        # list_dumps_for_base is newest-first; tail -n takes the oldest to delete.
-        list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name" | tail -n "$del" | \
-            while read f; do
-                rm -f "$f"
-                log_debug "Deleted: $f"
-            done
+        # list_dumps_for_base is newest-first; tail -n takes the oldest to delete/archive.
+        if [ -n "$ARCHIVE_OUTPUT" ]; then
+            log_info "Archiving $del old dump(s) to $ARCHIVE_OUTPUT..."
+            mkdir -p "$ARCHIVE_OUTPUT" 2>/dev/null
+            list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name" | tail -n "$del" | \
+                while read f; do
+                    mv -f "$f" "$ARCHIVE_OUTPUT/" 2>/dev/null
+                    [ -f "${f}.meta" ] && mv -f "${f}.meta" "$ARCHIVE_OUTPUT/" 2>/dev/null
+                    log_debug "Archived: $f -> $ARCHIVE_OUTPUT/"
+                done
+            cleanup_archive_dumps "$dump_base_name"
+        else
+            log_info "Deleting $del old dump(s)..."
+            list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name" | tail -n "$del" | \
+                while read f; do
+                    rm -f "$f" "${f}.meta"
+                    log_debug "Deleted: $f"
+                done
+        fi
     fi
+}
+
+# Enforce --archive-keep inside ARCHIVE_OUTPUT. Mirrors the simple keep-N
+# logic above, but always deletes (the archive tier is the last stop — there
+# is no third tier to fall back to).
+cleanup_archive_dumps() {
+    local dump_base_name="$1"
+    [ -z "$ARCHIVE_OUTPUT" ] && return 0
+    [ "$ARCHIVE_KEEP" -lt 0 ] && return 0  # -1 = keep everything ever archived
+
+    local count=$(list_dumps_for_base "$ARCHIVE_OUTPUT" "$dump_base_name" | wc -l | tr -d ' ')
+    [ "$count" -le "$ARCHIVE_KEEP" ] && return 0
+
+    local del=$((count - ARCHIVE_KEEP))
+    log_info "Deleting $del expired archived dump(s)..."
+    list_dumps_for_base "$ARCHIVE_OUTPUT" "$dump_base_name" | tail -n "$del" | \
+        while read f; do
+            rm -f "$f" "${f}.meta"
+            log_debug "Deleted (archive): $f"
+        done
 }
 
 # GFS (Grandfather-Father-Son) Retention Policy
@@ -157,7 +189,7 @@ $file"
     while read -r file; do
         [ -z "$file" ] && continue
         if ! printf '%s\n' "$keep_files" | grep -Fxq "$file"; then
-            rm -f "$file"
+            rm -f "$file" "${file}.meta"
             log_debug "Deleted: $(basename "$file")"
             deleted=$((deleted + 1))
         fi

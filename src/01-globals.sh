@@ -43,6 +43,13 @@ KEEP=-1
 FROM_KEEP=1  # 0=delete, N=keep last N, -1=keep all (default: 1)
 SKIP_IF_RECENT=""  # Skip if dump exists within timeframe (e.g., 24h, 12h, today)
 
+# Archive tier: when set, dumps aged out by --keep are MOVED here instead of
+# deleted (e.g. a cheaper/less redundant disk kept for extended history).
+ARCHIVE_OUTPUT=""
+ARCHIVE_OUTPUT_SET=false      # true once --archive-output given on CLI
+ARCHIVE_KEEP=-1               # keep last N dumps in ARCHIVE_OUTPUT (-1=keep all, 0=delete immediately)
+ARCHIVE_KEEP_SET=false        # true once --archive-keep given on CLI
+
 # Retention (GFS)
 RETENTION=false
 RETENTION_DAILY=7

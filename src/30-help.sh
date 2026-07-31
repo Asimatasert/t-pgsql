@@ -86,6 +86,11 @@ STORAGE:
                                   else <script dir>/../data/dumps)
     --dump-name <name>            Custom dump filename (without timestamp)
     --keep <N>                    Keep last N local dumps (-1=all, 0=none)
+    --archive-output <dir>        When a dump ages out of --keep, MOVE it here
+                                  instead of deleting it (e.g. a cheaper/less
+                                  redundant disk kept for extended history).
+    --archive-keep <N>            Keep last N dumps in --archive-output
+                                  (-1=keep all, 0=delete immediately; default: -1)
     --from-keep <N>               For SSH sources: how many dumps to keep in the remote
                                   /tmp staging dir (default: 1, -1=all, 0=delete)
     --from-stale <time>           With --from-keep 0: before dumping, purge this job's

@@ -21,7 +21,7 @@
 # ==============================================================================
 # VERSION & PATHS
 # ==============================================================================
-VERSION="3.11.1"
+VERSION="3.12.0"
 SCRIPT_NAME="t-pgsql"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -81,6 +81,13 @@ COMPRESS_SET=false            # true once --compress given on CLI
 KEEP=-1
 FROM_KEEP=1  # 0=delete, N=keep last N, -1=keep all (default: 1)
 SKIP_IF_RECENT=""  # Skip if dump exists within timeframe (e.g., 24h, 12h, today)
+
+# Archive tier: when set, dumps aged out by --keep are MOVED here instead of
+# deleted (e.g. a cheaper/less redundant disk kept for extended history).
+ARCHIVE_OUTPUT=""
+ARCHIVE_OUTPUT_SET=false      # true once --archive-output given on CLI
+ARCHIVE_KEEP=-1               # keep last N dumps in ARCHIVE_OUTPUT (-1=keep all, 0=delete immediately)
+ARCHIVE_KEEP_SET=false        # true once --archive-keep given on CLI
 
 # Retention (GFS)
 RETENTION=false
@@ -1096,6 +1103,11 @@ STORAGE:
                                   else <script dir>/../data/dumps)
     --dump-name <name>            Custom dump filename (without timestamp)
     --keep <N>                    Keep last N local dumps (-1=all, 0=none)
+    --archive-output <dir>        When a dump ages out of --keep, MOVE it here
+                                  instead of deleting it (e.g. a cheaper/less
+                                  redundant disk kept for extended history).
+    --archive-keep <N>            Keep last N dumps in --archive-output
+                                  (-1=keep all, 0=delete immediately; default: -1)
     --from-keep <N>               For SSH sources: how many dumps to keep in the remote
                                   /tmp staging dir (default: 1, -1=all, 0=delete)
     --from-stale <time>           With --from-keep 0: before dumping, purge this job's
@@ -1688,7 +1700,7 @@ load_config() {
         # or connection strings (a password that happens to start with ~ was being
         # silently rewritten into a home-dir path).
         case "$key" in
-            output|log|log_level|*_file|*-file) value="${value/#\~/$HOME}" ;;
+            output|archive_output|archive-output|log|log_level|*_file|*-file) value="${value/#\~/$HOME}" ;;
         esac
 
         case "$key" in
@@ -1702,6 +1714,8 @@ load_config() {
             to_password_file|to-password-file) [ ${#TO_PASSWORD_FILES[@]} -eq 0 ] && TO_PASSWORD_FILES+=("$value") ;;
             output) [ "$OUTPUT_DIR_SET" != true ] && OUTPUT_DIR="$value" ;;
             keep) [ "$KEEP_SET" != true ] && KEEP="$value" ;;
+            archive_output|archive-output) [ "$ARCHIVE_OUTPUT_SET" != true ] && ARCHIVE_OUTPUT="$value" ;;
+            archive_keep|archive-keep) [ "$ARCHIVE_KEEP_SET" != true ] && ARCHIVE_KEEP="$value" ;;
             from_keep|from-keep) [ "$FROM_KEEP_SET" != true ] && FROM_KEEP="$value" ;;
             from_stale|from-stale) [ "$FROM_STALE_SET" != true ] && FROM_STALE="$value" ;;
             compress) [ "$COMPRESS_SET" != true ] && COMPRESS="$value" ;;
@@ -4054,6 +4068,8 @@ parse_job_to_args() {
     [ -n "$(get_job_value "$job" "dump_name")" ] && args+=" --dump-name $(pq "$(get_job_value "$job" "dump_name")")"
     [ -n "$(get_job_value "$job" "keep")" ] && args+=" --keep $(pq "$(get_job_value "$job" "keep")")"
     [ -n "$(get_job_value "$job" "from_keep")" ] && args+=" --from-keep $(pq "$(get_job_value "$job" "from_keep")")"
+    [ -n "$(get_job_value "$job" "archive_output")" ] && args+=" --archive-output $(pq "$(get_job_value "$job" "archive_output")")"
+    [ -n "$(get_job_value "$job" "archive_keep")" ] && args+=" --archive-keep $(pq "$(get_job_value "$job" "archive_keep")")"
     [ -n "$(get_job_value "$job" "from_stale")" ] && args+=" --from-stale $(pq "$(get_job_value "$job" "from_stale")")"
     [ -n "$(get_job_value "$job" "skip_if_recent")" ] && args+=" --skip-if-recent $(pq "$(get_job_value "$job" "skip_if_recent")")"
 
@@ -5220,15 +5236,47 @@ cleanup_old_dumps() {
 
     if [ "$count" -gt "$KEEP" ]; then
         local del=$((count - KEEP))
-        log_info "Deleting $del old dump(s)..."
 
-        # list_dumps_for_base is newest-first; tail -n takes the oldest to delete.
-        list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name" | tail -n "$del" | \
-            while read f; do
-                rm -f "$f"
-                log_debug "Deleted: $f"
-            done
+        # list_dumps_for_base is newest-first; tail -n takes the oldest to delete/archive.
+        if [ -n "$ARCHIVE_OUTPUT" ]; then
+            log_info "Archiving $del old dump(s) to $ARCHIVE_OUTPUT..."
+            mkdir -p "$ARCHIVE_OUTPUT" 2>/dev/null
+            list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name" | tail -n "$del" | \
+                while read f; do
+                    mv -f "$f" "$ARCHIVE_OUTPUT/" 2>/dev/null
+                    [ -f "${f}.meta" ] && mv -f "${f}.meta" "$ARCHIVE_OUTPUT/" 2>/dev/null
+                    log_debug "Archived: $f -> $ARCHIVE_OUTPUT/"
+                done
+            cleanup_archive_dumps "$dump_base_name"
+        else
+            log_info "Deleting $del old dump(s)..."
+            list_dumps_for_base "$OUTPUT_DIR" "$dump_base_name" | tail -n "$del" | \
+                while read f; do
+                    rm -f "$f" "${f}.meta"
+                    log_debug "Deleted: $f"
+                done
+        fi
     fi
+}
+
+# Enforce --archive-keep inside ARCHIVE_OUTPUT. Mirrors the simple keep-N
+# logic above, but always deletes (the archive tier is the last stop — there
+# is no third tier to fall back to).
+cleanup_archive_dumps() {
+    local dump_base_name="$1"
+    [ -z "$ARCHIVE_OUTPUT" ] && return 0
+    [ "$ARCHIVE_KEEP" -lt 0 ] && return 0  # -1 = keep everything ever archived
+
+    local count=$(list_dumps_for_base "$ARCHIVE_OUTPUT" "$dump_base_name" | wc -l | tr -d ' ')
+    [ "$count" -le "$ARCHIVE_KEEP" ] && return 0
+
+    local del=$((count - ARCHIVE_KEEP))
+    log_info "Deleting $del expired archived dump(s)..."
+    list_dumps_for_base "$ARCHIVE_OUTPUT" "$dump_base_name" | tail -n "$del" | \
+        while read f; do
+            rm -f "$f" "${f}.meta"
+            log_debug "Deleted (archive): $f"
+        done
 }
 
 # GFS (Grandfather-Father-Son) Retention Policy
@@ -5316,7 +5364,7 @@ $file"
     while read -r file; do
         [ -z "$file" ] && continue
         if ! printf '%s\n' "$keep_files" | grep -Fxq "$file"; then
-            rm -f "$file"
+            rm -f "$file" "${file}.meta"
             log_debug "Deleted: $(basename "$file")"
             deleted=$((deleted + 1))
         fi
@@ -5421,6 +5469,8 @@ parse_args() {
             --output) OUTPUT_DIR="$2"; OUTPUT_DIR_SET=true; shift 2 || _need_val "$1" ;;
             --keep) KEEP="$2"; KEEP_SET=true; shift 2 || _need_val "$1" ;;
             --from-keep) FROM_KEEP="$2"; FROM_KEEP_SET=true; shift 2 || _need_val "$1" ;;
+            --archive-output) ARCHIVE_OUTPUT="$2"; ARCHIVE_OUTPUT_SET=true; shift 2 || _need_val "$1" ;;
+            --archive-keep) ARCHIVE_KEEP="$2"; ARCHIVE_KEEP_SET=true; shift 2 || _need_val "$1" ;;
             --from-stale) FROM_STALE="$2"; FROM_STALE_SET=true; shift 2 || _need_val "$1" ;;
             --dump-name) DUMP_NAME="$2"; shift 2 || _need_val "$1" ;;
             --skip-if-recent) SKIP_IF_RECENT="$2"; shift 2 || _need_val "$1" ;;

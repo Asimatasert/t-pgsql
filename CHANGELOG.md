@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.12.0] - 2026-07-31
+
+### Added
+- **Two-tier retention**: `--archive-output <dir>` / `--archive-keep <N>` (also settable
+  as `archive_output` / `archive_keep` in job YAML or a `--config` defaults file). When a
+  dump ages out of `--keep`, it is now MOVED to `--archive-output` instead of being
+  deleted, and a second `--archive-keep` cap prunes that archive dir once it's set
+  (-1=keep all, 0=delete immediately; default -1). Lets recent backups live on a
+  fast/redundant disk while older-but-still-wanted history moves to a second,
+  cheaper/less redundant disk instead of being lost outright.
+
+### Fixed
+- **Orphaned `.meta` files on cleanup**: `--keep`/GFS cleanup now also removes the
+  matching `.meta` sidecar when a dump is deleted (previously only the dump itself
+  was removed, leaving the metadata file behind).
+
 ## [3.9.0] - 2026-07-02
 
 Audit remediation release. Hardening and correctness fixes across the tool plus documentation and packaging version sync.

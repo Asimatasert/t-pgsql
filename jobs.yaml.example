@@ -99,6 +99,11 @@ jobs:
     output: /backups/daily
     keep: 7
     from_keep: 1
+    # Two-tier retention: keep the last 7 dumps on the fast/redundant disk above,
+    # then move older ones to a second (e.g. cheaper, non-redundant) disk and
+    # keep up to 23 more there (7 + 23 = 30 days of total history).
+    archive_output: /backups/archive
+    archive_keep: 23
 
   # Staging daily backup
   daily-staging-backup:

@@ -1064,6 +1064,8 @@ Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_pa
 |-----------|-------------|---------|----------|---------|
 | `--output <dir>` | Output directory for dumps | `<script dir>/../data/dumps` | No | `/backups/daily` |
 | `--keep <N>` | Number of local dumps to keep | `-1` (all) | No | `7`, `0` (delete), `-1` (all) |
+| `--archive-output <dir>` | When a dump ages out of `--keep`, move it here instead of deleting (a second, e.g. cheaper/less redundant, tier) | - | No | `/backups/archive` |
+| `--archive-keep <N>` | Number of dumps to keep in `--archive-output` | `-1` (all) | No | `23`, `0` (delete immediately), `-1` (all) |
 | `--from-keep <N>` | Number of dumps to keep on source | `1` | No | `3`, `0` (delete), `-1` (all) |
 | `--from-stale <time>` | With `--from-keep 0`: purge this job's leftover dumps older than `<time>` from the source staging dir before dumping (failed runs never reach the normal cleanup) | `72h` | No | `48h`, `2d`, `0` (off) |
 | `--dump-name <name>` | Custom dump filename (without timestamp) | Database name | No | `myapp-backup` |
