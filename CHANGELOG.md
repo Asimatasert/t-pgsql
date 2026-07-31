@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.12.1] - 2026-07-31
+
+### Fixed
+- **`--dry-run` silently ignored under `batch`**: `run_job()` re-execs each job as a
+  brand-new process built purely from the job's YAML args, so a `--dry-run` given on
+  the `batch` command line (e.g. `t-pgsql batch all --yaml prod --dry-run`) never
+  reached the child — it ran the dump for real. `--dry-run` is now forced into every
+  re-exec'd job when the parent process was invoked with it, regardless of what the
+  job's own YAML sets. Discovered via a live production test where a dry-run
+  triggered a real dump/transfer.
+
 ## [3.12.0] - 2026-07-31
 
 ### Added

@@ -257,6 +257,14 @@ run_job() {
     # (parse_job_to_args deliberately omits them); they travel via the environment below.
     local job_args=$(parse_job_to_args "$job_name")
 
+    # The job is re-exec'd below as a BRAND NEW process, so the parent's runtime
+    # --dry-run flag (only a shell variable in THIS process) would otherwise be lost —
+    # the child would run for real even though the operator asked for a dry run.
+    # Force it through unless the job's own yaml already set dry_run: true.
+    if [ "$DRY_RUN" = true ] && [[ "$job_args" != *"--dry-run"* ]]; then
+        job_args="$job_args --dry-run"
+    fi
+
     # Read inline passwords to hand to the child via the ENVIRONMENT (not argv, so they stay
     # off the child's process argv / ps). Empty values are treated as unset by get_password.
     local _pw_both _pw_from _pw_to
