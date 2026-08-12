@@ -98,10 +98,10 @@ cmd_clone() {
     if [ $r -eq 0 ]; then
         log_success "Clone complete"
         local details=$(build_notify_details "CLONE" "Success" "$total_elapsed")
-        send_notification "success" "Clone completed: ${FROM_DATABASE} → ${TO_DATABASE}" "$details"
+        send_notification "success" "Clone completed: ${dump_base_name} → ${TO_DATABASE}" "$details"
     else
         local details=$(build_notify_details "CLONE" "Failed" "$total_elapsed")
-        send_notification "failed" "Clone failed: ${FROM_DATABASE} → ${TO_DATABASE}" "$details"
+        send_notification "failed" "Clone failed: ${dump_base_name} → ${TO_DATABASE}" "$details"
         return 1
     fi
 }

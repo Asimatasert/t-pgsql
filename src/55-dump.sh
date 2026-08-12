@@ -286,7 +286,7 @@ cmd_dump() {
 
         # Send notification
         local details=$(build_notify_details "DUMP" "Success" "$elapsed" "$size")
-        send_notification "success" "Dump completed: ${FROM_DATABASE}" "$details"
+        send_notification "success" "Dump completed: ${dump_base_name}" "$details"
 
         echo "DUMP_FILE=$final_file"
         echo "DUMP_SIZE=$size"
@@ -300,7 +300,7 @@ cmd_dump() {
         # Send notification
         local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
         local details=$(build_notify_details "DUMP" "Failed" "$elapsed")
-        send_notification "failed" "Dump failed: ${FROM_DATABASE}" "$details"
+        send_notification "failed" "Dump failed: ${dump_base_name}" "$details"
 
         return 1
     fi
