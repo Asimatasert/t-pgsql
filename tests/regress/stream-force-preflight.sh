@@ -30,8 +30,11 @@ echo "ssh \$*" >> "$TMP/calls"
 script="\$(cat)"
 printf '%s\n' "\$script" >> "$TMP/remote_scripts"
 case "\$script" in *"-d srcdb"*) [ "\$SRC_DOWN" = 1 ] && exit 255 ;; esac
-case "\$script" in *pg_database*) echo 1 ;; esac
-case "\$script" in *"-d srcdb"*) echo 1 ;; esac
+case "\$script" in
+    *psql*"-d srcdb"*|*psql*pg_database*) echo 1 ;;
+    *psql*) ;;
+    *mktemp*) echo "/tmp/tpgfake.\$\$" ;;
+esac
 exit 0
 EOS
 chmod +x "$TMP/bin/"*

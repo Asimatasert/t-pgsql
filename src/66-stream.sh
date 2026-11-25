@@ -48,7 +48,7 @@ clone_stream() {
         log_info "Streaming: ${FROM_SSH_HOST:-$FROM_DB_HOST}/${FROM_DATABASE} → ${TO_SSH_HOST:-$TO_DB_HOST}/${TO_DATABASE}"
 
         # Track temp .pgpass files created for local commands so we can clean up.
-        local stream_from_pgpass="" stream_to_pgpass=""
+        local stream_from_pgpass="" stream_to_pgpass="" from_rpgpass="" to_rpgpass=""
 
         # Build pg_dump command
         local dump_cmd=""
@@ -57,7 +57,14 @@ clone_stream() {
             if [ "$SUDO" = true ]; then
                 from_rcmd="sudo -u $(pq "$FROM_DB_USER") pg_dump -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -Fc $exclude_opts $only_opts $(pq "$FROM_DATABASE")"
             else
-                from_rcmd="$(remote_pgpass_preamble "$FROM_DB_USER" "$FROM_DB_PASSWORD")pg_dump -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -Fc $exclude_opts $only_opts $(pq "$FROM_DATABASE")"
+                # The ssh command line carries the data stream on stdin/stdout, so it rides in
+                # argv: keep the password out of it by creating the remote .pgpass first (stdin).
+                if ! remote_pgpass_create "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$FROM_DB_USER" "$FROM_DB_PASSWORD"; then
+                    log_error "Could not create a credential file on the source host"
+                    _stream_release; result=1; idx=$((idx + 1)); continue
+                fi
+                from_rpgpass="$_RPGPASS_PATH"
+                from_rcmd="PGPASSFILE=$(pq "$from_rpgpass") pg_dump -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -Fc $exclude_opts $only_opts $(pq "$FROM_DATABASE")"
             fi
             dump_cmd="ssh -p $(pq "$FROM_SSH_PORT") ${SSH_OPTS[*]} $(pq "${FROM_SSH_USER}@${FROM_SSH_HOST}") $(shq "$from_rcmd")"
         else
@@ -71,7 +78,8 @@ clone_stream() {
         if [ "$FORCE" = true ]; then
             local _src_probe="SELECT 1" _src_ok=""
             if [ "$FROM_TYPE" = "ssh" ]; then
-                local _src_pre _src_uopt="-U $(pq "$FROM_DB_USER") "
+                local _src_pre _src_uopt
+                _src_uopt="-U $(pq "$FROM_DB_USER") "
                 if [ "$SUDO" = true ]; then
                     _src_pre="sudo -u $(pq "$FROM_DB_USER") "; _src_uopt=""
                 else
@@ -84,7 +92,7 @@ clone_stream() {
             fi
             if [ "$_src_ok" != "1" ]; then
                 log_error "Source database '$FROM_DATABASE' is not reachable; aborting before touching the target '$TO_DATABASE' (--force would have dropped it)"
-                [ -n "$stream_from_pgpass" ] && rm -f "$stream_from_pgpass"
+                _stream_release
                 result=1; idx=$((idx + 1)); continue
             fi
         fi
@@ -92,6 +100,12 @@ clone_stream() {
         # Build pg_restore command
         local restore_cmd=""
         if [ "$TO_TYPE" = "ssh" ]; then
+            # Credential file for the restore command (created over stdin; see above).
+            if ! remote_pgpass_create "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$TO_DB_USER" "$TO_DB_PASSWORD"; then
+                log_error "Could not create a credential file on the target host"
+                _stream_release; result=1; idx=$((idx + 1)); continue
+            fi
+            to_rpgpass="$_RPGPASS_PATH"
             # Prepare target database (password via remote PGPASSFILE, not argv)
             local prep_pre; prep_pre="$(remote_pgpass_preamble "$TO_DB_USER" "$TO_DB_PASSWORD")"
             # Refuse to stream into an existing DB without --force: pg_restore would
@@ -101,6 +115,7 @@ clone_stream() {
                 "${prep_pre}psql -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -tAc $(pq "$_st_check") postgres 2>/dev/null")
             if [ "$_st_exists" = "1" ] && [ "$FORCE" != true ]; then
                 log_error "Target database '$TO_DATABASE' already exists. Use --force (stream clone would duplicate its data)."
+                _stream_release
                 return 1
             fi
             local prep_cmd="$prep_pre"
@@ -114,11 +129,9 @@ clone_stream() {
             # stdin-free prep step: command (with pgpass preamble) via stdin, not argv.
             ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$prep_cmd"
 
-            # NOTE: the dump|restore data pipe below carries the DB stream on ssh stdin/stdout,
-            # so the command (with its pgpass preamble) must ride in argv here — the password
-            # is transiently visible to a local `ps` for the duration of the stream. All other
-            # ssh calls use ssh_exec to keep it out of argv.
-            local to_rcmd="$(remote_pgpass_preamble "$TO_DB_USER" "$TO_DB_PASSWORD")pg_restore --no-owner --no-privileges -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -d $(pq "$TO_DATABASE")"
+            # The dump|restore pipe carries the DB stream on ssh stdin/stdout, so this command
+            # rides in argv; it references only the pgpass file path, never the password.
+            local to_rcmd="PGPASSFILE=$(pq "$to_rpgpass") pg_restore --no-owner --no-privileges -U $(pq "$TO_DB_USER") -h $(pq "$TO_DB_HOST") -p $(pq "$TO_DB_PORT") -d $(pq "$TO_DATABASE")"
             restore_cmd="ssh -p $(pq "$TO_SSH_PORT") ${SSH_OPTS[*]} $(pq "${TO_SSH_USER}@${TO_SSH_HOST}") $(shq "$to_rcmd")"
         else
             # Prepare local target database (password via PGPASSFILE, not argv)
@@ -129,6 +142,7 @@ clone_stream() {
             if [ "$_st_exists" = "1" ] && [ "$FORCE" != true ]; then
                 log_error "Target database '$TO_DATABASE' already exists. Use --force (stream clone would duplicate its data)."
                 cleanup_local_pgpass
+                _stream_release
                 return 1
             fi
             if [ "$FORCE" = true ]; then
@@ -165,9 +179,8 @@ clone_stream() {
             result=1
         fi
 
-        # Remove any local temp .pgpass files created for this iteration.
-        [ -n "$stream_from_pgpass" ] && rm -f "$stream_from_pgpass"
-        [ -n "$stream_to_pgpass" ] && rm -f "$stream_to_pgpass"
+        # Remove the temp .pgpass files (local and remote) created for this iteration.
+        _stream_release
 
         idx=$((idx + 1))
     done
@@ -188,3 +201,13 @@ clone_stream() {
     return $result
 }
 
+# Remove the per-target credential files of the running clone_stream iteration (local temp
+# files and remote .pgpass files). Reads clone_stream's locals through bash dynamic scope.
+_stream_release() {
+    [ -n "$stream_from_pgpass" ] && rm -f "$stream_from_pgpass"
+    [ -n "$stream_to_pgpass" ] && rm -f "$stream_to_pgpass"
+    [ -n "$from_rpgpass" ] && remote_pgpass_remove "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$from_rpgpass"
+    [ -n "$to_rpgpass" ] && remote_pgpass_remove "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$to_rpgpass"
+    stream_from_pgpass=""; stream_to_pgpass=""; from_rpgpass=""; to_rpgpass=""
+    return 0
+}

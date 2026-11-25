@@ -36,12 +36,19 @@ apply_masking() {
                 ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" \
                     "${pre}psql $flags -U $(pq "$user") -h $(pq "$host") -p $(pq "$port") -d $(pq "$database") -c $(pq "$sql")" 2>/dev/null
             else
-                # Batch: SQL is piped on ssh stdin (per-statement autocommit), so the command
-                # with its pgpass preamble must ride in argv here — transiently visible to `ps`.
+                # Batch: the SQL is piped on ssh stdin (per-statement autocommit), so the
+                # command rides in argv. The password must not: write the remote .pgpass first
+                # (over stdin, via ssh_exec) and reference only PGPASSFILE=<path> here.
                 # ON_ERROR_STOP=1 makes psql exit nonzero on a failed masking statement so the
                 # caller fails loudly instead of shipping unmasked data as success.
+                local _rp _rc
+                remote_pgpass_create "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$user" "$password" || return 1
+                _rp="$_RPGPASS_PATH"
                 printf '%s' "$sql" | ssh -p "$TO_SSH_PORT" "${SSH_OPTS[@]}" "${TO_SSH_USER}@${TO_SSH_HOST}" \
-                    "${pre}psql -v ON_ERROR_STOP=1 -U $(pq "$user") -h $(pq "$host") -p $(pq "$port") -d $(pq "$database")" 2>/dev/null
+                    "PGPASSFILE=$(pq "$_rp") psql -v ON_ERROR_STOP=1 -U $(pq "$user") -h $(pq "$host") -p $(pq "$port") -d $(pq "$database")" 2>/dev/null
+                _rc=$?
+                remote_pgpass_remove "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$_rp"
+                return $_rc
             fi
         else
             if [ -n "$flags" ]; then

@@ -51,9 +51,9 @@ pgpass_escape() {
 _redact_variants() {
     local -A seen=()
     local -a cur=("$1") next=()
-    local d v t sq="'" i j tmp
+    local v t sq="'" i j tmp
     seen["$1"]=1
-    for d in 1 2 3; do
+    for _ in 1 2 3; do
         next=()
         for v in "${cur[@]}"; do
             t="${v//\\/\\\\}"; t="${t//:/\\:}"                 # .pgpass escaping
@@ -120,7 +120,19 @@ make_pgpass_file() {
 # decompressed dumps. install_cleanup_trap (called from main) wires the trap.
 _TMP_TO_CLEAN=()
 reg_tmp() { [ -n "$1" ] && _TMP_TO_CLEAN+=("$1"); }
-run_tmp_cleanup() { local p; for p in "${_TMP_TO_CLEAN[@]}"; do rm -rf "$p" 2>/dev/null; done; _TMP_TO_CLEAN=(); }
+# Remote credential files (port<TAB>dest<TAB>path) created by remote_pgpass_create and not
+# yet removed; the exit/signal cleanup removes them over ssh.
+_REMOTE_TMP_TO_CLEAN=()
+run_tmp_cleanup() {
+    local p e port dest path
+    for p in "${_TMP_TO_CLEAN[@]}"; do rm -rf "$p" 2>/dev/null; done; _TMP_TO_CLEAN=()
+    local -a pending=("${_REMOTE_TMP_TO_CLEAN[@]}")
+    _REMOTE_TMP_TO_CLEAN=()
+    for e in "${pending[@]}"; do
+        IFS=$'\t' read -r port dest path <<< "$e"
+        ssh_exec "$port" "$dest" "rm -f $(pq "$path")" >/dev/null 2>&1 </dev/null
+    done
+}
 # INT/TERM must clean up AND stop the script: a handler that only cleaned up let the run
 # continue (compress, metadata, notifications) with its credential files already deleted.
 # \`exit\` fires the EXIT trap, which performs the cleanup exactly once.
@@ -143,8 +155,8 @@ cleanup_local_pgpass() {
 # remote_pgpass_preamble — into the LOCAL process argv (where another local user's `ps`
 # could read it). The command is fed to the remote shell via stdin instead. Use this for
 # any ssh call whose own stdin is otherwise unused; sites that pipe data through ssh
-# stdin (stream, globals-apply, masking batch) cannot use it and keep the secret only
-# transiently in argv. Returns the remote command's exit status; stdout/stderr pass
+# stdin (stream, masking batch) create the remote .pgpass first with remote_pgpass_create
+# and pass only PGPASSFILE=<path> in argv. Returns the remote command's exit status; stdout/stderr pass
 # through so `out=$(ssh_exec ...)` and redirections on the call still work.
 # Usage: ssh_exec <port> <user@host> <command> [extra ssh options...]
 # The remote command is executed by bash when the remote has it, else /bin/sh. bash is
@@ -170,5 +182,40 @@ remote_pgpass_preamble() {
     line=$(shq "*:*:*:$(pgpass_escape "$1"):$(pgpass_escape "$2")")
     printf '%s' \
 'PGPASSFILE=$(umask 077; mktemp 2>/dev/null || { f="/tmp/.tpg.$$"; :>"$f"; echo "$f"; }); export PGPASSFILE; chmod 600 "$PGPASSFILE"; printf '"'"'%s\n'"'"' '"$line"' >"$PGPASSFILE"; trap '"'"'rm -f "$PGPASSFILE"'"'"' EXIT; '
+}
+
+# Create a 600-mode .pgpass on a remote host and return its path in _RPGPASS_PATH, WITHOUT the password ever
+# appearing in a local or remote argv: the script that writes the file travels on ssh stdin
+# (via ssh_exec). Callers that must keep stdin free for a data stream (stream clone, masking
+# batch) then reference only `PGPASSFILE=<path>` in their ssh command line and remove the
+# file with remote_pgpass_remove. The file is also removed by run_tmp_cleanup if the
+# caller never gets to (interrupt, early exit).
+# The path is a global (not stdout) so the registration for run_tmp_cleanup survives: a
+# $(...) capture would run this in a subshell and lose it.
+# Usage: remote_pgpass_create <ssh_port> <user@host> <db_user> <db_password>
+_RPGPASS_PATH=""
+remote_pgpass_create() {
+    local port="$1" dest="$2" line out path
+    _RPGPASS_PATH=""
+    line=$(shq "*:*:*:$(pgpass_escape "$3"):$(pgpass_escape "$4")")
+    out=$(ssh_exec "$port" "$dest" \
+'f=$(umask 077; mktemp 2>/dev/null || { f="/tmp/.tpg.$$"; :>"$f"; echo "$f"; }) || exit 1; chmod 600 "$f" || { rm -f "$f"; exit 1; }; printf '"'"'%s\n'"'"' '"$line"' >"$f" || { rm -f "$f"; exit 1; }; printf '"'"'%s\n'"'"' "$f"' 2>/dev/null) || return 1
+    path="${out##*$'\n'}"
+    # Only accept a plain absolute path; anything else could not be removed safely.
+    [[ "$path" =~ ^/[A-Za-z0-9._/+-]+$ ]] || return 1
+    _REMOTE_TMP_TO_CLEAN+=("$port"$'\t'"$dest"$'\t'"$path")
+    _RPGPASS_PATH="$path"
+}
+
+# Remove a remote file made by remote_pgpass_create (and forget it).
+# Usage: remote_pgpass_remove <ssh_port> <user@host> <path>
+remote_pgpass_remove() {
+    local port="$1" dest="$2" path="$3" e kept=()
+    [ -z "$path" ] && return 0
+    for e in "${_REMOTE_TMP_TO_CLEAN[@]}"; do
+        [ "$e" = "$port"$'\t'"$dest"$'\t'"$path" ] || kept+=("$e")
+    done
+    _REMOTE_TMP_TO_CLEAN=("${kept[@]}")
+    ssh_exec "$port" "$dest" "rm -f $(pq "$path")" >/dev/null 2>&1 </dev/null
 }
 
