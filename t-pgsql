@@ -369,8 +369,11 @@ make_pgpass_file() {
 # decompressed dumps. install_cleanup_trap (called from main) wires the trap.
 _TMP_TO_CLEAN=()
 reg_tmp() { [ -n "$1" ] && _TMP_TO_CLEAN+=("$1"); }
-run_tmp_cleanup() { local p; for p in "${_TMP_TO_CLEAN[@]}"; do rm -rf "$p" 2>/dev/null; done; }
-install_cleanup_trap() { trap 'run_tmp_cleanup' EXIT INT TERM; }
+run_tmp_cleanup() { local p; for p in "${_TMP_TO_CLEAN[@]}"; do rm -rf "$p" 2>/dev/null; done; _TMP_TO_CLEAN=(); }
+# INT/TERM must clean up AND stop the script: a handler that only cleaned up let the run
+# continue (compress, metadata, notifications) with its credential files already deleted.
+# \`exit\` fires the EXIT trap, which performs the cleanup exactly once.
+install_cleanup_trap() { trap 'run_tmp_cleanup' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; }
 
 _PGPASS_TMP=""
 setup_local_pgpass() {
