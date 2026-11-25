@@ -18,15 +18,17 @@ if [ ! -x "$ROOT/scripts/release.sh" ] || [ ! -x "$ROOT/scripts/check-version.sh
     exit 1
 fi
 
-git clone -q --no-hardlinks "$ROOT" "$T/repo" || { nok "clone"; exit 1; }
+mkdir -p "$T/repo"
+# Copy the working tree (no .git, no nested worktrees): independent of clone depth.
+tar -cf - --exclude=.git --exclude=.worktrees -C "$ROOT" . | tar -xf - -C "$T/repo" || { nok "copy tree"; exit 1; }
 cd "$T/repo" || exit 1
-git config user.email test@example.com
+git init -q . || { nok "git init"; exit 1; }
+# Local test identity, set in this temp repository only.
 git config user.name test
-# use the working-tree copies of the files under test (they may be uncommitted)
-mkdir -p scripts
-cp "$ROOT/scripts/release.sh" "$ROOT/scripts/check-version.sh" scripts/
-cp "$ROOT/Makefile" "$ROOT/install.sh" .
+git config user.email test@example.com
+git config commit.gpgsign false
 git add -A
+git commit -q -m "test fixture: initial tree" || { nok "initial commit"; exit 1; }
 
 # Make the clone's stale doc-owned places consistent first (the documentation
 # branch fixes these in the real tree), so this test isolates the scripts.
@@ -44,6 +46,7 @@ check "release.sh refuses a bad version" bash -c '! bash scripts/release.sh bana
 check "release.sh refuses the current version" bash -c "! bash scripts/release.sh $CUR >/dev/null 2>&1"
 
 # real run
+HEAD_BEFORE="$(git rev-parse HEAD)"
 check "release.sh 9.9.9 succeeds" bash scripts/release.sh 9.9.9 >"$T/rel.out" 2>&1
 check "check-version agrees on 9.9.9 afterwards" bash scripts/check-version.sh 9.9.9
 check "src header stamped" grep -q '^VERSION="9.9.9"' src/00-header.sh
@@ -53,7 +56,7 @@ check "debian/changelog keeps the previous entry" grep -q "^t-pgsql ($CUR-1) uns
 check "PKGBUILD pkgver stamped" grep -q '^pkgver=9.9.9$' arch/PKGBUILD
 check ".SRCINFO source URL stamped" grep -q 'source = t-pgsql-9.9.9.tar.gz::.*/tags/v9.9.9.tar.gz' arch/.SRCINFO
 check "Formula url stamped" grep -q '/tags/v9.9.9.tar.gz' Formula/t-pgsql.rb
-check "release.sh did not commit" test "$(git log --oneline | wc -l | tr -d ' ')" = "$(git rev-list --count HEAD | tr -d ' ')"
+check "release.sh did not commit" test "$(git rev-parse HEAD)" = "$HEAD_BEFORE"
 check "release.sh did not tag" test -z "$(git tag --points-at HEAD)"
 
 # disagreement is detected
