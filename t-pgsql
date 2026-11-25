@@ -2042,40 +2042,68 @@ remote_dump_match_re() {
     printf '%s%s' "$esc" '_[0-9]{8}_[0-9]{6}(_[0-9]+)?\.dump(\.zst|\.xz|\.bz2)?$'
 }
 
-# Confirm a freshly created dump is non-empty and readable for its format
-# before any rotation removes older dumps. A missing validation tool only
-# produces a warning (the non-empty check still applies).
+# Confirm a freshly created dump is usable before any rotation removes older
+# dumps. Invalid means: empty, missing the PGDMP magic bytes, or failing the
+# compression stream test. A plain .dump that the LOCAL pg_restore cannot list
+# is still valid: an older client cannot read archives written by a newer
+# pg_dump, which is normal for dumps taken on a remote host. A missing tool only
+# produces a warning.
 verify_dump_integrity() {
-    local f="$1" tool=""
+    local f="$1" name; name=$(basename "$f")
     if [ ! -s "$f" ]; then
-        log_error "Integrity check failed: $f is missing or empty"
+        log_error "Integrity check failed: $name is missing or empty"
         return 1
     fi
+    local dec="" tool=""
     case "$f" in
-        *.tar.gz)   tool=tar ;;
-        *.dump.zst) tool=zstd ;;
-        *.dump.xz)  tool=xz ;;
-        *.dump.bz2) tool=bzip2 ;;
-        *.dump)     tool=pg_restore ;;
+        *.tar.gz)
+            if command -v tar >/dev/null 2>&1 && ! tar -tzf "$f" >/dev/null 2>&1; then
+                log_error "Integrity check failed: $name is not a readable tar.gz archive"
+                return 1
+            fi
+            return 0 ;;
+        *.dump.zst) tool=zstd;  dec="zstd -dc" ;;
+        *.dump.xz)  tool=xz;    dec="xz -dc" ;;
+        *.dump.bz2) tool=bzip2; dec="bzip2 -dc" ;;
+        *.dump)     tool="" ;;
         *) return 0 ;;
     esac
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        log_warn "Cannot verify $(basename "$f"): '$tool' not found; skipping readability check"
-        return 0
+
+    local magic
+    if [ -n "$tool" ]; then
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            log_warn "Cannot verify $name: '$tool' not found; skipping readability check"
+            return 0
+        fi
+        if ! "$tool" -t "$f" >/dev/null 2>&1; then
+            log_error "Integrity check failed: $name failed the $tool stream test"
+            return 1
+        fi
+        # First 5 bytes through the decompressor only (cheap, stops early).
+        magic=$($dec "$f" 2>/dev/null | head -c 5)
+    else
+        magic=$(head -c 5 "$f" 2>/dev/null)
     fi
-    local ok=false
-    case "$tool" in
-        tar)        tar -tzf "$f" >/dev/null 2>&1 && ok=true ;;
-        zstd)       zstd -t -q "$f" >/dev/null 2>&1 && ok=true ;;
-        xz)         xz -t "$f" >/dev/null 2>&1 && ok=true ;;
-        bzip2)      bzip2 -t "$f" >/dev/null 2>&1 && ok=true ;;
-        pg_restore) pg_restore -l "$f" >/dev/null 2>&1 && ok=true ;;
-    esac
-    if [ "$ok" != true ]; then
-        log_error "Integrity check failed: $(basename "$f") is not a readable archive"
+    if [ "$magic" != "PGDMP" ]; then
+        log_error "Integrity check failed: $name does not look like a PostgreSQL custom-format archive (missing PGDMP header)"
         return 1
     fi
+
+    if [ -z "$tool" ] && command -v pg_restore >/dev/null 2>&1 && ! pg_restore -l "$f" >/dev/null 2>&1; then
+        log_warn "$name could not be listed by the local pg_restore (probably a newer server version); treating it as valid"
+    fi
     return 0
+}
+
+# Set the new dump aside so no dump pattern (keep-N, retention, restore, fetch,
+# list) matches it any more. It is not deleted. Usage: quarantine_dump FILE
+quarantine_dump() {
+    local f="$1"
+    if [ -e "$f" ] && mv -f "$f" "${f}.invalid" 2>/dev/null; then
+        log_error "The unusable dump was kept as ${f}.invalid; older dumps were not rotated"
+    else
+        log_error "Older dumps were not rotated"
+    fi
 }
 
 cmd_dump() {
@@ -2215,6 +2243,7 @@ cmd_dump() {
     esac
 
     local result=0
+    local integrity_checked=""
     local remote_compressed=false comp_ext=""
 
     if [ "$FROM_TYPE" = "ssh" ]; then
@@ -2323,7 +2352,10 @@ cmd_dump() {
             # Never delete older source dumps (or the source copy) unless the
             # copy we just received is readable.
             if [ $result -eq 0 ] && [ "$FROM_KEEP" -ge 0 ]; then
-                if ! verify_dump_integrity "$dump_file"; then
+                if verify_dump_integrity "$dump_file"; then
+                    integrity_checked="$dump_file"
+                else
+                    quarantine_dump "$dump_file"
                     log_error "Keeping existing dumps on the source"
                     result=1
                 fi
@@ -2374,12 +2406,11 @@ cmd_dump() {
             fi
         fi
 
-        # Make sure the new dump is readable BEFORE it is wrapped in metadata or
-        # any rotation removes older dumps; a truncated or corrupt dump must not
-        # replace the good ones.
-        if ! verify_dump_integrity "$dump_file"; then
-            log_error "Keeping older dumps; removing the unreadable new dump"
-            rm -f "$dump_file" 2>/dev/null
+        # Make sure the new dump is usable BEFORE it is wrapped in metadata or
+        # any rotation removes older dumps. Skipped when this very file was
+        # already verified before source-side rotation (once per run).
+        if [ "$integrity_checked" != "$dump_file" ] && ! verify_dump_integrity "$dump_file"; then
+            quarantine_dump "$dump_file"
             local _ve; _ve=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
             send_notification "failed" "Dump failed: ${dump_base_name}" "$(build_notify_details "DUMP" "Failed" "$_ve")"
             return 1
