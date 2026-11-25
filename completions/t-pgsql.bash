@@ -13,15 +13,17 @@ _t_pgsql() {
         --config
         --exclude-table --exclude-schema --exclude-data
         --only-table --only-schema
-        --compress --compress-level --pg-compress-level
-        --output --dump-name --keep --from-keep --skip-if-recent
+        --compress --compress-level --pg-compress-level --compress-where
+        --output --dump-name --keep --from-keep --from-stale --skip-if-recent
+        --archive-output --archive-keep
         --from-file --file --yaml
         --retention --retention-daily --retention-weekly --retention-monthly --retention-yearly
         --health-check --health-check-after --no-health-check --health-check-fail
         --notify --notify-on-error --notify-summary
         --mask --mask-rules --mask-tables
         --stream --stream-buffer
-        --sudo --globals --pg-bindir --parallel --continue-on-error
+        --token --cooldown
+        --sudo --globals --pg-bindir --bwlimit --retries --parallel --continue-on-error
         --only-jobs --exclude-jobs --only --exclude
         --save --batch
         --log --log-level
@@ -50,8 +52,16 @@ _t_pgsql() {
             COMPREPLY=($(compgen -W "1 2 3 4 5 6 7 8 9" -- "$cur"))
             return
             ;;
+        --compress-where)
+            COMPREPLY=($(compgen -W "source target" -- "$cur"))
+            return
+            ;;
         --password-file|--from-password-file|--to-password-file|--config|--mask-rules|--log|--file|--from-file)
             _filedir
+            return
+            ;;
+        --archive-output|--pg-bindir)
+            _filedir -d
             return
             ;;
         --yaml)
@@ -85,6 +95,12 @@ _t_pgsql() {
             return
             ;;
     esac
+
+    # Explain topics
+    if [[ ${words[1]} == "explain" && $cword -eq 2 && $cur != -* ]]; then
+        COMPREPLY=($(compgen -W "dump restore clone stream upgrade fetch batch jobs bot list meta clean doctor masking retention" -- "$cur"))
+        return
+    fi
 
     # Jobs subcommands
     if [[ ${words[1]} == "jobs" && $cword -eq 2 ]]; then

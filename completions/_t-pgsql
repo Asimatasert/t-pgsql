@@ -43,6 +43,14 @@ _t-pgsql() {
                 return
             fi
 
+            # explain topic completion (position right after "explain")
+            if [[ $words[2] == explain && $CURRENT -eq 3 ]]; then
+                local -a explain_topics
+                explain_topics=(dump restore clone stream upgrade fetch batch jobs bot list meta clean doctor masking retention)
+                _describe -t explain-topics 'topic' explain_topics
+                return
+            fi
+
             _arguments -s \
                 '--from[Source connection]:connection:' \
                 '--to[Target connection]:connection:' \
@@ -61,10 +69,14 @@ _t-pgsql() {
                 '--compress[Compression type]:type:(gzip zstd xz bzip2 none)' \
                 '--compress-level[Compression level 1-9]:level:(1 2 3 4 5 6 7 8 9)' \
                 '--pg-compress-level[pg_dump compression 0-9]:level:(0 1 2 3 4 5 6 7 8 9)' \
+                '--compress-where[Where to compress SSH dumps]:where:(source target)' \
                 '--output[Output directory]:dir:_files -/' \
                 '--dump-name[Custom dump filename]:name:' \
                 '--keep[Keep N local dumps]:count:' \
                 '--from-keep[Keep N on source]:count:' \
+                '--from-stale[Purge stale remote dumps older than]:time:' \
+                '--archive-output[Move aged-out dumps here]:dir:_files -/' \
+                '--archive-keep[Keep N dumps in archive]:count:' \
                 '--skip-if-recent[Skip if recent dump exists]:time:(today 24h 12h 6h 1d)' \
                 '--from-file[Fetch existing dump]:pattern:' \
                 '--yaml[Custom YAML file]:yaml:_files -g "*.yaml"' \
@@ -88,6 +100,10 @@ _t-pgsql() {
                 '--sudo[Use sudo]' \
                 '--globals[Also migrate roles/tablespaces]' \
                 '--pg-bindir[PostgreSQL client bin dir]:dir:_files -/' \
+                '--bwlimit[Cap transfer bandwidth]:rate:' \
+                '--retries[Retry failed scp transfers]:count:' \
+                '--token[Telegram bot token]:token:' \
+                '--cooldown[Bot cooldown between backups]:time:' \
                 '--parallel[Parallel jobs]:count:' \
                 '--continue-on-error[Continue on error]' \
                 '--only-jobs[Only run these batch jobs]:jobs:' \
