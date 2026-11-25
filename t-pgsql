@@ -6128,6 +6128,17 @@ parse_args() {
 # MAIN
 # ==============================================================================
 main() {
+    # Dumps, archives, logs and job files hold database contents and credentials, so
+    # everything this tool creates is private (0600/0700) by default. Setups that share
+    # dumps through group permissions can relax it with T_PGSQL_UMASK (e.g. 027 or 007).
+    local _umask="${T_PGSQL_UMASK:-077}"
+    if [[ "$_umask" =~ ^0?[0-7]{3}$ ]]; then
+        umask "$_umask"
+    else
+        umask 077
+        log_warn "Ignoring invalid T_PGSQL_UMASK '$_umask' (expected an octal mask such as 077 or 027)"
+    fi
+
     install_cleanup_trap
     parse_args "$@"
 
