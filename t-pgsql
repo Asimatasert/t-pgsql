@@ -577,8 +577,10 @@ send_notification() {
     local details="$3"     # Additional details (optional)
 
     [ ${#NOTIFY[@]} -eq 0 ] && return 0
-    [ "$QUIET" = true ] && return 0
-
+    # --quiet only reduces console output and success notifications; a failure is always sent.
+    if [ "$QUIET" = true ] && [ "$status" != "failed" ] && [ "$status" != "error" ]; then
+        return 0
+    fi
     # Only notify on error if --notify-on-error is set
     if [ "$NOTIFY_ON_ERROR" = true ] && [ "$status" = "success" ]; then
         return 0
