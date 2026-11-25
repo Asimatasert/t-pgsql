@@ -18,9 +18,10 @@ cat > "$TMP/bin/pg_dump" <<'EOF'
 #!/bin/sh
 f=""
 while [ $# -gt 0 ]; do [ "$1" = "-f" ] && f="$2"; shift; done
-printf 'fake dump\n' >> "$f"
+printf 'PGDMP\nfake dump\n' >> "$f"
 EOF
 chmod +x "$TMP/bin/psql" "$TMP/bin/pg_dump"
+. "$ROOT/tests/regress/lib/fakes.sh"; fake_pg_tools "$TMP/bin"
 export PATH="$TMP/bin:$PATH"
 
 cat > "$TMP/jobs.yaml" <<EOF

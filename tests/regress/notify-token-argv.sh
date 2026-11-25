@@ -19,7 +19,7 @@ cat > "$TMP/bin/pg_dump" <<'EOF'
 #!/bin/sh
 f=""
 while [ $# -gt 0 ]; do [ "$1" = "-f" ] && f="$2"; shift; done
-printf 'fake dump\n' >> "$f"
+printf 'PGDMP\nfake dump\n' >> "$f"
 ps -axww -o args= > "$REC/ps.$$" 2>/dev/null
 env > "$REC/env.$$"
 EOF
@@ -32,6 +32,7 @@ if [ ! -t 0 ]; then cat > "$REC/curl.$n.stdin"; fi
 printf '{"ok":true}\n'
 EOF
 chmod +x "$TMP/bin/psql" "$TMP/bin/pg_dump" "$TMP/bin/curl"
+. "$ROOT/tests/regress/lib/fakes.sh"; fake_pg_tools "$TMP/bin"
 export PATH="$TMP/bin:$PATH" REC="$TMP/rec"
 
 TOKEN="424242:SECRETTOKENVALUE"

@@ -29,6 +29,7 @@ else
 fi
 EOF
 chmod +x "$TMP/bin/psql" "$TMP/bin/pg_dump" "$TMP/bin/curl"
+. "$ROOT/tests/regress/lib/fakes.sh"; fake_pg_tools "$TMP/bin"
 export PATH="$TMP/bin:$PATH" REC="$TMP/rec"
 
 run_failing_dump() { # $1 = yaml file name, $2 = job name

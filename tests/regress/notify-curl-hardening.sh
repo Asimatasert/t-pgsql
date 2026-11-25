@@ -18,7 +18,7 @@ cat > "$TMP/bin/pg_dump" <<'EOF'
 #!/bin/sh
 f=""
 while [ $# -gt 0 ]; do [ "$1" = "-f" ] && f="$2"; shift; done
-printf 'fake dump\n' >> "$f"
+printf 'PGDMP\nfake dump\n' >> "$f"
 EOF
 # Fake curl: records argv and stdin. CURL_MODE=fail makes webhook/slack calls exit 22 and
 # Telegram answer {"ok":false}. A call counter bounds it; it never loops or sleeps.
@@ -35,6 +35,7 @@ if [ "$CURL_MODE" = fail ]; then echo "curl: (22) The requested URL returned err
 printf 'ok\n'
 EOF
 chmod +x "$TMP/bin/psql" "$TMP/bin/pg_dump" "$TMP/bin/curl"
+. "$ROOT/tests/regress/lib/fakes.sh"; fake_pg_tools "$TMP/bin"
 export PATH="$TMP/bin:$PATH" REC="$TMP/rec"
 
 run_dump() { # extra args = --notify options; output in $TMP/run.out, rc in $RC

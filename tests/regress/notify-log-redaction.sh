@@ -18,10 +18,11 @@ cat > "$TMP/bin/pg_dump" <<'EOF'
 #!/bin/sh
 f=""
 while [ $# -gt 0 ]; do [ "$1" = "-f" ] && f="$2"; shift; done
-printf 'fake dump\n' >> "$f"
+printf 'PGDMP\nfake dump\n' >> "$f"
 EOF
 printf '#!/bin/sh\ncat >/dev/null 2>&1 </dev/null\nprintf "{\\"ok\\":true}\\n"\n' > "$TMP/bin/curl"
 chmod +x "$TMP/bin/psql" "$TMP/bin/pg_dump" "$TMP/bin/curl"
+. "$ROOT/tests/regress/lib/fakes.sh"; fake_pg_tools "$TMP/bin"
 export PATH="$TMP/bin:$PATH"
 
 # 1. Misspelled channel name: the warning must not print the token.

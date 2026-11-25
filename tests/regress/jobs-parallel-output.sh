@@ -20,9 +20,10 @@ cat > "$TMP/bin/pg_dump" <<'EOF'
 f=""; last=""
 while [ $# -gt 0 ]; do [ "$1" = "-f" ] && f="$2"; last="$1"; shift; done
 case "$last" in fail*) echo "FAKE-PGDUMP-ERROR connection refused for $last" >&2; exit 1 ;; esac
-printf 'fake dump\n' >> "$f"
+printf 'PGDMP\nfake dump\n' >> "$f"
 EOF
 chmod +x "$TMP/bin/psql" "$TMP/bin/pg_dump"
+. "$ROOT/tests/regress/lib/fakes.sh"; fake_pg_tools "$TMP/bin"
 export PATH="$TMP/bin:$PATH"
 
 mkjob() { # name db
