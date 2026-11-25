@@ -62,6 +62,7 @@ if [ "$method" = getUpdates ]; then
             cat "$FAKE_DIR/head.json" 2>/dev/null || echo '{"ok":true,"result":[]}'; exit 0 ;;
     esac
     n=$(cat "$FAKE_DIR/n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_DIR/n"
+    [ "$n" = 2 ] && : > "$FAKE_DIR/ready"
     if [ "$n" = 1 ]; then cat "$FAKE_DIR/updates.json"; else echo '{"ok":true,"result":[]}'; fi
     if [ "$n" -ge "$(cat "$FAKE_DIR/maxpoll" 2>/dev/null || echo 3)" ]; then
         : > "$FAKE_DIR/done"
@@ -131,3 +132,37 @@ run_bot() {
     sleep 0.3
 }
 started() { grep -c 'Starting backup' "$FAKE/curl.log"; }
+
+# run_bot_signal <TERM|INT>: starts the bot, waits until it is polling, sends the signal to
+# the bot process and prints the bot's exit status (bounded: python3 gives up after 20 s and
+# kills the bot). The bot is started with SIGINT at its default disposition, as from a terminal.
+cat > "$TMP/sigrun.py" <<'EOF2'
+import os, signal, subprocess, sys, time
+sig = getattr(signal, "SIG" + sys.argv[1])
+ready = sys.argv[2]
+out = open(os.environ["FAKE_DIR"] + "/../bot.out", "w")
+p = subprocess.Popen(sys.argv[3:], stdout=out, stderr=subprocess.STDOUT,
+                     preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+for _ in range(150):
+    if os.path.exists(ready) or p.poll() is not None:
+        break
+    time.sleep(0.2)
+pid = int(open(os.environ["FAKE_DIR"] + "/botpid").read())
+os.kill(pid, sig)
+try:
+    rc = p.wait(20)
+except subprocess.TimeoutExpired:
+    os.kill(pid, signal.SIGKILL)
+    rc = p.wait()
+print(rc)
+EOF2
+run_bot_signal() {
+    local sig="$1"
+    printf '{"ok":true,"result":[]}' > "$FAKE/updates.json"
+    echo 1000 > "$FAKE/maxpoll"
+    rm -f "$FAKE/done" "$FAKE/n" "$FAKE/m" "$FAKE/ready" "$FAKE/botpid"; : > "$FAKE/curl.log"
+    ( cd "$TMP" && exec $TIMEOUT_CMD env PATH="$FAKEBIN:$PATH" FAKE_DIR="$FAKE" HOME="$TMP/home" \
+        TMPDIR="$TMP/tmp" XDG_STATE_HOME="$TMP/state" BASH_BIN="${BASH:-bash}" APP="$APP" \
+        YAML_ARG="${YAML_ARG:-jobs}" python3 "$TMP/sigrun.py" "$sig" "$FAKE/ready" sh "$TMP/launch.sh" )
+    rm -f "$FAKE/maxpoll"
+}

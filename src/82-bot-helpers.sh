@@ -185,7 +185,12 @@ bot_run_backup() {
         local start_time=$(date +%s)
         # Unique per-run temp log (a fixed /tmp path was symlink-clobberable: a
         # pre-placed symlink would redirect this truncating write to an arbitrary file).
-        local log_file; log_file=$(mktemp "${_BOT_SCRATCH:-${TMPDIR:-/tmp}}/run-XXXXXX" 2>/dev/null) || log_file=/dev/null
+        # Per-run log in its own private directory under the per-user state dir (not in the
+        # scratch dir, which the exit cleanup removes while the job may still be running).
+        # It is removed only after the job finished and its result was reported.
+        local run_dir log_file=/dev/null
+        run_dir=$(umask 077; mktemp -d "${_BOT_RUNS_DIR:-${TMPDIR:-/tmp}}/run-XXXXXX" 2>/dev/null) || run_dir=""
+        [ -n "$run_dir" ] && log_file="$run_dir/log"
 
         # Run with --skip-if-recent 0 to bypass YAML's skip_if_recent
         "$0" batch all --yaml "$yaml_path" --only "$job_name" --skip-if-recent 0 -y > "$log_file" 2>&1
@@ -219,7 +224,7 @@ bot_run_backup() {
         # raw log output, which routinely contains Markdown metacharacters -> parse_mode would
         # 400 and drop the alert; bot_send_message falls back to plain text.
         bot_send_message "$notify_token" "$notify_chat" "$notify_thread" "$result_text"
-        [ "$log_file" != /dev/null ] && rm -f "$log_file"
+        [ -n "$run_dir" ] && rm -rf "$run_dir"
     ) &
     log_info "Backup started in background (PID: $!)"
 }

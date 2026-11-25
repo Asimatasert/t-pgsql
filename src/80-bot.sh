@@ -61,13 +61,23 @@ cmd_bot() {
     reg_tmp "$scratch"
     _BOT_SCRATCH="$scratch"
     # The tmp cleanup trap does not exit on INT/TERM; stop the loop so the scratch
-    # directory is not removed underneath it. (exit runs the EXIT trap.)
-    trap 'exit 130' INT TERM
+    # directory is not removed underneath it. (exit runs the EXIT trap.) Conventional
+    # statuses: 130 for INT, 143 for TERM. A job already started keeps running.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     local tmp_resp="$scratch/resp.json"
 
     # Persistent poll offset in a per-user state directory (never in a shared dir).
     local offset_file="" state_dir
     state_dir=$(bot_state_dir) || state_dir=""
+    _BOT_RUNS_DIR=""
+    if [ -n "$state_dir" ] && [ ! -L "$state_dir/runs" ]; then
+        (umask 077; mkdir -p "$state_dir/runs") 2>/dev/null
+        if [ -d "$state_dir/runs" ] && [ "$(bot_file_owner "$state_dir/runs")" = "$(id -u)" ]; then
+            chmod 700 "$state_dir/runs" 2>/dev/null
+            _BOT_RUNS_DIR="$state_dir/runs"
+        fi
+    fi
     if [ -n "$state_dir" ]; then
         offset_file="$state_dir/bot-offset"
         if [ -L "$offset_file" ] || { [ -e "$offset_file" ] && ! bot_safe_file "$offset_file"; }; then
