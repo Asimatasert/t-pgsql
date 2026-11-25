@@ -12,7 +12,7 @@
 #   - arch/PKGBUILD and arch/.SRCINFO (pkgver, pkgrel=1, source URL; text
 #     substitution, no makepkg)
 #   - Formula/t-pgsql.rb (url and test assertion)
-#   - man/t-pgsql.1 .TH line, jobs.yaml.example header, Makefile fallback,
+#   - man/t-pgsql.1 .TH line, Makefile fallback,
 #     install.sh usage example
 # and finishes by running scripts/check-version.sh.
 #
@@ -89,9 +89,8 @@ sedi "s/^([[:space:]]*pkgver = ).*/\1$NEW/; s/^([[:space:]]*pkgrel = ).*/\11/; s
 # 5. Homebrew formula (url version and test assertion; sha256 is updated after tagging)
 sedi "s#(/tags/v)[0-9][^/\"]*(\.tar\.gz)#\1$NEW\2#; s/(assert_match \"v)[^\"]+(\")/\1$NEW\2/" Formula/t-pgsql.rb
 
-# 6. man page, example config, Makefile fallback, installer usage text
+# 6. man page, Makefile fallback, installer usage text
 sedi "s/^(\.TH T-PGSQL 1 )\"[^\"]*\" \"t-pgsql [^\"]*\"/\1\"$DATE_MAN\" \"t-pgsql $NEW\"/" man/t-pgsql.1
-sedi "2s/\(v[0-9][^)]*\)/(v$NEW)/" jobs.yaml.example
 sedi "s/(git describe.*echo \")[0-9][^\"]*(\")/\1$NEW\2/" Makefile
 sedi "s/^(#   VERSION=v)[0-9][^ ]*/\1$NEW/" install.sh
 

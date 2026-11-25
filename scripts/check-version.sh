@@ -23,7 +23,6 @@ ITEMS=(
     'Formula url|Formula/t-pgsql.rb|s/^[[:space:]]*url .*\/tags\/v([^/"]+)\.tar\.gz".*/\1/p'
     'Formula test assertion|Formula/t-pgsql.rb|s/.*assert_match "v([^"]+)".*/\1/p'
     'man page .TH line|man/t-pgsql.1|s/^\.TH .*"t-pgsql ([^"]+)".*/\1/p'
-    'jobs.yaml.example header|jobs.yaml.example|2s/.*\(v([0-9][^)]*)\).*/\1/p'
     'Makefile VERSION fallback|Makefile|s/.*git describe.*echo "([0-9][^"]*)".*/\1/p'
     'install.sh usage example|install.sh|s/^#   VERSION=v([0-9][^ ]*) .*/\1/p'
 )

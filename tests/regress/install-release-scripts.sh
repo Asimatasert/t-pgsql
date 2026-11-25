@@ -32,7 +32,6 @@ git add -A
 # branch fixes these in the real tree), so this test isolates the scripts.
 CUR="$(sed -n -E 's/^VERSION="([^"]+)".*/\1/p' src/00-header.sh | head -n1)"
 sed -E "s/^(\.TH T-PGSQL 1 )\"[^\"]*\" \"t-pgsql [^\"]*\"/\1\"January 2026\" \"t-pgsql $CUR\"/" man/t-pgsql.1 > "$T/m" && cat "$T/m" > man/t-pgsql.1
-sed -E "2s/\(v[0-9][^)]*\)/(v$CUR)/" jobs.yaml.example > "$T/j" && cat "$T/j" > jobs.yaml.example
 git commit -q -am "test fixture: align doc-owned version places" 2>/dev/null
 
 check "check-version passes on a consistent tree" bash scripts/check-version.sh
