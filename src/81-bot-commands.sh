@@ -108,6 +108,11 @@ To see jobs: \`/list ${yaml_name:-<yaml>}\`"
         return 0
     fi
 
+    if ! bot_valid_job_name "$job_name"; then
+        bot_send_message "$bot_token" "$chat_id" "$thread_id" "❌ Invalid job name."
+        return 0
+    fi
+
     local yaml_path
     yaml_path=$(bot_resolve_yaml "$yaml_name")
 

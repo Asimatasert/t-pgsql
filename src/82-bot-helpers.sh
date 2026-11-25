@@ -1,10 +1,16 @@
+bot_valid_job_name() {
+    # Job names from chat or button data: the safe set YAML job keys use, and never
+    # a leading dash (the name is passed to --only).
+    [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]
+}
+
 bot_resolve_yaml() {
     local name="$1"
 
-    # Already a full path
-    if [[ "$name" == *"/"* ]]; then
-        echo "$name"
-        return
+    # Chat input: only a plain file name inside SCRIPT_DIR is accepted. Paths,
+    # "..", leading dots/dashes and unusual characters resolve to nothing.
+    if [[ ! "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || [[ "$name" == *..* ]]; then
+        return 1
     fi
 
     # Add .yaml extension if missing

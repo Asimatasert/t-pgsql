@@ -143,7 +143,9 @@ for u in data.get('result',[]):
                 cb_yaml=$(echo "$cb_data" | cut -d: -f2)
                 cb_job=$(echo "$cb_data" | cut -d: -f3)
 
-                if [ "$cb_action" = "backup" ]; then
+                if [ "$cb_action" = "backup" ] && ! bot_valid_job_name "$cb_job"; then
+                    bot_answer_callback "$bot_token" "$cb_id" "❌ Invalid job name"
+                elif [ "$cb_action" = "backup" ]; then
                     local yaml_path
                     yaml_path=$(bot_resolve_yaml "$cb_yaml")
                     if [ ! -f "$yaml_path" ]; then

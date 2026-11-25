@@ -5221,7 +5221,9 @@ for u in data.get('result',[]):
                 cb_yaml=$(echo "$cb_data" | cut -d: -f2)
                 cb_job=$(echo "$cb_data" | cut -d: -f3)
 
-                if [ "$cb_action" = "backup" ]; then
+                if [ "$cb_action" = "backup" ] && ! bot_valid_job_name "$cb_job"; then
+                    bot_answer_callback "$bot_token" "$cb_id" "❌ Invalid job name"
+                elif [ "$cb_action" = "backup" ]; then
                     local yaml_path
                     yaml_path=$(bot_resolve_yaml "$cb_yaml")
                     if [ ! -f "$yaml_path" ]; then
@@ -5406,6 +5408,11 @@ To see jobs: \`/list ${yaml_name:-<yaml>}\`"
         return 0
     fi
 
+    if ! bot_valid_job_name "$job_name"; then
+        bot_send_message "$bot_token" "$chat_id" "$thread_id" "❌ Invalid job name."
+        return 0
+    fi
+
     local yaml_path
     yaml_path=$(bot_resolve_yaml "$yaml_name")
 
@@ -5444,13 +5451,19 @@ YAML: ${yaml_name}"
 # ---------------------------------------------------------------------------
 
 # Resolve YAML name to full path
+bot_valid_job_name() {
+    # Job names from chat or button data: the safe set YAML job keys use, and never
+    # a leading dash (the name is passed to --only).
+    [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]
+}
+
 bot_resolve_yaml() {
     local name="$1"
 
-    # Already a full path
-    if [[ "$name" == *"/"* ]]; then
-        echo "$name"
-        return
+    # Chat input: only a plain file name inside SCRIPT_DIR is accepted. Paths,
+    # "..", leading dots/dashes and unusual characters resolve to nothing.
+    if [[ ! "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || [[ "$name" == *..* ]]; then
+        return 1
     fi
 
     # Add .yaml extension if missing
