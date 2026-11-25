@@ -19,6 +19,8 @@ cmd_fetch() {
 
     mkdir -p "$OUTPUT_DIR"
 
+    remote_stage_prepare "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "/tmp/t-pgsql" || return 1
+
     # Determine which file to fetch
     local remote_file=""
 

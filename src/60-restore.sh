@@ -299,7 +299,7 @@ restore_local() {
 restore_ssh() {
     local dump="$1"
     local remote_dump_dir="/tmp/t-pgsql"
-    ssh -p "$TO_SSH_PORT" "${SSH_OPTS[@]}" "${TO_SSH_USER}@${TO_SSH_HOST}" "mkdir -p $(pq "$remote_dump_dir") && chmod 700 $(pq "$remote_dump_dir")"
+    remote_stage_prepare "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$remote_dump_dir" || return 1
     local remote="${remote_dump_dir}/$(basename "$dump")"
 
     # Check if DB exists on remote (password via remote PGPASSFILE, not argv)

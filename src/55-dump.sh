@@ -1,6 +1,35 @@
 # ==============================================================================
 # DUMP
 # ==============================================================================
+# Create the remote staging directory and verify it is safe to use: a real
+# directory (not a symlink), owned by the connecting user, with no group/other
+# permissions. The remote script only needs POSIX sh, id, ls and awk, so it
+# behaves the same on Linux and BSD/macOS hosts. A directory pre-created by
+# another account fails this check and the operation is aborted.
+# Usage: remote_stage_prepare PORT USER@HOST DIR
+remote_stage_prepare() {
+    local port="$1" dest="$2" dir="$3" script
+    local body='umask 077
+bad() { echo "remote staging directory $d is unsafe: $1" >&2; exit 1; }
+[ -L "$d" ] && bad "it is a symlink"
+mkdir -p "$d" 2>/dev/null
+[ -d "$d" ] || bad "it cannot be created"
+[ -L "$d" ] && bad "it is a symlink"
+chmod 700 "$d" 2>/dev/null
+set -- $(ls -ldn "$d" 2>/dev/null | awk '"'"'{print substr($1,1,1), substr($1,5,6), $3}'"'"')
+[ "$1" = d ] || bad "it is not a directory"
+[ "$3" = "$(id -u)" ] || bad "it is not owned by the connecting user"
+[ "$2" = "------" ] || bad "it grants group/other permissions"
+exit 0'
+    script="d=$(shq "$dir")
+$body"
+    if ! ssh_exec "$port" "$dest" "$script"; then
+        log_error "Remote staging directory $dir failed the safety check on ${dest#*@}; aborting"
+        return 1
+    fi
+    return 0
+}
+
 cmd_dump() {
     meta_start
     log_info "Starting dump..."
@@ -132,7 +161,12 @@ cmd_dump() {
     if [ "$FROM_TYPE" = "ssh" ]; then
         log_info "Dumping via SSH..."
         local remote_dump_dir="/tmp/t-pgsql"
-        ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "mkdir -p $(pq "$remote_dump_dir") && chmod 700 $(pq "$remote_dump_dir")"
+        if ! remote_stage_prepare "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$remote_dump_dir"; then
+            rm -f "$dump_file"
+            local _elapsed; _elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+            send_notification "failed" "Dump failed: ${DUMP_NAME:-$FROM_DATABASE}" "$(build_notify_details "DUMP" "Failed" "$_elapsed")"
+            return 1
+        fi
         local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
         local remote_file="${remote_dump_dir}/${dump_base_name}_${ts}.dump"
 
