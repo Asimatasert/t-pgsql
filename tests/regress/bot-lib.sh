@@ -53,7 +53,13 @@ args=$(printf '%s ' "$@" | tr '\n' ' ')
 printf '%s|%s\n' "$method" "$args" >> "$FAKE_DIR/curl.log"
 if [ "$method" = getUpdates ]; then
     case "$args" in
-        *offset=-1*) cat "$FAKE_DIR/head.json" 2>/dev/null || echo '{"ok":true,"result":[]}'; exit 0 ;;
+        *offset=-1*)
+            m=$(cat "$FAKE_DIR/m" 2>/dev/null || echo 0); m=$((m + 1)); echo "$m" > "$FAKE_DIR/m"
+            if [ "$m" -ge 6 ]; then
+                : > "$FAKE_DIR/done"
+                pid=$(cat "$FAKE_DIR/botpid" 2>/dev/null) && [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
+            fi
+            cat "$FAKE_DIR/head.json" 2>/dev/null || echo '{"ok":true,"result":[]}'; exit 0 ;;
     esac
     n=$(cat "$FAKE_DIR/n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_DIR/n"
     if [ "$n" = 1 ]; then cat "$FAKE_DIR/updates.json"; else echo '{"ok":true,"result":[]}'; fi
@@ -113,7 +119,7 @@ cb() { printf '{"update_id":%s,"callback_query":{"id":"cb%s","from":{"id":%s,"fi
 run_bot() {
     local upd="$1" pid i; shift
     printf '{"ok":true,"result":[%s]}' "$upd" > "$FAKE/updates.json"
-    rm -f "$FAKE/done" "$FAKE/n" "$FAKE/botpid"; : > "$FAKE/curl.log"
+    rm -f "$FAKE/done" "$FAKE/n" "$FAKE/m" "$FAKE/botpid"; : > "$FAKE/curl.log"
     ( cd "$TMP" && exec $TIMEOUT_CMD env PATH="$FAKEBIN:$PATH" FAKE_DIR="$FAKE" HOME="$TMP/home" \
         TMPDIR="$TMP/tmp" XDG_STATE_HOME="$TMP/state" BASH_BIN="${BASH:-bash}" APP="$APP" \
         YAML_ARG="${YAML_ARG:-jobs}" "$@" sh "$TMP/launch.sh" > "$TMP/bot.out" 2>&1 ) &

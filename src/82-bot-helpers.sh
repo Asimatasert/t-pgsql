@@ -80,17 +80,21 @@ bot_state_dir() {
     echo "$dir"
 }
 
-# Print the integer stored in an offset file, or 0 if it is not a plain integer.
+# Print the integer stored in an offset file; print nothing and fail if it is not one.
 bot_read_offset() {
     local v=""
     read -r v < "$1" 2>/dev/null || true
-    [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0
+    [[ "$v" =~ ^[0-9]+$ ]] || return 1
+    echo "$v"
 }
 
-# Persist the poll offset (no-op when no safe offset file is available).
+# Persist the poll offset atomically (temp file in the same directory, then rename).
+# No-op when no safe offset file is available.
 bot_save_offset() {
-    [ -n "$1" ] || return 0
-    (umask 077; printf '%s\n' "$2" > "$1") 2>/dev/null || true
+    local f="$1" tmp
+    [ -n "$f" ] || return 0
+    tmp=$(umask 077; mktemp "${f}.XXXXXX" 2>/dev/null) || return 0
+    printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
 }
 
 bot_valid_job_name() {

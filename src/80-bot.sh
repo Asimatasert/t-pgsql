@@ -5,7 +5,7 @@ cmd_bot() {
     local bot_token=""
     local poll_interval=2
     local bot_cooldown="1h"
-    local offset=0
+    local offset=""
 
     # Get token from --token arg or from YAML defaults
     if [ -n "$BOT_TOKEN" ]; then
@@ -76,7 +76,7 @@ cmd_bot() {
         fi
     fi
     if [ -z "$offset_file" ]; then
-        log_warn "No safe state directory: the poll offset is kept in memory only (old updates may be replayed after a restart)."
+        log_warn "No safe state directory: the poll offset is kept in memory only."
     elif [ -f "$offset_file" ]; then
         offset=$(bot_read_offset "$offset_file")
     else
@@ -85,15 +85,35 @@ cmd_bot() {
         local legacy_file="${TMPDIR:-/tmp}/.t-pgsql-bot-offset-$(id -u)"
         if bot_safe_file "$legacy_file"; then
             offset=$(bot_read_offset "$legacy_file")
+            [ -n "$offset" ] && bot_save_offset "$offset_file" "$offset"
         fi
-        bot_save_offset "$offset_file" "$offset"
     fi
+    # No known offset: Telegram would redeliver up to 24 hours of old updates and every old
+    # /backup would run again. Skip the backlog on the first poll instead (see loop).
+    local skip_backlog=""
+    [ -z "$offset" ] && skip_backlog=1
 
     # Main polling loop (errexit already disabled globally)
     set +e
 
     while true; do
         local response
+        if [ -n "$skip_backlog" ]; then
+            response=$(tg_api "$bot_token" getUpdates --max-time 35 -X POST \
+                -d "offset=-1" -d "limit=1" -d "timeout=0" 2>&1)
+            if ! echo "$response" | grep -q '"ok":true' 2>/dev/null; then
+                log_warn "Telegram API error while skipping the backlog; retrying"
+                sleep "$poll_interval"
+                continue
+            fi
+            local newest
+            newest=$(echo "$response" | grep -o '"update_id":[0-9]*' | grep -o '[0-9]*' | sort -n | tail -1)
+            if [ -n "$newest" ]; then offset=$((newest + 1)); else offset=0; fi
+            bot_save_offset "$offset_file" "$offset"
+            skip_backlog=""
+            log_info "No stored poll offset: skipped the pending backlog (next update id: ${offset}); old commands were not executed."
+            continue
+        fi
         response=$(tg_api "$bot_token" getUpdates --max-time 35 -X POST \
             -d "offset=${offset}" \
             -d "timeout=30" \
