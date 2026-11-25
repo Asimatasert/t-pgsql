@@ -46,14 +46,48 @@ pgpass_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g'
 }
 
+# Fill _RV_SORTED with every textual form of $1 that can appear in a logged command,
+# longest first. Works on arbitrary bytes (quotes, backslashes, colons).
+_redact_variants() {
+    local -A seen=()
+    local -a cur=("$1") next=()
+    local d v t sq="'" i j tmp
+    seen["$1"]=1
+    for d in 1 2 3; do
+        next=()
+        for v in "${cur[@]}"; do
+            t="${v//\\/\\\\}"; t="${t//:/\\:}"                 # .pgpass escaping
+            [ -n "$t" ] && [ -z "${seen[$t]+x}" ] && { seen["$t"]=1; next+=("$t"); }
+            t="${v//$sq/$sq\\$sq$sq}"                              # inside shq(...)
+            [ -z "${seen[$t]+x}" ] && { seen["$t"]=1; next+=("$t"); }
+            t="$(printf '%q' "$v")"                                 # pq(...)
+            [ -z "${seen[$t]+x}" ] && { seen["$t"]=1; next+=("$t"); }
+        done
+        cur=("${next[@]}")
+    done
+    _RV_SORTED=("${!seen[@]}")
+    for ((i = 1; i < ${#_RV_SORTED[@]}; i++)); do        # insertion sort, longest first
+        tmp="${_RV_SORTED[i]}"
+        for ((j = i - 1; j >= 0 && ${#_RV_SORTED[j]} < ${#tmp}; j--)); do
+            _RV_SORTED[j+1]="${_RV_SORTED[j]}"
+        done
+        _RV_SORTED[j+1]="$tmp"
+    done
+}
+
 # Redact known passwords from a command string before logging.
 redact_cmd() {
-    local s="$1" p
-    # Redact both the raw and the .pgpass-escaped form of each known password.
+    local s="$1" p k
+    # Redact the raw password and every rendering a command string can carry: the
+    # .pgpass-escaped form, POSIX single-quoted (shq) and printf-%q (pq) forms, and
+    # those layered up to three deep (pgpass line inside shq inside shq). Longest first so
+    # a shorter variant never leaves a fragment of a longer one behind.
     for p in "$FROM_DB_PASSWORD" "$TO_DB_PASSWORD"; do
         [ -z "$p" ] && continue
-        s="${s//"$p"/***}"
-        s="${s//"$(pgpass_escape "$p")"/***}"
+        _redact_variants "$p"
+        for k in "${_RV_SORTED[@]}"; do
+            s="${s//"$k"/***}"
+        done
     done
     # Fallback: neutralize any lingering PGPASSWORD=<value> tokens.
     s="$(printf '%s' "$s" | sed -E "s/PGPASSWORD=([\"'])[^\"']*\1/PGPASSWORD=***/g; s/PGPASSWORD=[^[:space:]'\"]*/PGPASSWORD=***/g")"
