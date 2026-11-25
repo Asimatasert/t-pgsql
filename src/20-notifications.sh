@@ -72,6 +72,12 @@ send_notification() {
     local message="$2"     # Main message
     local details="$3"     # Additional details (optional)
 
+    # Remember that a failure was reported (even when no channel is configured), so the
+    # catch-all in main() does not announce the same failure a second time.
+    if [ "$status" = "failed" ] || [ "$status" = "error" ]; then
+        NOTIFY_FAILURE_SENT=true
+    fi
+
     [ ${#NOTIFY[@]} -eq 0 ] && return 0
     # --quiet only reduces console output and success notifications; a failure is always sent.
     if [ "$QUIET" = true ] && [ "$status" != "failed" ] && [ "$status" != "error" ]; then
@@ -110,6 +116,20 @@ send_notification() {
 
     # A delivery problem is logged by the sender; it must never fail the operation.
     return 0
+}
+
+# Catch-all for operations that returned a failure without sending their own failure
+# notification (a missing --from, an invalid connection string, a missing password, ...).
+# Passes the status through. Usage: notify_unreported_failure <rc> <operation>
+notify_unreported_failure() {
+    local rc="$1" op="$2"
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$NOTIFY_FAILURE_SENT" != true ]; then
+        local details
+        details="$(build_notify_details "$op" "Failed" "")"
+        send_notification "failed" "${op^} failed" "${details}Stopped before completion (exit code ${rc}); see the log for the reason."
+    fi
+    return "$rc"
 }
 
 # Resolve the "telegram:TOKEN:CHAT[:THREAD]" string for a bare "telegram"

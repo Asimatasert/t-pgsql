@@ -127,11 +127,11 @@ main() {
     fi
 
     case "$COMMAND" in
-        dump)    cmd_dump ;;
-        restore) cmd_restore ;;
-        clone)   cmd_clone ;;
-        upgrade) cmd_upgrade ;;
-        fetch)   cmd_fetch ;;
+        dump)    cmd_dump;    notify_unreported_failure $? dump ;;
+        restore) cmd_restore; notify_unreported_failure $? restore ;;
+        clone)   cmd_clone;   notify_unreported_failure $? clone ;;
+        upgrade) cmd_upgrade; notify_unreported_failure $? upgrade ;;
+        fetch)   cmd_fetch;   notify_unreported_failure $? fetch ;;
         batch)   cmd_batch "$BATCH_JOB" ;;
         bot)     cmd_bot ;;
         list)    cmd_list ;;

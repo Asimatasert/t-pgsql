@@ -65,6 +65,7 @@ HEALTH_CHECK_FAIL=false
 # Notifications
 NOTIFY=()
 NOTIFY_ON_ERROR=false
+NOTIFY_FAILURE_SENT=false     # true once a failure notification was attempted in this run
 
 # Masking
 MASK=false

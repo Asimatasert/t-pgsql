@@ -104,6 +104,7 @@ HEALTH_CHECK_FAIL=false
 # Notifications
 NOTIFY=()
 NOTIFY_ON_ERROR=false
+NOTIFY_FAILURE_SENT=false     # true once a failure notification was attempted in this run
 
 # Masking
 MASK=false
@@ -576,6 +577,12 @@ send_notification() {
     local message="$2"     # Main message
     local details="$3"     # Additional details (optional)
 
+    # Remember that a failure was reported (even when no channel is configured), so the
+    # catch-all in main() does not announce the same failure a second time.
+    if [ "$status" = "failed" ] || [ "$status" = "error" ]; then
+        NOTIFY_FAILURE_SENT=true
+    fi
+
     [ ${#NOTIFY[@]} -eq 0 ] && return 0
     # --quiet only reduces console output and success notifications; a failure is always sent.
     if [ "$QUIET" = true ] && [ "$status" != "failed" ] && [ "$status" != "error" ]; then
@@ -614,6 +621,20 @@ send_notification() {
 
     # A delivery problem is logged by the sender; it must never fail the operation.
     return 0
+}
+
+# Catch-all for operations that returned a failure without sending their own failure
+# notification (a missing --from, an invalid connection string, a missing password, ...).
+# Passes the status through. Usage: notify_unreported_failure <rc> <operation>
+notify_unreported_failure() {
+    local rc="$1" op="$2"
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$NOTIFY_FAILURE_SENT" != true ]; then
+        local details
+        details="$(build_notify_details "$op" "Failed" "")"
+        send_notification "failed" "${op^} failed" "${details}Stopped before completion (exit code ${rc}); see the log for the reason."
+    fi
+    return "$rc"
 }
 
 # Resolve the "telegram:TOKEN:CHAT[:THREAD]" string for a bare "telegram"
@@ -1842,6 +1863,9 @@ run_health_checks() {
 
     if [ $failed -eq 1 ] && [ "$HEALTH_CHECK_FAIL" = true ]; then
         log_error "Health check failed, aborting (--health-check-fail)"
+        local _hc_details
+        _hc_details="$(build_notify_details "HEALTH" "Failed" "")"
+        send_notification "failed" "Health check failed: ${DUMP_NAME:-${FROM_DATABASE:-$TO_DATABASE}}" "${_hc_details}Aborted by --health-check-fail before the operation started."
         exit 1
     fi
 
@@ -6344,11 +6368,11 @@ main() {
     fi
 
     case "$COMMAND" in
-        dump)    cmd_dump ;;
-        restore) cmd_restore ;;
-        clone)   cmd_clone ;;
-        upgrade) cmd_upgrade ;;
-        fetch)   cmd_fetch ;;
+        dump)    cmd_dump;    notify_unreported_failure $? dump ;;
+        restore) cmd_restore; notify_unreported_failure $? restore ;;
+        clone)   cmd_clone;   notify_unreported_failure $? clone ;;
+        upgrade) cmd_upgrade; notify_unreported_failure $? upgrade ;;
+        fetch)   cmd_fetch;   notify_unreported_failure $? fetch ;;
         batch)   cmd_batch "$BATCH_JOB" ;;
         bot)     cmd_bot ;;
         list)    cmd_list ;;
