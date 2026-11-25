@@ -94,6 +94,13 @@ send_notification() {
     [ "$status" = "failed" ] || [ "$status" = "error" ] && emoji="❌"
     [ "$status" = "warning" ] && emoji="⚠️"
 
+    # No escape codes in notification text (checked first so ordinary text, including the
+    # trailing newline of the details, is left exactly as it is)
+    if [[ "$message$details" == *$'\033'* || "$message$details" == *'\033['* ]]; then
+        message="$(strip_ansi "$message")"
+        details="$(strip_ansi "$details")"
+    fi
+
     local hostname=$(hostname)
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 

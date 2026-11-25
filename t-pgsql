@@ -41,6 +41,12 @@ NC='\033[0m'
 # DEFAULT VALUES
 # ==============================================================================
 
+# Colours (defined in the header) are switched off when NO_COLOR is set to a non-empty value
+# (https://no-color.org) or when stdout is not a terminal (cron mail, pipes, redirected logs).
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
+fi
+
 # Command
 COMMAND=""
 
@@ -245,7 +251,10 @@ log_warn() {
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
+    # Errors go to stderr: only colour them when stderr itself is a terminal.
+    local _red="$RED" _nc="$NC"
+    [ -t 2 ] || { _red=""; _nc=""; }
+    echo -e "${_red}[ERROR]${_nc} $1" >&2
     log_to_file "ERROR" "$1"
 }
 
@@ -278,8 +287,18 @@ log_to_file() {
     if [ -n "$LOG_FILE" ]; then
         # Only write messages at or above the configured --log-level.
         [ "$(log_level_num "$1")" -lt "$(log_level_num "$LOG_LEVEL")" ] && return 0
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2" >> "$LOG_FILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $(strip_ansi "$2")" >> "$LOG_FILE"
     fi
+}
+
+# Remove ANSI colour sequences (a real ESC or the literal \033 text) from a string, so log
+# files and notifications never carry escape codes.
+strip_ansi() {
+    case "$1" in
+        *$'\033'*|*'\033['*) ;;
+        *) printf '%s' "$1"; return 0 ;;
+    esac
+    printf '%s' "$1" | sed -E "s/($(printf '\033')|\\\\033)\[[0-9;]*m//g"
 }
 
 # ==============================================================================
@@ -598,6 +617,13 @@ send_notification() {
     local emoji="✅"
     [ "$status" = "failed" ] || [ "$status" = "error" ] && emoji="❌"
     [ "$status" = "warning" ] && emoji="⚠️"
+
+    # No escape codes in notification text (checked first so ordinary text, including the
+    # trailing newline of the details, is left exactly as it is)
+    if [[ "$message$details" == *$'\033'* || "$message$details" == *'\033['* ]]; then
+        message="$(strip_ansi "$message")"
+        details="$(strip_ansi "$details")"
+    fi
 
     local hostname=$(hostname)
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')

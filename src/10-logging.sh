@@ -12,7 +12,10 @@ log_warn() {
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
+    # Errors go to stderr: only colour them when stderr itself is a terminal.
+    local _red="$RED" _nc="$NC"
+    [ -t 2 ] || { _red=""; _nc=""; }
+    echo -e "${_red}[ERROR]${_nc} $1" >&2
     log_to_file "ERROR" "$1"
 }
 
@@ -45,7 +48,17 @@ log_to_file() {
     if [ -n "$LOG_FILE" ]; then
         # Only write messages at or above the configured --log-level.
         [ "$(log_level_num "$1")" -lt "$(log_level_num "$LOG_LEVEL")" ] && return 0
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2" >> "$LOG_FILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $(strip_ansi "$2")" >> "$LOG_FILE"
     fi
+}
+
+# Remove ANSI colour sequences (a real ESC or the literal \033 text) from a string, so log
+# files and notifications never carry escape codes.
+strip_ansi() {
+    case "$1" in
+        *$'\033'*|*'\033['*) ;;
+        *) printf '%s' "$1"; return 0 ;;
+    esac
+    printf '%s' "$1" | sed -E "s/($(printf '\033')|\\\\033)\[[0-9;]*m//g"
 }
 

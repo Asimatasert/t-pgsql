@@ -2,6 +2,12 @@
 # DEFAULT VALUES
 # ==============================================================================
 
+# Colours (defined in the header) are switched off when NO_COLOR is set to a non-empty value
+# (https://no-color.org) or when stdout is not a terminal (cron mail, pipes, redirected logs).
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
+fi
+
 # Command
 COMMAND=""
 
