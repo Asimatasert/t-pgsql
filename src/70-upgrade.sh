@@ -72,10 +72,20 @@ apply_globals_to_target() {
         fi
         # Feed the globals as a quoted here-doc appended to the command (which itself,
         # with the pgpass preamble, travels on ssh's stdin via ssh_exec — never argv).
-        # The delimiter is unquoted content: psql reads the here-doc, not ssh stdin.
-        rcmd+=" <<'__TPG_GLOBALS_EOF__'
+        # The terminator is random per call and verified not to occur as a line of the
+        # dump, so dump content (role names, comments) can never close the here-doc and
+        # reach the remote shell.
+        local term="" try
+        for try in 1 2 3 4 5; do
+            term="__TPG_GLOBALS_$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')__"
+            [ "${#term}" -gt 20 ] || { log_error "Cannot generate a random here-doc terminator"; return 1; }
+            grep -Fxq -- "$term" "$gfile" || break
+            term=""
+        done
+        [ -n "$term" ] || { log_error "Cannot find a here-doc terminator absent from the globals dump"; return 1; }
+        rcmd+=" <<'$term'
 $(cat "$gfile")
-__TPG_GLOBALS_EOF__"
+$term"
         errout=$(ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$rcmd" 2>&1 >/dev/null)
     else
         setup_local_pgpass "$TO_DB_USER" "$TO_DB_PASSWORD"
