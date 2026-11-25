@@ -11,6 +11,11 @@ optdepends=(
     'zsh: for zsh completion support'
     'bash-completion: for bash completion support'
     'fish: for fish completion support'
+    'zstd: for .zst compressed dumps'
+    'xz: for .xz compressed dumps'
+    'bzip2: for .bz2 compressed dumps'
+    'pv: for stream progress display'
+    'python: for bot JSON parsing'
 )
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('8fbd3424f8f6ddb00c1341c4b3aaa014c2994c462a38266eb85361d0688a5b0e')

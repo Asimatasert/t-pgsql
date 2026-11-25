@@ -12,6 +12,11 @@ pkgbase = t-pgsql
 	optdepends = zsh: for zsh completion support
 	optdepends = bash-completion: for bash completion support
 	optdepends = fish: for fish completion support
+	optdepends = zstd: for .zst compressed dumps
+	optdepends = xz: for .xz compressed dumps
+	optdepends = bzip2: for .bz2 compressed dumps
+	optdepends = pv: for stream progress display
+	optdepends = python: for bot JSON parsing
 	source = t-pgsql-3.12.1.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v3.12.1.tar.gz
 	sha256sums = 8fbd3424f8f6ddb00c1341c4b3aaa014c2994c462a38266eb85361d0688a5b0e
 

@@ -72,7 +72,8 @@ deb:
 	@echo "Section: database" >> build/deb/DEBIAN/control
 	@echo "Priority: optional" >> build/deb/DEBIAN/control
 	@echo "Architecture: all" >> build/deb/DEBIAN/control
-	@echo "Depends: postgresql-client, openssh-client, bash (>= 4.0)" >> build/deb/DEBIAN/control
+	@echo "Depends: postgresql-client, openssh-client, curl, bash (>= 4.0)" >> build/deb/DEBIAN/control
+	@echo "Recommends: zstd, xz-utils, bzip2, pv, python3" >> build/deb/DEBIAN/control
 	@echo "Maintainer: Asim Atasert <asimatasert@outlook.com>" >> build/deb/DEBIAN/control
 	@echo "Description: PostgreSQL database sync and clone tool" >> build/deb/DEBIAN/control
 	@echo " Advanced CLI tool for backing up, restoring, and synchronizing" >> build/deb/DEBIAN/control
