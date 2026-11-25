@@ -5463,9 +5463,21 @@ bot_resolve_yaml() {
 bot_check_cooldown() {
     local yaml_path="$1" job_name="$2" cooldown="$3"
 
+    # Use the same base name the dump code uses: ${DUMP_NAME:-$FROM_DATABASE}.
+    # The job name is only a last resort (it is not part of the dump file name).
     local dump_name
     dump_name=$(JOBS_FILE="$yaml_path" get_job_value "$job_name" "dump_name" 2>/dev/null) || true
+    if [ -z "$dump_name" ]; then
+        local profile
+        profile=$(JOBS_FILE="$yaml_path" get_job_field "$job_name" "from" "profile" 2>/dev/null) || true
+        dump_name=$(JOBS_FILE="$yaml_path" get_job_field "$job_name" "from" "database" 2>/dev/null) || true
+        if [ -z "$dump_name" ] && [ -n "$profile" ]; then
+            dump_name=$(JOBS_FILE="$yaml_path" get_profile_value "$profile" "database" 2>/dev/null) || true
+        fi
+    fi
     [ -z "$dump_name" ] && dump_name="$job_name"
+    # The name is used in a file glob: refuse anything that could widen or escape it.
+    [[ "$dump_name" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
 
     local output_dir
     output_dir=$(JOBS_FILE="$yaml_path" get_job_value "$job_name" "output" 2>/dev/null) || true
@@ -5475,7 +5487,7 @@ bot_check_cooldown() {
     [ ! -d "$output_dir" ] && return 0
 
     local latest
-    latest=$(ls -t "$output_dir"/${dump_name}_*.tar.gz "$output_dir"/${dump_name}_*.dump.zst "$output_dir"/${dump_name}_*.dump "$output_dir"/${dump_name}_*.dump.xz "$output_dir"/${dump_name}_*.dump.bz2 2>/dev/null | head -1) || true
+    latest=$(ls -t "$output_dir/${dump_name}"_*.tar.gz "$output_dir/${dump_name}"_*.dump.zst "$output_dir/${dump_name}"_*.dump "$output_dir/${dump_name}"_*.dump.xz "$output_dir/${dump_name}"_*.dump.bz2 2>/dev/null | head -1) || true
 
     [ -z "$latest" ] && return 0
 
