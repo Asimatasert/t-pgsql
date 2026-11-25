@@ -1,13 +1,38 @@
+# Read "telegram_allowed_users" from the defaults: section of the yaml. Understands an inline
+# value (comma string or [a, b]) and a block list ("- 111" lines). Prints nothing when the key
+# is absent; otherwise prints PRESENT: followed by the raw ids (possibly empty).
+bot_yaml_allowed_raw() {
+    awk '
+    /^defaults:/ { d = 1; next }
+    /^[A-Za-z]/ { d = 0; if (k) k = 2 }
+    d && k != 1 && k != 2 && /^  telegram_allowed_users:/ {
+        k = 1; v = $0
+        sub(/^  telegram_allowed_users:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v)
+        val = v; next
+    }
+    k == 1 && /^[ \t]*-([ \t]|$)/ {
+        v = $0; sub(/^[ \t]*-[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v)
+        val = val "," v; next
+    }
+    k == 1 && /^[ \t]*(#.*)?$/ { next }
+    k == 1 { k = 2 }
+    END { if (k) print "PRESENT:" val }
+    ' "$1"
+}
+
 # Print the normalized sender allowlist as ",id1,id2,". Prints nothing when no allowlist is
 # configured. A configured list without any valid numeric id prints "," (matches nobody).
-# Source: TELEGRAM_ALLOWED_USERS, else "telegram_allowed_users" under defaults: in the YAML.
+# Source: TELEGRAM_ALLOWED_USERS (non-empty), else "telegram_allowed_users" under defaults:
+# in the YAML (key present, even when empty or in an unreadable form, counts as configured).
 bot_allowed_users() {
-    local raw="${TELEGRAM_ALLOWED_USERS:-}"
-    if [ -z "$raw" ] && [ -f "$JOBS_FILE" ]; then
-        raw=$(get_default_value "telegram_allowed_users" 2>/dev/null) || true
+    local raw="${TELEGRAM_ALLOWED_USERS:-}" present=""
+    [ -n "$raw" ] && present=1
+    if [ -z "$present" ] && [ -f "$JOBS_FILE" ]; then
+        raw=$(bot_yaml_allowed_raw "$JOBS_FILE" 2>/dev/null) || true
+        if [ -n "$raw" ]; then present=1; raw="${raw#PRESENT:}"; fi
     fi
+    [ -z "$present" ] && return 0
     raw=$(printf '%s' "$raw" | tr -d '[]"\047 \t')
-    [ -z "$raw" ] && return 0
     local out="," id ids=()
     IFS=, read -ra ids <<< "$raw"
     for id in "${ids[@]}"; do

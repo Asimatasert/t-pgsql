@@ -46,7 +46,7 @@ cmd_bot() {
     if [ -z "$allowed_users" ]; then
         log_warn "No sender allowlist (TELEGRAM_ALLOWED_USERS): ANY member of the configured chat can run jobs, including restore/clone/upgrade jobs, via /backup and buttons."
     elif [ "$allowed_users" = "," ]; then
-        log_warn "Sender allowlist is set but contains no valid numeric user id: the bot will reject every sender."
+        log_error "Sender allowlist is set (TELEGRAM_ALLOWED_USERS or defaults.telegram_allowed_users) but contains no valid numeric user id: the bot will reject EVERY sender. Use a comma separated string, an inline list [111, 222] or a block list of numeric Telegram user ids."
     fi
     [ -z "$default_chat_id" ] && log_warn "No chat_id configured (telegram config in YAML) — the bot will IGNORE all commands until an allowed chat is set."
 
