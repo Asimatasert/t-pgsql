@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared helper for the regress tests (sourced, not run).
 # fake_pg_tools DIR: create harmless stand-ins for the PostgreSQL client tools a dump may
 # call besides pg_dump/psql, so a test never depends on which real tools are installed.
