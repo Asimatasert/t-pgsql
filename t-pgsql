@@ -6531,20 +6531,26 @@ main() {
     # Dumps, archives, logs and job files hold database contents and credentials, so
     # everything this tool creates is private (0600/0700) by default. Setups that share
     # dumps through group permissions can relax it with T_PGSQL_UMASK (e.g. 027 or 007).
-    local _umask="${T_PGSQL_UMASK:-077}"
-    if [[ "$_umask" =~ ^0?[0-7]{3}$ ]]; then
+    local _umask="${T_PGSQL_UMASK:-077}" _umask_warn=""
+    if [[ "$_umask" =~ ^[0-7]{1,4}$ ]]; then
         umask "$_umask"
+        # "other" read bit (4) clear in the mask means new files are world-readable
+        if [ $(( 8#$_umask & 4 )) -eq 0 ]; then
+            _umask_warn="T_PGSQL_UMASK=$_umask leaves new files (dumps, logs) readable by every local user"
+        fi
     else
         umask 077
-        log_warn "Ignoring invalid T_PGSQL_UMASK '$_umask' (expected an octal mask such as 077 or 027)"
+        _umask_warn="Ignoring invalid T_PGSQL_UMASK '$_umask' (expected one to four octal digits such as 077, 027 or 22); using 077"
     fi
 
     install_cleanup_trap
     parse_args "$@"
+    [ -n "$_umask_warn" ] && log_warn "$_umask_warn"
 
-    # Notification specs handed over by a parent job run (they hold the bot token, so they
-    # travel in the environment rather than on argv). Consume and drop them so nothing
-    # we spawn (pg_dump, ssh, ...) inherits them.
+    # Notification specs handed over by a parent job run (run_job sets T_PGSQL_NOTIFY_SPECS
+    # for its re-exec'd child). This is an INTERNAL variable, not a user option: it holds
+    # the bot token, so it travels in the environment rather than on argv. Consume and drop
+    # it so nothing we spawn (pg_dump, ssh, ...) inherits it.
     if [ -n "${T_PGSQL_NOTIFY_SPECS:-}" ]; then
         local _spec
         while IFS= read -r _spec; do

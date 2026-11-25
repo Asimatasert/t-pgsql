@@ -29,7 +29,7 @@ mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 
 run_dump() { # $1 = output dir, $2 = log file
     ( cd "$TMP" && t-pgsql dump --from postgres@localhost/appdb --password x \
-        --output "$1" --log "$2" --no-meta --no-health-check >/dev/null 2>&1 )
+        --output "$1" --log "$2" --no-meta --no-health-check >"$TMP/run.out" 2>&1 )
 }
 
 # Default: private files
@@ -49,5 +49,22 @@ d="$(ls "$TMP"/out2/appdb_*.dump 2>/dev/null | head -n 1)"
 ( umask 022; T_PGSQL_UMASK=banana run_dump "$TMP/out3" "$TMP/logs3/run.log" )
 d="$(ls "$TMP"/out3/appdb_*.dump 2>/dev/null | head -n 1)"
 [ -n "$d" ] && [ "$(mode "$d")" = "600" ] && ok "invalid T_PGSQL_UMASK falls back to 077" || nok "invalid T_PGSQL_UMASK falls back to 077"
+grep -q "Ignoring invalid T_PGSQL_UMASK" "$TMP/run.out" && ok "invalid value is reported" || nok "invalid value is reported"
+
+# One to four octal digits are accepted; a mask that leaves files world-readable warns
+for m in 22 022 0022; do
+    rm -rf "$TMP/outm"
+    ( umask 077; T_PGSQL_UMASK=$m run_dump "$TMP/outm" "$TMP/logsm/run.log" )
+    d="$(ls "$TMP"/outm/appdb_*.dump 2>/dev/null | head -n 1)"
+    [ -n "$d" ] && [ "$(mode "$d")" = "644" ] && ok "T_PGSQL_UMASK=$m gives 644" || nok "T_PGSQL_UMASK=$m gives 644 (got: $( [ -n "$d" ] && mode "$d"))"
+    grep -q "readable by every local user" "$TMP/run.out" && ok "T_PGSQL_UMASK=$m warns about world-readable files" || nok "T_PGSQL_UMASK=$m warns about world-readable files"
+done
+rm -rf "$TMP/outm"
+( umask 077; T_PGSQL_UMASK=0 run_dump "$TMP/outm" "$TMP/logsm/run.log" )
+d="$(ls "$TMP"/outm/appdb_*.dump 2>/dev/null | head -n 1)"
+[ -n "$d" ] && [ "$(mode "$d")" = "666" ] && ok "T_PGSQL_UMASK=0 is accepted" || nok "T_PGSQL_UMASK=0 is accepted"
+rm -rf "$TMP/out4"
+( umask 022; T_PGSQL_UMASK=027 run_dump "$TMP/out4" "$TMP/logs4/run.log" )
+grep -q "readable by every local user" "$TMP/run.out" && nok "no warning for 027" || ok "no warning for 027"
 
 [ "$FAILS" -eq 0 ]
