@@ -37,8 +37,20 @@ $body"
 # Mirrors list_dumps_for_base so "prod" never matches "prod_v2_...".
 # The result has no ^ or / anchor; callers add their own.
 remote_dump_match_re() {
-    local esc
-    esc=$(printf '%s' "$1" | sed 's/[][\.^$*+?(){}|/]/\\&/g')
+    # Escape each ERE metacharacter with a bracket expression instead of a
+    # backslash, so GNU grep 3.8+ never reports a "stray \" warning. "/" is an
+    # ordinary character and is left alone.
+    local s="$1" esc="" c i
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            '.'|'*'|'+'|'?'|'('|')'|'{'|'}'|'|'|'$'|'[') esc+="[$c]" ;;
+            ']')  esc+='[]]' ;;
+            '^')  esc+='\^' ;;
+            '\')  esc+='[\]' ;;
+            *)    esc+="$c" ;;
+        esac
+    done
     printf '%s%s' "$esc" '_[0-9]{8}_[0-9]{6}(_[0-9]+)?\.dump(\.zst|\.xz|\.bz2)?$'
 }
 

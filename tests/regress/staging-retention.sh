@@ -19,7 +19,7 @@ cat > "$FAKE/ssh" <<'EOF'
 cmd="${!#}"
 echo "$cmd" >> "$REC/ssh.log"
 cmd="${cmd//\/tmp\/t-pgsql/$SB/t-pgsql}"
-sed "s#/tmp/t-pgsql#$SB/t-pgsql#g" | sh -c "$cmd"
+sed "s#/tmp/t-pgsql#$SB/t-pgsql#g" | tee -a "$REC/script.log" | sh -c "$cmd"
 EOF
 cat > "$FAKE/scp" <<'EOF'
 #!/usr/bin/env bash
@@ -34,6 +34,9 @@ cat > "$FAKE/pg_dump" <<'EOF'
 while [ $# -gt 0 ]; do [ "$1" = -f ] && { printf 'PGDMP-fake\n' > "$2"; }; shift; done
 exit 0
 EOF
+for t in pg_isready createdb dropdb pg_dumpall; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE/$t"
+done
 cat > "$FAKE/pg_restore" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -53,7 +56,7 @@ seed() {
     rm -rf "$SB/t-pgsql" "$TMP/out"; mkdir -p "$SB/t-pgsql" "$TMP/out"; chmod 700 "$SB/t-pgsql"
     for f in appdb_20200101_000000.dump appdb_20200102_000000.dump \
              appdb_v2_20200101_000000.dump appdb_v2_20200102_000000.dump; do
-        printf 'x\n' > "$SB/t-pgsql/$f"
+        printf 'PGDMP-fake\n' > "$SB/t-pgsql/$f"
     done
     touch -t 202001010000 "$SB/t-pgsql/appdb_20200101_000000.dump" "$SB/t-pgsql/appdb_v2_20200101_000000.dump"
     touch -t 202001020000 "$SB/t-pgsql/appdb_20200102_000000.dump" "$SB/t-pgsql/appdb_v2_20200102_000000.dump"
@@ -82,5 +85,25 @@ touch -t 202001030000 "$SB/t-pgsql/appdb_v2_20200102_000000.dump"
 "$BIN" fetch --from "$SRC" --output "$TMP/out" </dev/null >/dev/null 2>&1
 grep -q "appdb_20200102_000000.dump " "$REC/scp.log" && ! grep -q "appdb_v2" "$REC/scp.log" \
     && ok "fetch latest picks the appdb dump, not appdb_v2" || nok "fetch latest picked the wrong base: $(cat "$REC/scp.log")"
+
+# --- regex metacharacters in the base are literal; no "\/" escapes -----------
+seed
+for f in a.b_20200101_000000.dump a.b_20200102_000000.dump aXb_20200101_000000.dump; do
+    printf 'PGDMP-fake\n' > "$SB/t-pgsql/$f"
+done
+touch -t 202001010000 "$SB/t-pgsql/a.b_20200101_000000.dump" "$SB/t-pgsql/aXb_20200101_000000.dump"
+touch -t 202001020000 "$SB/t-pgsql/a.b_20200102_000000.dump"
+rm -f "$REC/script.log"
+"$BIN" dump --from "$SRC" --output "$TMP/out" --dump-name a.b --from-keep 1 </dev/null >/dev/null 2>&1
+[ -e "$SB/t-pgsql/aXb_20200101_000000.dump" ] && ok "'.' in the base name is matched literally" || nok "base a.b deleted an aXb dump"
+[ ! -e "$SB/t-pgsql/a.b_20200101_000000.dump" ] && ok "older a.b dump rotated" || nok "a.b dump not rotated"
+if grep -q '\\/' "$REC/script.log"; then nok "remote pattern contains a backslash before a slash"; else ok "remote pattern has no backslash before a slash"; fi
+
+# The helper itself: a '/' in the base is not escaped, other metacharacters are literal.
+FN="$TMP/fn.sh"
+sed -n '/^remote_dump_match_re() {/,/^}/p' "$BIN" > "$FN"
+re=$(bash -c 'source "$1"; remote_dump_match_re "$2"' _ "$FN" 'a/b.c]d')
+case "$re" in *'a/b[.]c[]]d_'*) ok "helper keeps '/' and bracket-escapes metacharacters" ;; *) nok "unexpected helper output: $re" ;; esac
+case "$re" in *'\/'*) nok "helper emits a backslash before a slash" ;; *) ok "helper emits no backslash before a slash" ;; esac
 
 exit $FAIL
