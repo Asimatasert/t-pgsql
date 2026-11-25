@@ -115,20 +115,31 @@ cmd_dump() {
             if [[ "$t" == *".*" ]]; then
                 local schema_name="${t%.*}"
                 log_info "Expanding wildcard: $t"
-                local tables=""
-                local wc_sql="SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$(sqllit "$schema_name")'"
+                local tables="" wc_rc=0
+                # format(%I) quotes upper-case/dotted names so pg_dump's pattern
+                # parser sees each schema.table exactly.
+                local wc_sql="SELECT format('%I.%I', schemaname, tablename) FROM pg_tables WHERE schemaname='$(sqllit "$schema_name")'"
                 if [ "$FROM_TYPE" = "ssh" ]; then
                     local wc_pre; wc_pre="$(remote_pgpass_preamble "$FROM_DB_USER" "$FROM_DB_PASSWORD")"
                     tables=$(ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-                        "${wc_pre}psql -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -d $(pq "$FROM_DATABASE") -tAc $(pq "$wc_sql")")
+                        "${wc_pre}psql -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -d $(pq "$FROM_DATABASE") -tAc $(pq "$wc_sql")") || wc_rc=$?
                 else
                     setup_local_pgpass "$FROM_DB_USER" "$FROM_DB_PASSWORD"
-                    tables=$(psql -U "$FROM_DB_USER" -h "$FROM_DB_HOST" -p "$FROM_DB_PORT" -d "$FROM_DATABASE" -tAc "$wc_sql")
+                    tables=$(psql -U "$FROM_DB_USER" -h "$FROM_DB_HOST" -p "$FROM_DB_PORT" -d "$FROM_DATABASE" -tAc "$wc_sql") || wc_rc=$?
                     cleanup_local_pgpass
                 fi
-                for tbl in $tables; do
+                if [ "$wc_rc" -ne 0 ]; then
+                    # Fail closed: dumping without the exclusion would leak data the
+                    # user asked to keep out of the dump.
+                    log_error "Could not expand --exclude-data pattern '$t' (table lookup failed); aborting dump"
+                    rm -f "$dump_file"
+                    return 1
+                fi
+                local tbl
+                while IFS= read -r tbl; do
+                    [ -z "$tbl" ] && continue
                     exclude_opts="$exclude_opts --exclude-table-data=$(pq "$tbl")"
-                done
+                done <<< "$tables"
             else
                 exclude_opts="$exclude_opts --exclude-table-data=$(pq "$t")"
             fi
