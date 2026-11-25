@@ -30,6 +30,16 @@ $body"
     return 0
 }
 
+# Extended regex matching exactly one base name's staged dumps on a remote
+# host: base + _YYYYMMDD_HHMMSS (+ optional _N) + .dump (+ compression ext).
+# Mirrors list_dumps_for_base so "prod" never matches "prod_v2_...".
+# The result has no ^ or / anchor; callers add their own.
+remote_dump_match_re() {
+    local esc
+    esc=$(printf '%s' "$1" | sed 's/[][\.^$*+?(){}|/]/\\&/g')
+    printf '%s%s' "$esc" '_[0-9]{8}_[0-9]{6}(_[0-9]+)?\.dump(\.zst|\.xz|\.bz2)?$'
+}
+
 cmd_dump() {
     meta_start
     log_info "Starting dump..."
@@ -176,9 +186,10 @@ cmd_dump() {
         # manages its own retention, and -1 means keep everything on the source.
         local stale_min=$(( $(parse_time_to_seconds "$FROM_STALE") / 60 ))
         if [ "$FROM_KEEP" -eq 0 ] && [ "$stale_min" -gt 0 ]; then
-            local stale_out
-            stale_out=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-                "find $(pq "$remote_dump_dir") -maxdepth 1 -name $(pq "${dump_base_name}_*.dump*") -mmin +${stale_min} -print -delete 2>/dev/null")
+            local stale_out stale_re
+            stale_re="/$(remote_dump_match_re "$dump_base_name")"
+            stale_out=$(ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+                "find $(shq "$remote_dump_dir") -maxdepth 1 -type f -mmin +${stale_min} -print 2>/dev/null | grep -E $(shq "$stale_re") | while IFS= read -r f; do rm -f -- \"\$f\" && printf '%s\\n' \"\$f\"; done")
             if [ -n "$stale_out" ]; then
                 log_info "Purged $(echo "$stale_out" | wc -l | tr -d ' ') stale source dump(s) older than ${FROM_STALE}"
             fi
@@ -268,8 +279,9 @@ cmd_dump() {
             elif [ $result -eq 0 ] && [ "$FROM_KEEP" -gt 0 ]; then
                 log_info "Keeping last $FROM_KEEP dump(s) on source..."
                 local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-                local cleanup_cmd="cd $(pq "$remote_dump_dir") && ls -t $(pq "$dump_base_name")_*.dump* 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
-                ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
+                local keep_re; keep_re="^$(remote_dump_match_re "$dump_base_name")"
+                local cleanup_cmd="cd $(shq "$remote_dump_dir") && ls -t -- $(shq "$dump_base_name")_*.dump* 2>/dev/null | grep -E $(shq "$keep_re") | tail -n +$((FROM_KEEP + 1)) | while IFS= read -r f; do rm -f -- \"\$f\"; done"
+                ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
             elif [ $result -eq 0 ]; then
                 log_info "Keeping source dump (--from-keep -1)"
             fi
