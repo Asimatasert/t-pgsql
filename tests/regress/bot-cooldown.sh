@@ -39,7 +39,7 @@ jobs:
     from:
       profile: stage
 YAML
-touch "$OUT/mydb_20260101_000000.dump" "$OUT/custom_20260101_000000.dump" "$OUT/profdb_20260101_000000.dump"
+for f in mydb custom profdb; do printf 'PGDMP' > "$OUT/${f}_20260101_000000.dump"; done
 
 for job in nightly named viaprofile; do
     msg=$(bot_check_cooldown "$TMP/jobs.yaml" "$job" "1h")
@@ -51,7 +51,7 @@ msg=$(bot_check_cooldown "$TMP/jobs.yaml" nightly "1h")
 [ -z "$msg" ] && ok "old dump does not trigger cooldown" || nok "old dump triggered cooldown"
 
 # A dump named after the job (not the database) must not be what is matched.
-rm -f "$OUT"/*; touch "$OUT/nightly_20260101_000000.dump"
+rm -f "$OUT"/*; printf 'PGDMP' > "$OUT/nightly_20260101_000000.dump"
 msg=$(bot_check_cooldown "$TMP/jobs.yaml" nightly "1h")
 [ -z "$msg" ] && ok "file named after the job is not matched" || nok "file named after the job was matched"
 
