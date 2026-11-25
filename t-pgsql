@@ -651,7 +651,8 @@ ${details}
 🕐 ${timestamp}"
 
     # On a failure notification, attach an inline "re-run backup" button whose
-    # callback_data the running bot (t-pgsql bot) understands: backup:<yaml>:<job>.
+    # callback_data the running bot (t-pgsql bot) understands: backup:<yaml>:<job>, or the
+    # short form backup:<job> (the bot then uses the yaml it was started with).
     local callback_data=""
     if [ -n "$JOBS_FILE" ] && [ -n "$CURRENT_JOB_NAME" ]; then
         callback_data="backup:$(basename "$JOBS_FILE"):${CURRENT_JOB_NAME}"
@@ -659,21 +660,34 @@ ${details}
         callback_data="backup:$(basename "$JOBS_FILE"):all"
     fi
 
+    # Telegram rejects callback_data longer than 64 BYTES (the whole request fails with
+    # BUTTON_DATA_INVALID). Fall back to the short form, and send no button at all if even
+    # that is too long.
+    if [ -n "$callback_data" ] && [ "$(printf '%s' "$callback_data" | LC_ALL=C wc -c | tr -d ' ')" -gt 64 ]; then
+        callback_data=""
+        [ -n "$CURRENT_JOB_NAME" ] && callback_data="backup:${CURRENT_JOB_NAME}"
+        if [ "$(printf '%s' "$callback_data" | LC_ALL=C wc -c | tr -d ' ')" -gt 64 ]; then
+            callback_data=""
+        fi
+    fi
+
     local reply_markup=""
     if [[ "$emoji" == "❌" ]] && [ -n "$callback_data" ]; then
         reply_markup='{"inline_keyboard":[[{"text":"🔄 Re-run Backup","callback_data":"'"$(json_escape "${callback_data}")"'"}]]}'
     fi
 
-    # Base args WITHOUT parse_mode; parse_mode is added only to the first (Markdown) attempt
-    # so the plain-text retry can reuse the exact same base (no fragile array filtering).
+    # Base args WITHOUT parse_mode and WITHOUT the button: parse_mode and reply_markup are
+    # added only to the first (Markdown) attempt, so the plain-text retry cannot be sunk by
+    # either of them.
     local base_args=(-X POST
         --data-urlencode "chat_id=${chat_id}"
         --data-urlencode "text=${text}"
         -d "disable_web_page_preview=true")
     [ -n "$thread_id" ] && base_args+=(-d "message_thread_id=${thread_id}")
-    [ -n "$reply_markup" ] && base_args+=(-d "reply_markup=${reply_markup}")
+    local markup_args=()
+    [ -n "$reply_markup" ] && markup_args=(--data-urlencode "reply_markup=${reply_markup}")
 
-    local response=$(tg_api "$token" sendMessage -S "${base_args[@]}" -d "parse_mode=Markdown" 2>&1)
+    local response=$(tg_api "$token" sendMessage -S "${base_args[@]}" "${markup_args[@]}" -d "parse_mode=Markdown" 2>&1)
     if echo "$response" | grep -q '"ok":true'; then
         log_debug "Telegram notification sent"
         return 0
