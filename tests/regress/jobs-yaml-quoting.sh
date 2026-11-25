@@ -66,12 +66,12 @@ $COMMON
 EOF
 
 ( cd "$TMP" && t-pgsql batch all --yaml "$TMP/jobs.yaml" --continue-on-error >"$TMP/run.out" 2>&1 </dev/null )
-has() { ls "$TMP/out" 2>/dev/null | grep -qF -- "$1"; }
+has() { local f; for f in "$TMP"/out/*; do case "${f##*/}" in *"$1"*) return 0 ;; esac; done; return 1; }
 has 'q #name_'      && ok "double-quoted value keeps ' #'"                || nok "double-quoted value keeps ' #'"
 has "it's_"         && ok "single-quoted '' becomes one apostrophe"        || nok "single-quoted '' becomes one apostrophe"
 has 'say "hi"_'     && ok "escaped double quotes inside double quotes"      || nok "escaped double quotes inside double quotes"
 has 'plain_'        && ok "an unquoted ' #' still starts a comment"         || nok "an unquoted ' #' still starts a comment"
-ls "$TMP/out" 2>/dev/null | grep -q '^plain #' && nok "the comment is not part of the plain value" || ok "the comment is not part of the plain value"
+has 'plain #' && nok "the comment is not part of the plain value" || ok "the comment is not part of the plain value"
 has 'arg #name_'    && ok "a quoted ' #' inside an args: line is kept"      || nok "a quoted ' #' inside an args: line is kept"
 
 if cat "$TMP"/rec/curl.*.stdin 2>/dev/null | grep -q 'bot616161:CMTSECRET/sendMessage'; then
