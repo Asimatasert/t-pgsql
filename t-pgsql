@@ -526,8 +526,35 @@ json_escape() {
 # Usage: tg_api <token> <method> [curl args...]
 tg_api() {
     local token="$1" method="$2"; shift 2
-    printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$token" "$method" \
-        | curl -s -K - "$@"
+    printf 'url = "%s"\n' "$(_curl_cfg_quote "https://api.telegram.org/bot${token}/${method}")" \
+        | curl -s --connect-timeout 10 --max-time 30 -K - "$@"
+}
+
+# Escape a value for use inside a double-quoted string of a curl config (-K) file:
+# backslash and double quote are escaped, line breaks are dropped (they would end the line).
+_curl_cfg_quote() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//$'\n'/}"
+    v="${v//$'\r'/}"
+    printf '%s' "$v"
+}
+
+# Only plain http(s) URLs are accepted for webhook/slack channels.
+_notify_url_ok() {
+    [[ "$1" =~ ^https?://[^[:space:]]+$ ]]
+}
+
+# POST a JSON payload. The URL (often a secret) goes to curl through a config on stdin
+# (-K -), never on the command line; --fail turns an HTTP error into a non-zero status.
+# Prints curl's output (response body or error text); returns curl's status.
+# Usage: curl_post_json <url> <json-payload>
+curl_post_json() {
+    local url="$1" payload="$2"
+    printf 'url = "%s"\n' "$(_curl_cfg_quote "$url")" \
+        | curl -sS --fail --connect-timeout 10 --max-time 30 -K - \
+            -X POST -H "Content-Type: application/json" -d "$payload" 2>&1
 }
 
 # Mask a notification channel spec for logs: keep the channel name, hide everything after
@@ -582,6 +609,9 @@ send_notification() {
             *)          log_warn "Unknown notification channel: $(mask_notify_spec "$channel")" ;;
         esac
     done
+
+    # A delivery problem is logged by the sender; it must never fail the operation.
+    return 0
 }
 
 # Resolve the "telegram:TOKEN:CHAT[:THREAD]" string for a bare "telegram"
@@ -643,14 +673,14 @@ ${details}
     [ -n "$thread_id" ] && base_args+=(-d "message_thread_id=${thread_id}")
     [ -n "$reply_markup" ] && base_args+=(-d "reply_markup=${reply_markup}")
 
-    local response=$(tg_api "$token" sendMessage "${base_args[@]}" -d "parse_mode=Markdown" 2>&1)
+    local response=$(tg_api "$token" sendMessage -S "${base_args[@]}" -d "parse_mode=Markdown" 2>&1)
     if echo "$response" | grep -q '"ok":true'; then
         log_debug "Telegram notification sent"
         return 0
     fi
     # Markdown parsing fails with HTTP 400 when an interpolated db/host/error name contains a
     # Markdown metacharacter, which would silently drop the whole alert. Retry as PLAIN TEXT.
-    response=$(tg_api "$token" sendMessage "${base_args[@]}" 2>&1)
+    response=$(tg_api "$token" sendMessage -S "${base_args[@]}" 2>&1)
     if echo "$response" | grep -q '"ok":true'; then
         log_debug "Telegram notification sent (plain-text fallback)"
     else
@@ -666,7 +696,10 @@ notify_webhook() {
     local timestamp="$5"
 
     local url="${channel#webhook:}"
-
+    if ! _notify_url_ok "$url"; then
+        log_warn "Webhook notification skipped: the URL must start with http:// or https://"
+        return 1
+    fi
     local payload=$(cat <<EOF
 {
     "status": "$(json_escape "$status")",
@@ -679,9 +712,12 @@ notify_webhook() {
 EOF
 )
 
-    local response=$(curl -s -X POST "$url" \
-        -H "Content-Type: application/json" \
-        -d "$payload" 2>&1)
+    local response
+    response=$(curl_post_json "$url" "$payload")
+    if [ $? -ne 0 ]; then
+        log_warn "Webhook notification failed: $response"
+        return 1
+    fi
 
     log_debug "Webhook response: $response"
 }
@@ -695,7 +731,10 @@ notify_slack() {
     local hostname="$6"
 
     local webhook_url="${channel#slack:}"
-
+    if ! _notify_url_ok "$webhook_url"; then
+        log_warn "Slack notification skipped: the URL must start with http:// or https://"
+        return 1
+    fi
     local color="good"
     [[ "$emoji" == "❌" ]] && color="danger"
     [[ "$emoji" == "⚠️" ]] && color="warning"
@@ -712,9 +751,12 @@ notify_slack() {
 EOF
 )
 
-    curl -s -X POST "$webhook_url" \
-        -H "Content-Type: application/json" \
-        -d "$payload" >/dev/null 2>&1
+    local response
+    response=$(curl_post_json "$webhook_url" "$payload")
+    if [ $? -ne 0 ]; then
+        log_warn "Slack notification failed: $response"
+        return 1
+    fi
 
     log_debug "Slack notification sent"
 }
@@ -730,7 +772,12 @@ notify_email() {
     if command -v mail &>/dev/null; then
         echo -e "Status: $status\n\n$message\n\nDetails:\n$details" | \
             mail -s "[t-pgsql] $status: $message" "$email"
-        log_debug "Email notification sent to $email"
+        if [ $? -eq 0 ]; then
+            log_debug "Email notification sent to $email"
+        else
+            log_warn "Email notification to $email failed"
+            return 1
+        fi
     else
         log_warn "mail command not found, skipping email notification"
     fi
