@@ -40,6 +40,42 @@ remote_dump_match_re() {
     printf '%s%s' "$esc" '_[0-9]{8}_[0-9]{6}(_[0-9]+)?\.dump(\.zst|\.xz|\.bz2)?$'
 }
 
+# Confirm a freshly created dump is non-empty and readable for its format
+# before any rotation removes older dumps. A missing validation tool only
+# produces a warning (the non-empty check still applies).
+verify_dump_integrity() {
+    local f="$1" tool=""
+    if [ ! -s "$f" ]; then
+        log_error "Integrity check failed: $f is missing or empty"
+        return 1
+    fi
+    case "$f" in
+        *.tar.gz)   tool=tar ;;
+        *.dump.zst) tool=zstd ;;
+        *.dump.xz)  tool=xz ;;
+        *.dump.bz2) tool=bzip2 ;;
+        *.dump)     tool=pg_restore ;;
+        *) return 0 ;;
+    esac
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        log_warn "Cannot verify $(basename "$f"): '$tool' not found; skipping readability check"
+        return 0
+    fi
+    local ok=false
+    case "$tool" in
+        tar)        tar -tzf "$f" >/dev/null 2>&1 && ok=true ;;
+        zstd)       zstd -t -q "$f" >/dev/null 2>&1 && ok=true ;;
+        xz)         xz -t "$f" >/dev/null 2>&1 && ok=true ;;
+        bzip2)      bzip2 -t "$f" >/dev/null 2>&1 && ok=true ;;
+        pg_restore) pg_restore -l "$f" >/dev/null 2>&1 && ok=true ;;
+    esac
+    if [ "$ok" != true ]; then
+        log_error "Integrity check failed: $(basename "$f") is not a readable archive"
+        return 1
+    fi
+    return 0
+}
+
 cmd_dump() {
     meta_start
     log_info "Starting dump..."
@@ -282,6 +318,15 @@ cmd_dump() {
                 fi
             fi
 
+            # Never delete older source dumps (or the source copy) unless the
+            # copy we just received is readable.
+            if [ $result -eq 0 ] && [ "$FROM_KEEP" -ge 0 ]; then
+                if ! verify_dump_integrity "$dump_file"; then
+                    log_error "Keeping existing dumps on the source"
+                    result=1
+                fi
+            fi
+
             # Cleanup based on FROM_KEEP — ONLY after a successful transfer, so a
             # failed copy never deletes the only remaining copy on the source.
             if [ $result -eq 0 ] && [ "$FROM_KEEP" -eq 0 ]; then
@@ -325,6 +370,17 @@ cmd_dump() {
                     bzip2) dump_file="${dump_file}.bz2" ;;
                 esac
             fi
+        fi
+
+        # Make sure the new dump is readable BEFORE it is wrapped in metadata or
+        # any rotation removes older dumps; a truncated or corrupt dump must not
+        # replace the good ones.
+        if ! verify_dump_integrity "$dump_file"; then
+            log_error "Keeping older dumps; removing the unreadable new dump"
+            rm -f "$dump_file" 2>/dev/null
+            local _ve; _ve=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+            send_notification "failed" "Dump failed: ${dump_base_name}" "$(build_notify_details "DUMP" "Failed" "$_ve")"
+            return 1
         fi
 
         # Size of the final artifact that actually exists on disk
