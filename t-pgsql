@@ -3195,22 +3195,32 @@ _stream_release() {
 # ==============================================================================
 # Identity of the database a parsed connection (FROM or TO globals) points at, normalised so
 # that spellings of the same endpoint compare equal: loopback names/addresses/socket paths
-# collapse to one host, an empty or zero-padded port becomes the default, host case is
-# ignored, and an ssh connection whose database host is loopback is identified by its ssh
-# host (that is where the server really runs). The database user does not change which
-# database it is, so it is not part of the key. Names that merely resolve to the same
-# address (DNS aliases, ssh config aliases) cannot be detected without network access.
+# collapse to one host, empty or zero-padded ports become the default, host case is
+# ignored. An ssh connection is identified by (ssh host, ssh port, db host, db port,
+# database); the ssh port matters because different machines are often reached through one
+# ssh host name on different ports (tunnels, containers). An ssh connection is only equal
+# to a direct connection when that is certain: the ssh host is a loopback name AND the ssh
+# port is 22 (it is this machine). Any other ssh connection never equals a direct one. The
+# database user is not part of the key. Names that merely resolve to the same address
+# (DNS aliases, ssh config aliases) cannot be detected without network access.
 _clone_endpoint_key() {
-    local p="$1" t h dbh port
+    local p="$1" t v dbh port sshh sshp db
     t="${p}_TYPE"; t="${!t}"
-    h="${p}_DB_HOST"; dbh="$(_clone_norm_host "${!h}")"
-    if [ "$t" = "ssh" ] && [ "$dbh" = "loopback" ]; then
-        h="${p}_SSH_HOST"; dbh="$(_clone_norm_host "${!h}")"
-    fi
+    v="${p}_DB_HOST"; dbh="$(_clone_norm_host "${!v}")"
     port="${p}_DB_PORT"; port="${!port}"
     [[ "$port" =~ ^[0-9]+$ ]] && port=$((10#$port)) || port=5432
-    h="${p}_DATABASE"
-    printf '%s:%s/%s' "$dbh" "$port" "${!h}"
+    v="${p}_DATABASE"; db="${!v}"
+    if [ "$t" = "ssh" ]; then
+        v="${p}_SSH_HOST"; sshh="$(_clone_norm_host "${!v}")"
+        v="${p}_SSH_PORT"; sshp="${!v}"
+        [[ "$sshp" =~ ^[0-9]+$ ]] && sshp=$((10#$sshp)) || sshp=22
+        if [ "$sshh" != "loopback" ] || [ "$sshp" != 22 ]; then
+            v="${p}_SSH_HOST"; sshh="${!v}"
+            printf 'ssh|%s|%s|%s:%s/%s' "${sshh,,}" "$sshp" "$dbh" "$port" "$db"
+            return
+        fi
+    fi
+    printf 'direct|%s:%s/%s' "$dbh" "$port" "$db"
 }
 _clone_norm_host() {
     local h="${1,,}"
