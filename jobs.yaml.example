@@ -1,5 +1,5 @@
 # ==============================================================================
-# t-pgsql - Example Jobs Configuration (v3.9.0)
+# t-pgsql - Example Jobs Configuration
 # ==============================================================================
 #
 # This file contains example job definitions.
@@ -113,6 +113,20 @@ jobs:
       database: myapp_staging
     output: /backups/staging
     keep: 14
+
+  # Slow or shared link: compress on the source host, cap bandwidth, retry scp
+  daily-remote-backup-slow-link:
+    command: dump
+    from:
+      profile: production
+      database: myapp
+    output: /backups/daily
+    compress: zstd
+    compress_where: source
+    bwlimit: 10m
+    retries: 3
+    from_keep: 0
+    from_stale: 48h
 
   # ============================================================================
   # CONNECTION STRING FORMAT (Simpler for one-off jobs)
@@ -291,7 +305,8 @@ jobs:
 # 1. Password files should be stored in ~/.secrets/ directory
 # 2. Set permissions with: chmod 600 ~/.secrets/*.pass
 # 3. Add .secrets/ to .gitignore
-# 4. Using force: true will DROP the target database!
+# 4. force: true replaces the target database (restored into a temporary database
+#    and swapped in only on success, but the old data is replaced)
 # 5. Profiles can be overridden in job definitions
 # 6. Use exclude_data with schema.* wildcard: "audit.*,hr.*"
 # 7. Remote dumps are stored in /tmp/t-pgsql/ on remote servers
