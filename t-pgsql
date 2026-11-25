@@ -3089,6 +3089,35 @@ clone_stream() {
 # ==============================================================================
 # CLONE
 # ==============================================================================
+# Identity of the database a parsed connection (FROM or TO globals) points at, normalised so
+# that spellings of the same endpoint compare equal: loopback names/addresses/socket paths
+# collapse to one host, an empty or zero-padded port becomes the default, host case is
+# ignored, and an ssh connection whose database host is loopback is identified by its ssh
+# host (that is where the server really runs). The database user does not change which
+# database it is, so it is not part of the key. Names that merely resolve to the same
+# address (DNS aliases, ssh config aliases) cannot be detected without network access.
+_clone_endpoint_key() {
+    local p="$1" t h dbh port
+    t="${p}_TYPE"; t="${!t}"
+    h="${p}_DB_HOST"; dbh="$(_clone_norm_host "${!h}")"
+    if [ "$t" = "ssh" ] && [ "$dbh" = "loopback" ]; then
+        h="${p}_SSH_HOST"; dbh="$(_clone_norm_host "${!h}")"
+    fi
+    port="${p}_DB_PORT"; port="${!port}"
+    [[ "$port" =~ ^[0-9]+$ ]] && port=$((10#$port)) || port=5432
+    h="${p}_DATABASE"
+    printf '%s:%s/%s' "$dbh" "$port" "${!h}"
+}
+_clone_norm_host() {
+    local h="${1,,}"
+    if [ -z "$h" ] || [[ "$h" == /* ]] || [[ "$h" == localhost || "$h" == localhost.* ]] \
+       || [[ "$h" == "::1" || "$h" == "::" || "$h" == "0:0:0:0:0:0:0:1" || "$h" == "0.0.0.0" ]] \
+       || [[ "$h" =~ ^127\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        h="loopback"
+    fi
+    printf '%s' "$h"
+}
+
 cmd_clone() {
     log_info "Starting clone..."
 
@@ -3110,13 +3139,11 @@ cmd_clone() {
     # Refuse a source==target clone for ANY target (not just the first): clone_stream/restore
     # iterate every --to and, with --force, drop each before pg_dump finishes reading the
     # source, permanently destroying it. Capture the source identity, then check every target.
-    local _f_type="$FROM_TYPE" _f_ssh="$FROM_SSH_HOST" _f_db="${FROM_DB_HOST}:${FROM_DB_PORT}/${FROM_DATABASE}"
+    local _f_key; _f_key="$(_clone_endpoint_key FROM)"
     local _i
     for _i in "${!TO_CONNECTIONS[@]}"; do
         parse_connection "${TO_CONNECTIONS[$_i]}" "TO" || { log_error "Invalid target connection: ${TO_CONNECTIONS[$_i]}"; return 1; }
-        if [ "$_f_type" = "$TO_TYPE" ] \
-           && [ "${_f_ssh}" = "${TO_SSH_HOST}" ] \
-           && [ "${_f_db}" = "${TO_DB_HOST}:${TO_DB_PORT}/${TO_DATABASE}" ]; then
+        if [ "$_f_key" = "$(_clone_endpoint_key TO)" ]; then
             log_error "Source and target #$((_i+1)) are the same database — refusing (this would destroy it)"
             return 1
         fi
