@@ -194,15 +194,21 @@ for u in data.get('result',[]):
 
                 # Tolerate the short form "backup:<job>" (a sender may drop the yaml name to
                 # stay within Telegram's 64-byte callback_data limit): use the bot's own yaml.
+                local cb_short=""
                 if [ "$cb_action" = "backup" ] && [[ "$cb_data" != *:*:* ]] && [ -n "$cb_yaml" ]; then
                     cb_job="$cb_yaml"
                     cb_yaml=$(basename "$JOBS_FILE")
+                    cb_short=1
                 fi
                 if [ "$cb_action" = "backup" ] && ! bot_valid_job_name "$cb_job"; then
                     bot_answer_callback "$bot_token" "$cb_id" "❌ Invalid job name"
                 elif [ "$cb_action" = "backup" ]; then
                     local yaml_path
-                    yaml_path=$(bot_resolve_yaml "$cb_yaml")
+                    if [ -n "$cb_short" ]; then
+                        yaml_path="$JOBS_FILE"
+                    else
+                        yaml_path=$(bot_resolve_yaml "$cb_yaml")
+                    fi
                     if [ ! -f "$yaml_path" ]; then
                         bot_answer_callback "$bot_token" "$cb_id" "❌ YAML not found: ${cb_yaml}"
                     else

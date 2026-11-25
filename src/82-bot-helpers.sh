@@ -77,6 +77,17 @@ bot_valid_job_name() {
 bot_resolve_yaml() {
     local name="$1"
 
+    # The yaml the bot was started with is always addressable: by its base name, by the
+    # base name without ".yaml", or by the exact path it was started with.
+    if [ -n "$JOBS_FILE" ]; then
+        local own_base
+        own_base=$(basename "$JOBS_FILE")
+        if [ "$name" = "$JOBS_FILE" ] || [ "$name" = "$own_base" ] || [ "$name" = "${own_base%.yaml}" ]; then
+            echo "$JOBS_FILE"
+            return
+        fi
+    fi
+
     # Chat input: only a plain file name inside SCRIPT_DIR is accepted. Paths,
     # "..", leading dots/dashes and unusual characters resolve to nothing.
     if [[ ! "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || [[ "$name" == *..* ]]; then
