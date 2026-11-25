@@ -1294,6 +1294,47 @@ show_version() {
 # ==============================================================================
 # CONNECTION PARSER
 # ==============================================================================
+# ------------------------------------------------------------------------------
+# Connection-field validation. Values from a connection string end up as ssh/scp
+# destinations and as psql/pg_dump arguments; a value starting with '-' would be parsed as
+# an option (e.g. an ssh user "-oProxyCommand=..." runs a local command).
+# ------------------------------------------------------------------------------
+# Reject (return 1) an SSH user/host: leading '-', whitespace/control characters, or shell
+# metacharacters.
+_conn_ssh_token_ok() {
+    case "$1" in
+        '') return 1 ;;
+        -*) return 1 ;;
+        *[[:cntrl:][:space:]]*) return 1 ;;
+        *[\;\&\|\<\>\(\)\$\`\\\"\'\*\?\[\]\{\}\!\#\~\^]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Validate the parsed fields; log the reason and return 1 on the first problem.
+# Usage: _conn_validate <ssh_user> <ssh_host> <ssh_port> <db_user> <db_host> <db_port> <db>
+# (pass '' for the ssh_* fields of a local connection)
+_conn_validate() {
+    local ssh_user="$1" ssh_host="$2" ssh_port="$3" db_user="$4" db_host="$5" db_port="$6" db="$7"
+    if [ -n "$ssh_user$ssh_host" ]; then
+        _conn_ssh_token_ok "$ssh_user" || { log_error "Invalid SSH user in connection string (must not start with '-' or contain spaces/shell metacharacters)"; return 1; }
+        _conn_ssh_token_ok "$ssh_host" || { log_error "Invalid SSH host in connection string (must not start with '-' or contain spaces/shell metacharacters)"; return 1; }
+        [[ "$ssh_port" =~ ^[0-9]+$ ]] || { log_error "Invalid SSH port in connection string: must be a number"; return 1; }
+    fi
+    case "$db_user" in -*) log_error "Invalid database user in connection string: must not start with '-'"; return 1 ;; esac
+    case "$db_host" in -*) log_error "Invalid database host in connection string: must not start with '-'"; return 1 ;; esac
+    [[ "$db_port" =~ ^[0-9]+$ ]] || { log_error "Invalid database port in connection string: must be a number"; return 1; }
+    case "$db" in
+        -*) log_error "Invalid database name: must not start with '-'"; return 1 ;;
+        *=*|postgres://*|postgresql://*)
+            # libpq treats a dbname containing '=' or a URI prefix as a full connection
+            # string, which could redirect the connection (and the password) elsewhere.
+            log_error "Invalid database name: must not contain '=' or start with a connection URI prefix"
+            return 1 ;;
+    esac
+    return 0
+}
+
 parse_connection() {
     local conn="$1"
     local prefix="$2"
@@ -1375,6 +1416,7 @@ parse_local_connection() {
     fi
 
     [ -z "$db" ] && { log_error "Missing database: $1"; return 1; }
+    _conn_validate "" "" "" "$user" "$host" "$port" "$db" || return 1
 
     printf -v "${prefix}_TYPE" '%s' 'local'
     printf -v "${prefix}_DB_USER" '%s' "$user"
@@ -1464,6 +1506,8 @@ parse_ssh_connection() {
 
     # If db_user not specified, use "postgres" as default
     [ -z "$db_user" ] && db_user="postgres"
+
+    _conn_validate "$ssh_user" "$ssh_host" "$ssh_port" "$db_user" "$db_host" "$db_port" "$db" || return 1
 
     printf -v "${prefix}_TYPE" '%s' 'ssh'
     printf -v "${prefix}_SSH_USER" '%s' "$ssh_user"
