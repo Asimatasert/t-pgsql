@@ -1,233 +1,475 @@
-.TH T-PGSQL 1 "January 2026" "t-pgsql 3.9.0" "User Commands"
+.TH T-PGSQL 1 "July 31, 2026" "t-pgsql 3.12.1" "User Commands"
 .SH NAME
 t-pgsql \- PostgreSQL database sync, backup and clone tool
 .SH SYNOPSIS
 .B t-pgsql
 .I command
 .RI [ options ]
+.br
+.B t-pgsql
+.B \-\-batch
+.IR job | all
+.RI [ options ]
 .SH DESCRIPTION
 .B t-pgsql
-is a powerful tool for PostgreSQL database operations including backup, restore, clone, and sync between local and remote servers via SSH.
+dumps, restores, clones, streams and masks PostgreSQL databases, locally or over
+SSH, and runs batches of saved jobs from a YAML file.
+It also sends notifications (Telegram, Slack, webhook, e-mail) and can run a
+Telegram bot that triggers backups from a chat.
+.PP
+A local or TCP connection is written as
+.PP
+.RS
+.B [user@]host[:port]/database
+.RE
+.PP
+A database reached through SSH is written as
+.PP
+.RS
+.B ssh://[ssh_user@]ssh_host[:ssh_port]/[db_user@]db_host[:db_port]/database
+.RE
 .SH COMMANDS
 .TP
 .B dump
-Create a database backup (pg_dump)
+Create a database backup (pg_dump).
 .TP
 .B restore
-Restore a backup to database (pg_restore)
+Restore a backup to a database (pg_restore).
 .TP
 .B clone
-Full sync: dump + restore in one operation
+Dump and restore in one operation (full sync).
+.TP
+.B upgrade
+Logical major-version migration: a clone that also migrates cluster globals
+(roles, tablespaces) and refuses to restore into an older major version.
+This is the dump/restore path, not a replacement for pg_upgrade or logical replication.
 .TP
 .B fetch
-Fetch existing dump file from remote server
+Fetch an existing dump file from a remote server without creating a new dump.
 .TP
-.B batch
-Run multiple jobs from jobs.yaml
+.BR batch " [" \fIjob | all ]
+Run one saved job, or all of them, from the jobs file.
+.TP
+.B bot
+Run the Telegram bot, which listens for chat commands and inline button callbacks
+and starts backup jobs. It runs until it is stopped.
 .TP
 .B jobs
-Manage saved jobs (list, show, remove)
+Manage saved jobs:
+.B jobs list
+(the default),
+.BI "jobs show " name
+and
+.BI "jobs remove " name .
 .TP
 .B list
-List dump files in output directory
+List dump files in the output directory.
 .TP
 .B meta
-Show metadata for dump files
+Show the metadata of a dump (the newest one, or the one given with
+.BR \-\-file ).
 .TP
-.B clean
-Clean old dump files
+.BR clean " [\fIdatabase\fR]"
+Remove old dumps. A target is required (a database name,
+.B \-\-from
+or
+.BR \-\-dump\-name )
+together with
+.B \-\-keep
+or
+.BR \-\-retention .
+.TP
+.B doctor
+Run read-only checks of the environment and backup health: required and optional
+tools, output directory and free disk space, freshness of the newest dump of each
+database, readability of the newest archives and the jobs file.
+With
+.B \-\-from
+and
+.B \-\-to
+it also tests connectivity.
+.TP
+.BR explain " [\fItopic\fR]"
+Print a built-in explanation of what a command is for. Without a topic the topics
+are listed (dump, restore, clone, stream, upgrade, fetch, batch, bot, list, meta,
+clean, doctor, masking, retention).
 .TP
 .B version
-Show version information
+Show the version.
 .TP
 .B help
-Show help message
+Show the help message.
 .SH CONNECTION OPTIONS
 .TP
-.BR \-\-from " " \fIconnection\fR
-Source connection string. Format: [ssh://user@host/]dbuser@dbhost[:port]/database
+.BI \-\-from " connection"
+Source connection.
 .TP
-.BR \-\-to " " \fIconnection\fR
-Target connection string. Same format as --from
+.BI \-\-to " connection"
+Target connection. May be given several times to restore to several targets.
+.SH PASSWORD OPTIONS
+Passwords given on the command line are visible to other users in the process list.
+Prefer password files or the environment variables listed under
+.BR ENVIRONMENT .
+When several sources are present, the order is: command-line password, environment
+variable, password file, interactive prompt.
 .TP
-.BR \-\-password " " \fIpassword\fR
-Database password (not recommended, use password-file)
+.BI \-\-password " password"
+Password for both connections.
 .TP
-.BR \-\-from\-password " " \fIpassword\fR
-Source database password
+.BI \-\-from\-password " password"
+Source password.
 .TP
-.BR \-\-to\-password " " \fIpassword\fR
-Target database password
+.BI \-\-to\-password " password"
+Target password.
 .TP
-.BR \-\-password\-file " " \fIfile\fR
-Read password from file
+.BI \-\-password\-file " file"
+Read the password from a file.
 .TP
-.BR \-\-from\-password\-file " " \fIfile\fR
-Read source password from file
+.BI \-\-from\-password\-file " file"
+Read the source password from a file.
 .TP
-.BR \-\-to\-password\-file " " \fIfile\fR
-Read target password from file
+.BI \-\-to\-password\-file " file"
+Read the target password from a file. May be given once for all targets or once
+per
+.BR \-\-to .
+.TP
+.BI \-\-config " file"
+Per-run defaults file (simple key: value lines). It is not the batch jobs file; use
+.B \-\-yaml
+for that. Command-line options override it.
 .SH FILTERING OPTIONS
 .TP
-.BR \-\-exclude\-table " " \fItables\fR
-Exclude tables (comma-separated)
+.BI \-\-exclude\-table " tables"
+Exclude tables (comma-separated).
 .TP
-.BR \-\-exclude\-schema " " \fIschemas\fR
-Exclude schemas (comma-separated)
+.BI \-\-exclude\-schema " schemas"
+Exclude schemas (comma-separated).
 .TP
-.BR \-\-exclude\-data " " \fItables\fR
-Exclude data only, keep structure. Supports schema.* wildcard (e.g., audit.*)
+.BI \-\-exclude\-data " tables"
+Exclude table data but keep the structure. Supports the schema.* wildcard.
 .TP
-.BR \-\-only\-table " " \fItables\fR
-Only include these tables
+.BI \-\-only\-table " tables"
+Include only these tables.
 .TP
-.BR \-\-only\-schema " " \fIschemas\fR
-Only include these schemas
+.BI \-\-only\-schema " schemas"
+Include only these schemas.
 .SH COMPRESSION OPTIONS
 .TP
-.BR \-\-compress " " \fItype\fR
-Compression type: gzip (default), zstd, xz, bzip2, none
+.BI \-\-compress " type"
+Compression type: gzip (default), zstd, xz, bzip2 or none.
 .TP
-.BR \-\-compress\-level " " \fI1-9\fR
-Compression level (default: 6)
+.BI \-\-compress\-level " n"
+Level for the selected compressor (default 6). gzip, xz and bzip2: 1-9; zstd: 1-19.
 .TP
-.BR \-\-pg\-compress\-level " " \fI0-9\fR
-pg_dump internal compression level
+.BI \-\-pg\-compress\-level " n"
+Override pg_dump's built-in compression level, 0-9 (gzip only; default 6).
+.TP
+.BI \-\-compress\-where " where"
+For SSH dumps with zstd, xz or bzip2: "source" compresses on the source host before
+the copy, "target" (the default) compresses locally after it. Falls back to target
+if the tool is missing on the source.
 .SH STORAGE OPTIONS
 .TP
-.BR \-\-output " " \fIdirectory\fR
-Output directory for dumps
+.BI \-\-output " directory"
+Output directory for dumps. Default: $T_PGSQL_OUTPUT_DIR, otherwise
+<script directory>/../data/dumps.
 .TP
-.BR \-\-keep " " \fIn\fR
-Keep last n local dumps
+.BI \-\-dump\-name " name"
+Custom dump file name (without timestamp).
 .TP
-.BR \-\-from\-keep " " \fIn\fR
-Keep last n dumps on source server (0=delete all, -1=keep all)
+.BI \-\-keep " n"
+Keep the last n local dumps (\-1 keeps all, 0 keeps none; default \-1).
+.TP
+.BI \-\-archive\-output " directory"
+When a dump ages out of
+.BR \-\-keep ,
+move it to this directory instead of deleting it.
+.TP
+.BI \-\-archive\-keep " n"
+Keep the last n dumps in the archive directory (\-1 keeps all, 0 deletes immediately;
+default \-1).
+.TP
+.BI \-\-from\-keep " n"
+For SSH sources: dumps to keep in the remote staging directory (default 1, \-1 keeps
+all, 0 deletes).
+.TP
+.BI \-\-from\-stale " time"
+With
+.BR "\-\-from\-keep 0" ,
+purge this job's leftover staging dumps older than
+.I time
+before dumping (default 72h, 0 disables). Examples: 48h, 2d.
+.TP
+.BI \-\-skip\-if\-recent " time"
+Skip the dump if one exists within the timeframe (24h, 12h, 1d, today).
+.TP
+.BR \-\-from\-file " [\fIpattern\fR]"
+Select an existing dump for the
+.B fetch
+command. Without a value the latest dump for the database is used. The pattern is a
+file name or a glob.
+.TP
+.BI \-\-file " path"
+Dump file to restore, or archive to show with
+.BR meta .
 .SH RETENTION OPTIONS (GFS)
 .TP
 .B \-\-retention
-Enable Grandfather-Father-Son retention policy
+Enable Grandfather-Father-Son retention. The newest dump is always kept.
 .TP
-.BR \-\-retention\-daily " " \fIn\fR
-Keep n daily backups (default: 7)
+.BI \-\-retention\-daily " n"
+Daily backups to keep (default 7).
 .TP
-.BR \-\-retention\-weekly " " \fIn\fR
-Keep n weekly backups (default: 4)
+.BI \-\-retention\-weekly " n"
+Weekly backups to keep (default 4).
 .TP
-.BR \-\-retention\-monthly " " \fIn\fR
-Keep n monthly backups (default: 12)
+.BI \-\-retention\-monthly " n"
+Monthly backups to keep (default 12).
 .TP
-.BR \-\-retention\-yearly " " \fIn\fR
-Keep n yearly backups (default: 3)
+.BI \-\-retention\-yearly " n"
+Yearly backups to keep (default 3).
+.SH HEALTH CHECK OPTIONS
+.TP
+.B \-\-health\-check
+Check the connection before the operation (default).
+.TP
+.B \-\-health\-check\-after
+Also check after the operation.
+.TP
+.B \-\-no\-health\-check
+Disable health checks.
+.TP
+.B \-\-health\-check\-fail
+Abort when a health check fails.
 .SH NOTIFICATION OPTIONS
 .TP
-.BR \-\-notify " " \fIchannel\fR
-Send notifications (telegram, slack, webhook, email)
+.BI \-\-notify " channel"
+Notification channel; may be given several times. Channels: telegram,
+telegram:TOKEN:CHAT, webhook:URL, email:ADDRESS, slack:URL.
 .TP
 .B \-\-notify\-on\-error
-Only send notifications on error
+Notify only on errors.
+.TP
+.B \-\-notify\-summary
+Send one summary notification after a batch.
 .SH MASKING OPTIONS
 .TP
 .B \-\-mask
-Enable data masking
+Mask sensitive data after the restore. Not supported with
+.BR \-\-stream .
 .TP
-.BR \-\-mask\-rules " " \fIfile\fR
-Masking rules file
+.BI \-\-mask\-rules " file"
+JSON file with masking rules.
 .TP
-.BR \-\-mask\-tables " " \fItables\fR
-Tables to apply masking
-.SH OTHER OPTIONS
+.BI \-\-mask\-tables " tables"
+Tables to mask (comma-separated).
+.SH STREAMING AND TRANSFER OPTIONS
 .TP
 .B \-\-stream
-Enable streaming mode (direct pipe, no temp files)
+Pipe pg_dump into pg_restore without temporary files.
 .TP
-.BR \-\-stream\-buffer " " \fIMB\fR
-Stream buffer size in MB
+.BI \-\-stream\-buffer " MB"
+Buffer size in megabytes (default 64; needs pv).
+.TP
+.BI \-\-bwlimit " rate"
+Cap transfer bandwidth: 10m (MByte/s), 500k (KByte/s) or a bare number (KByte/s).
+Applies to scp copies and, with pv installed, to the streaming pipe.
+.TP
+.BI \-\-retries " n"
+Retry a failed scp transfer n extra times, with backoff (default 0).
+.SH MIGRATION OPTIONS
+.TP
+.B \-\-globals
+Also migrate cluster globals (roles, tablespaces) to every target. Implied by
+.BR upgrade .
+.TP
+.BI \-\-pg\-bindir " directory"
+Use the PostgreSQL client tools in this directory for local operations. It does not
+affect SSH sources.
 .TP
 .B \-\-sudo
-Use sudo for database commands
+On SSH sources, run pg_dump through "sudo \-u <db user>" instead of password
+authentication (peer authentication).
+.SH BATCH OPTIONS
 .TP
-.BR \-\-parallel " " \fIn\fR
-Number of parallel jobs for batch mode
+.BI \-\-yaml " name"
+Use this jobs file. A bare name resolves to <script directory>/name.yaml; a value
+containing a slash or ending in .yaml is used as given. Default: jobs.yaml next to
+the script.
+.TP
+.BI \-\-save " name"
+Save the current command line as job
+.I name
+in the jobs file instead of running it.
+.TP
+.BR \-\-batch " \fIjob\fR|all"
+Run saved job(s); the same as
+.B batch
+.IR job | all .
+.TP
+.BI \-\-parallel " n"
+Number of jobs to run at the same time (default 1).
 .TP
 .B \-\-continue\-on\-error
-Continue batch on error
+Do not stop the batch when a job fails.
 .TP
-.BR \-\-save " " \fIname\fR
-Save current command as a job
+.BI \-\-only\-jobs " jobs"
+Run only these jobs (comma-separated). Alias:
+.BR \-\-only .
 .TP
-.BR \-\-batch " " \fIname\fR
-Run saved job(s). Use "all" for all jobs
+.BI \-\-exclude\-jobs " jobs"
+Skip these jobs (comma-separated). Alias:
+.BR \-\-exclude .
+.SH BOT OPTIONS
 .TP
-.BR \-\-log " " \fIfile\fR
-Write logs to file
+.BI \-\-token " token"
+Telegram bot token. Otherwise it is read from the jobs file or from
+.BR TELEGRAM_BOT_TOKEN .
 .TP
-.BR \-\-log\-level " " \fIlevel\fR
-Log level: debug, info, warn, error
+.BI \-\-cooldown " time"
+Minimum interval between button-triggered runs of the same job, as N[h|m|d]
+(default 1h).
+.SH GENERAL OPTIONS
+.TP
+.BI \-\-log " file"
+Write log output to a file.
+.TP
+.BI \-\-log\-level " level"
+Log level: debug, info, warn or error.
 .TP
 .BR \-v ", " \-\-verbose
-Verbose output
+Verbose output.
 .TP
 .BR \-q ", " \-\-quiet
-Quiet output
+Minimal console output. Success notifications are suppressed; failures are still
+notified.
 .TP
 .BR \-y ", " \-\-yes
-Skip confirmations
+Skip confirmations.
 .TP
 .BR \-f ", " \-\-force
-Force overwrite target database
+Overwrite an existing target database. The restore goes into a temporary database
+that replaces the old one only when it succeeded. Without this option an existing
+target is an error.
 .TP
 .B \-\-dry\-run
-Show what would be done without executing
+Show what would be done without doing it.
 .TP
 .B \-\-no\-meta
-Disable metadata file generation
+Do not write metadata.
 .TP
 .BR \-h ", " \-\-help
-Show help message
+Show the help message.
 .TP
 .B \-\-version
-Show version
+Show the version.
 .SH EXAMPLES
 .TP
-Backup local database:
-t-pgsql dump --from postgres@localhost/mydb --output ./dumps
+Back up a local database:
+t-pgsql dump \-\-from postgres@localhost/mydb \-\-output ./dumps
 .TP
-Clone remote to local:
-t-pgsql clone --from 'ssh://admin@server/postgres@localhost/prod' --to postgres@localhost/dev --force
+Clone a remote database to a local one:
+t-pgsql clone \-\-from 'ssh://admin@192.0.2.20/postgres@localhost/prod' \-\-to postgres@localhost/dev \-\-from\-password\-file ~/.secrets/prod.pass \-\-to\-password\-file ~/.secrets/local.pass \-\-force
 .TP
-Clone with password files:
-t-pgsql clone --from 'ssh://admin@server/postgres@localhost/prod' --to postgres@localhost/dev --from-password-file ~/.secrets/prod.pass --to-password-file ~/.secrets/local.pass --force
+Exclude table data:
+t-pgsql clone \-\-from postgres@localhost/prod \-\-to postgres@localhost/dev \-\-exclude\-data "logs,sessions,audit.*" \-\-force
 .TP
-Exclude tables data:
-t-pgsql clone --from postgres@localhost/prod --to postgres@localhost/dev --exclude-data "logs,sessions,audit.*" --force
+Migrate to a newer major version:
+t-pgsql upgrade \-\-from postgres@old.example.com:5432/appdb \-\-to postgres@new.example.com:5432/appdb \-y
 .TP
-Run batch job:
-t-pgsql --batch prod-to-dev
+Run all jobs, two at a time:
+t-pgsql batch all \-\-yaml prod \-\-parallel 2
 .TP
-List jobs:
-t-pgsql jobs
+Check the environment:
+t-pgsql doctor
+.TP
+Learn what a command does:
+t-pgsql explain clone
+.TP
+Run the Telegram bot:
+t-pgsql bot \-\-yaml prod \-\-cooldown 30m
 .SH FILES
 .TP
 .I jobs.yaml
-Jobs configuration file located next to the t-pgsql script. Override the path with \fB\-\-yaml\fR.
+Batch jobs file located next to the t-pgsql script. Override the path with
+.BR \-\-yaml .
+See
+.IR jobs.yaml.example .
+.TP
+.I Dump files
+Written to the output directory as .tar.gz (gzip), or as .dump, .dump.zst, .dump.xz
+and .dump.bz2. Dumps that are not wrapped in a .tar.gz have a .meta metadata file
+next to them.
+.SH EXIT STATUS
+.TP
+.B 0
+The command completed successfully. This also applies to
+.BR \-\-help ,
+.B \-\-version
+and
+.B explain
+with a known topic, and to
+.B doctor
+when it found at most warnings.
+.TP
+.B 1
+An option or value was invalid, a required value or argument was missing, the command
+was unknown, or the operation failed.
+.B batch
+exits with 1 when at least one job failed, also with
+.BR \-\-continue\-on\-error .
+.B doctor
+exits with 1 when it found a problem.
+.PP
+Other non-zero values may be returned when an underlying tool such as pg_restore or
+ssh fails; do not rely on a specific value other than 0.
 .SH ENVIRONMENT
 .TP
 .B T_PGSQL_PASSWORD
-Database password for both source and target connections (overridden by --password options)
+Password for both source and target (overridden by the \-\-password options).
 .TP
 .B T_PGSQL_FROM_PASSWORD
-Source database password (overridden by --from-password options)
+Source password (overridden by \-\-from\-password).
 .TP
 .B T_PGSQL_TO_PASSWORD
-Target database password (overridden by --to-password options)
+Target password (overridden by \-\-to\-password).
+.TP
+.B T_PGSQL_OUTPUT_DIR
+Default output directory for dumps (overridden by \-\-output).
+.TP
+.B PGCONNECT_TIMEOUT
+libpq connection timeout in seconds (default 10).
+.TP
+.B TELEGRAM_BOT_TOKEN
+Bot token for the bare
+.B \-\-notify telegram
+channel and for
+.BR bot .
+.TP
+.B TELEGRAM_CHAT_ID
+Chat id for the bare
+.B \-\-notify telegram
+channel.
+.TP
+.B TELEGRAM_THREAD_ID
+Optional forum-topic thread id for Telegram notifications.
+.TP
+.B TMPDIR
+Directory for temporary files (default /tmp).
+.TP
+.B HOME
+Used to expand a leading ~ in path values read from configuration files.
 .SH SEE ALSO
 .BR pg_dump (1),
 .BR pg_restore (1),
-.BR psql (1)
+.BR psql (1),
+.BR ssh (1),
+.BR scp (1)
 .SH AUTHOR
 Asim Atasert
 .SH BUGS
 Report bugs at: https://github.com/Asimatasert/t-pgsql/issues
+.br
+Report security problems privately, see SECURITY.md in the source repository.
 .SH COPYRIGHT
 MIT License - Copyright (c) 2026 Asim Atasert
