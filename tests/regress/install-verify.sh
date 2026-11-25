@@ -151,6 +151,21 @@ check "latest API failure: no master fallback" \
 check "latest API failure: nothing installed" nothing_installed
 mv "$FIX/latest.json.off" "$FIX/latest.json"
 
+# 8b. a tarball member that is a symlink is refused (even with matching checksums)
+SYM="$T/symrel/t-pgsql-$VER"; mkdir -p "$SYM/man" "$SYM/completions"
+echo "secret" > "$T/secret.txt"
+ln -s "$T/secret.txt" "$SYM/man/t-pgsql.1"
+cp "$PK/completions/"* "$SYM/completions/"
+cp "$FIX/t-pgsql-$VER.tar.gz" "$T/good.tar.gz"
+( cd "$T/symrel" && tar -czf "$FIX/t-pgsql-$VER.tar.gz" "t-pgsql-$VER" )
+write_sums "$GOOD_BIN" "$(sha "$FIX/t-pgsql-$VER.tar.gz")"
+ENVX="VERSION=v$VER"; run
+check "symlink tarball member: aborts" rc_fail
+check "symlink tarball member: nothing installed" nothing_installed
+check "symlink tarball member: reported" out_has "not a regular file"
+cp "$T/good.tar.gz" "$FIX/t-pgsql-$VER.tar.gz"
+write_sums "$GOOD_BIN" "$GOOD_TAR"
+
 # 9. master needs the opt-in
 ENVX="VERSION=master"; run
 check "VERSION=master without opt-in: aborts" rc_fail

@@ -175,7 +175,7 @@ check_version() {
 # Download the binary (and the sums + tarball for releases) and verify all
 # of it BEFORE anything is installed.
 download_and_verify() {
-    local num tarball
+    local num tarball d m
     if [[ "$VERSION" == "master" ]]; then
         require_unverified_optin "VERSION=master (unreleased branch) has no published checksums."
         fetch "https://raw.githubusercontent.com/${REPO}/master/t-pgsql" "$TMP_DIR/t-pgsql" || \
@@ -204,13 +204,22 @@ download_and_verify() {
         tarball="t-pgsql-${num}.tar.gz"
         if fetch "https://github.com/${REPO}/releases/download/${VERSION}/${tarball}" "$TMP_DIR/$tarball" 2>/dev/null; then
             verify_asset "$TMP_DIR/$tarball" "$tarball"
-            mkdir -p "$TMP_DIR/extras"
-            if tar -xzf "$TMP_DIR/$tarball" -C "$TMP_DIR/extras" \
+            EXTRAS_WORK="$(mktemp -d "$TMP_DIR/extras.XXXXXX")"
+            if tar -xzf "$TMP_DIR/$tarball" -C "$EXTRAS_WORK" \
                 "t-pgsql-${num}/man/t-pgsql.1" \
                 "t-pgsql-${num}/completions/_t-pgsql" \
                 "t-pgsql-${num}/completions/t-pgsql.bash" \
                 "t-pgsql-${num}/completions/t-pgsql.fish" 2>/dev/null; then
-                EXTRAS_DIR="$TMP_DIR/extras/t-pgsql-${num}"
+                EXTRAS_DIR="$EXTRAS_WORK/t-pgsql-${num}"
+                # Only plain files may be installed: refuse symlinks (also as
+                # parent directories) and anything that is not a regular file.
+                for d in "$EXTRAS_DIR" "$EXTRAS_DIR/man" "$EXTRAS_DIR/completions"; do
+                    [[ -d "$d" && ! -L "$d" ]] || error "Release tarball has an unexpected directory layout. Nothing was installed."
+                done
+                for m in man/t-pgsql.1 completions/_t-pgsql completions/t-pgsql.bash completions/t-pgsql.fish; do
+                    [[ -f "$EXTRAS_DIR/$m" && ! -L "$EXTRAS_DIR/$m" ]] || \
+                        error "Release tarball member $m is not a regular file. Nothing was installed."
+                done
             else
                 warn "Release tarball has no man page/completions; skipping them."
             fi
