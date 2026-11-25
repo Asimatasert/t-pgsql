@@ -466,10 +466,18 @@ parse_job_to_args() {
     [ -n "$(get_job_value "$job" "log")" ] && args+=" --log $(pq "$(get_job_value "$job" "log")")"
     [ -n "$(get_job_value "$job" "log_level")" ] && args+=" --log-level $(pq "$(get_job_value "$job" "log_level")")"
 
-    # Notify - telegram
-    local telegram_config=$(get_job_telegram_config "$job")
-    [ -n "$telegram_config" ] && args+=" --notify $(pq "$telegram_config")"
+    # Notify channels are NOT emitted here: run_job hands them to the re-exec'd child through
+    # the environment (see get_job_notify_specs) so a bot token never lands on a process argv.
 
     echo "$args"
+}
+
+# Notification specs for a job, one per line, for run_job to pass to the child via the
+# environment. Jobs using the legacy "args:" field carry their own --notify (unchanged).
+# Usage: get_job_notify_specs "job_name"
+get_job_notify_specs() {
+    local job="$1"
+    [ -n "$(get_job_field "$job" "args")" ] && return 0
+    get_job_telegram_config "$job"
 }
 

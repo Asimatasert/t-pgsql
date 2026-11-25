@@ -275,6 +275,11 @@ run_job() {
     log_info "Running job: $job_name"
     log_debug "Command: $job_cmd $(redact_args "$job_args")"
 
+    # Notification specs (they contain the bot token) travel via the environment, like the
+    # passwords: they must not appear in the argv of the re-exec'd process.
+    local _notify_specs
+    _notify_specs=$(get_job_notify_specs "$job_name")
+
     # Export so the re-exec'd child (which runs the dump and sends notifications)
     # can attach a job-specific "re-run" button to a failure notification.
     export CURRENT_JOB_NAME="$job_name"
@@ -283,6 +288,7 @@ run_job() {
     # Execute via bash -c. Job passwords are passed as scoped env assignments (not argv).
     # Fall back to any INHERITED T_PGSQL_*_PASSWORD when the job has none, so a passwordless
     # job does not get an empty assignment that would shadow the documented ambient env var.
+    T_PGSQL_NOTIFY_SPECS="$_notify_specs" \
     T_PGSQL_PASSWORD="${_pw_both:-$T_PGSQL_PASSWORD}" \
     T_PGSQL_FROM_PASSWORD="${_pw_from:-$T_PGSQL_FROM_PASSWORD}" \
     T_PGSQL_TO_PASSWORD="${_pw_to:-$T_PGSQL_TO_PASSWORD}" \

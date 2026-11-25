@@ -4517,11 +4517,19 @@ parse_job_to_args() {
     [ -n "$(get_job_value "$job" "log")" ] && args+=" --log $(pq "$(get_job_value "$job" "log")")"
     [ -n "$(get_job_value "$job" "log_level")" ] && args+=" --log-level $(pq "$(get_job_value "$job" "log_level")")"
 
-    # Notify - telegram
-    local telegram_config=$(get_job_telegram_config "$job")
-    [ -n "$telegram_config" ] && args+=" --notify $(pq "$telegram_config")"
+    # Notify channels are NOT emitted here: run_job hands them to the re-exec'd child through
+    # the environment (see get_job_notify_specs) so a bot token never lands on a process argv.
 
     echo "$args"
+}
+
+# Notification specs for a job, one per line, for run_job to pass to the child via the
+# environment. Jobs using the legacy "args:" field carry their own --notify (unchanged).
+# Usage: get_job_notify_specs "job_name"
+get_job_notify_specs() {
+    local job="$1"
+    [ -n "$(get_job_field "$job" "args")" ] && return 0
+    get_job_telegram_config "$job"
 }
 
 save_job() {
@@ -4801,6 +4809,11 @@ run_job() {
     log_info "Running job: $job_name"
     log_debug "Command: $job_cmd $(redact_args "$job_args")"
 
+    # Notification specs (they contain the bot token) travel via the environment, like the
+    # passwords: they must not appear in the argv of the re-exec'd process.
+    local _notify_specs
+    _notify_specs=$(get_job_notify_specs "$job_name")
+
     # Export so the re-exec'd child (which runs the dump and sends notifications)
     # can attach a job-specific "re-run" button to a failure notification.
     export CURRENT_JOB_NAME="$job_name"
@@ -4809,6 +4822,7 @@ run_job() {
     # Execute via bash -c. Job passwords are passed as scoped env assignments (not argv).
     # Fall back to any INHERITED T_PGSQL_*_PASSWORD when the job has none, so a passwordless
     # job does not get an empty assignment that would shadow the documented ambient env var.
+    T_PGSQL_NOTIFY_SPECS="$_notify_specs" \
     T_PGSQL_PASSWORD="${_pw_both:-$T_PGSQL_PASSWORD}" \
     T_PGSQL_FROM_PASSWORD="${_pw_from:-$T_PGSQL_FROM_PASSWORD}" \
     T_PGSQL_TO_PASSWORD="${_pw_to:-$T_PGSQL_TO_PASSWORD}" \
@@ -6141,6 +6155,17 @@ main() {
 
     install_cleanup_trap
     parse_args "$@"
+
+    # Notification specs handed over by a parent job run (they hold the bot token, so they
+    # travel in the environment rather than on argv). Consume and drop them so nothing
+    # we spawn (pg_dump, ssh, ...) inherits them.
+    if [ -n "${T_PGSQL_NOTIFY_SPECS:-}" ]; then
+        local _spec
+        while IFS= read -r _spec; do
+            [ -n "$_spec" ] && NOTIFY+=("$_spec")
+        done <<< "$T_PGSQL_NOTIFY_SPECS"
+    fi
+    unset T_PGSQL_NOTIFY_SPECS
 
     # Use a specific PostgreSQL client version if requested (affects all LOCAL
     # pg_dump/pg_restore/psql/createdb/pg_dumpall calls; not SSH-remote ones).

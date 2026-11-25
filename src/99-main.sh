@@ -16,6 +16,17 @@ main() {
     install_cleanup_trap
     parse_args "$@"
 
+    # Notification specs handed over by a parent job run (they hold the bot token, so they
+    # travel in the environment rather than on argv). Consume and drop them so nothing
+    # we spawn (pg_dump, ssh, ...) inherits them.
+    if [ -n "${T_PGSQL_NOTIFY_SPECS:-}" ]; then
+        local _spec
+        while IFS= read -r _spec; do
+            [ -n "$_spec" ] && NOTIFY+=("$_spec")
+        done <<< "$T_PGSQL_NOTIFY_SPECS"
+    fi
+    unset T_PGSQL_NOTIFY_SPECS
+
     # Use a specific PostgreSQL client version if requested (affects all LOCAL
     # pg_dump/pg_restore/psql/createdb/pg_dumpall calls; not SSH-remote ones).
     [ -n "$PG_BINDIR" ] && export PATH="$PG_BINDIR:$PATH"
