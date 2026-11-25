@@ -29,14 +29,26 @@ check "no top-level contents: write in release.yml" \
     bash -c "! awk '/^permissions:/{p=1;next} p&&/^[^ ]/{exit} p&&/contents: write/{f=1} END{exit f?0:1}' '$REL'"
 
 unpinned() { # print uses: lines whose ref is not a 40-hex SHA
-    grep -hE '^\s*(-\s*)?uses:' "$@" | grep -Ev '@[0-9a-f]{40}( |$)'
+    grep -hE '^[[:space:]]*(-[[:space:]]*)?uses:' "$@" | grep -Ev '@[0-9a-f]{40}( |$)'
 }
 check "every action in workflows is pinned to a 40-hex SHA" test -z "$(unpinned "$CI" "$REL")"
 check "pinned actions keep a version comment" \
-    test -z "$(grep -hE '^\s*(-\s*)?uses:' "$CI" "$REL" | grep -Ev '# v[0-9]')"
+    test -z "$(grep -hE '^[[:space:]]*(-[[:space:]]*)?uses:' "$CI" "$REL" | grep -Ev '# v[0-9]')"
 
-check "no github/steps expression inside run: scripts" \
-    bash -c "! awk '/^ *run: *[|>]?/{r=1;next} /^ *[a-z-]+:/{ if (\$0 !~ /^ {10,}/) r=0 } r && /\\\$\\{\\{/{print; f=1} END{exit f?0:1}' '$CI' '$REL' | grep -q ."
+# Print lines of run: blocks (indented 10+ spaces under a run: key) and the run:
+# line itself that contain a ${{ expression. Strict POSIX awk: literal spaces,
+# index(), no interval expressions.
+run_expr_hits() {
+    awk '
+        /^[[:space:]]*run:/ { r = 1; if (index($0, "${{") > 0) { print; f = 1 } ; next }
+        /^[[:space:]]*$/ { next }
+        r && /^          / { if (index($0, "${{") > 0) { print; f = 1 } ; next }
+        { r = 0 }
+        END { exit f ? 0 : 1 }
+    ' "$@"
+}
+no_expr_in_run() { ! run_expr_hits "$CI" "$REL"; }
+check "no github/steps expression inside run: scripts" no_expr_in_run
 
 check "ShellCheck is blocking in ci.yml (no || true)" hasnt 'shellcheck.*\|\| *true' "$CI"
 check "ci.yml has a tests job using the timeout runner" has 'scripts/run-tests\.sh' "$CI"
