@@ -211,6 +211,8 @@ cmd_dump() {
                     # user asked to keep out of the dump.
                     log_error "Could not expand --exclude-data pattern '$t' (table lookup failed); aborting dump"
                     rm -f "$dump_file"
+                    local _xe; _xe=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+                    send_notification "failed" "Dump failed: ${dump_base_name}" "$(build_notify_details "DUMP" "Failed" "$_xe")"
                     return 1
                 fi
                 local tbl

@@ -40,6 +40,15 @@ cat > "$FAKE/pg_restore" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
+cat > "$FAKE/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$REC/curl.log"
+cat >> "$REC/curl.log" 2>/dev/null
+exit 0
+EOF
+for t in pg_isready createdb dropdb pg_dumpall; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE/$t"
+done
 chmod +x "$FAKE"/*
 export REC
 export PATH="$FAKE:$PATH"
@@ -54,6 +63,12 @@ out=$(PSQL_FAIL=1 run); rc=$?
 [ $rc -ne 0 ] && ok "dump fails when the table lookup fails" || nok "dump continued after lookup failure"
 [ ! -e "$REC/pg_dump.args" ] && ok "pg_dump never ran after lookup failure" || nok "pg_dump ran without the exclusion"
 case "$out" in *"--exclude-data"*) ok "clear error mentions --exclude-data" ;; *) nok "no clear error: $out" ;; esac
+
+# 1b. the abort sends the failure notification
+rm -f "$REC/curl.log"
+out=$(PSQL_FAIL=1 "$BIN" dump --from "postgres@localhost/appdb" --output "$TMP/out" --exclude-data 'audit.*' \
+    --notify webhook:http://192.0.2.9/hook </dev/null 2>&1)
+grep -q "Dump failed" "$REC/curl.log" 2>/dev/null && ok "failure notification sent on lookup failure" || nok "no failure notification"
 
 # 2. names needing quoting reach pg_dump as one correctly quoted argument
 out=$(PSQL_FAIL=0 run); rc=$?
