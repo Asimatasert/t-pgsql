@@ -5,22 +5,86 @@ on:
     tags:
       - 'v*'
 
+# Read-only by default; only the jobs that publish get write access.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  # Nothing is published unless every gate here passes.
+  verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Tag is vX.Y.Z and equals the script version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not of the form vX.Y.Z"
+            exit 1
+          fi
+          reported="$(./t-pgsql --version | awk '{print $NF}')"
+          if [ "$reported" != "$TAG" ]; then
+            echo "::error::Tag '$TAG' does not match './t-pgsql --version' ('$reported')"
+            exit 1
+          fi
+
+      - name: Version is consistent everywhere
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash scripts/check-version.sh "$TAG"
+
+      - name: t-pgsql matches src/ (generated file in sync)
+        run: ./build.sh --check
+
+      - name: Syntax check (bash -n)
+        run: |
+          bash -n t-pgsql
+          bash -n build.sh
+          bash -n install.sh
+          for f in scripts/*.sh; do bash -n "$f"; done
+
+      - name: ShellCheck (errors)
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -S error t-pgsql install.sh scripts/*.sh
+
+      - name: Tests
+        run: |
+          status=0
+          for t in tests/regress/*.sh; do
+            [ -e "$t" ] || continue
+            echo "::group::$t"
+            bash "$t" || status=1
+            echo "::endgroup::"
+          done
+          if [ -f tests/run.sh ]; then
+            bash tests/run.sh || status=1
+          fi
+          exit "$status"
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Get version
         id: version
         run: |
-          # Strip everything up to the first digit so the version is digit-first
-          VERSION=$(echo "${GITHUB_REF#refs/tags/}" | sed 's/^[^0-9]*//')
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          # The verify job already enforced vX.Y.Z.
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
         run: |
@@ -34,28 +98,33 @@ jobs:
           # control fields, changelog and any copyright are the real ones.
           dpkg-buildpackage -us -uc -b
           DEB=$(ls ../t-pgsql_*_all.deb | head -n1)
-          cp "$DEB" "$GITHUB_WORKSPACE/"
-          echo "DEB_FILE=$(basename "$DEB")" >> $GITHUB_OUTPUT
+          mkdir -p release-assets
+          cp "$DEB" release-assets/
+          echo "DEB_FILE=$(basename "$DEB")" >> "$GITHUB_OUTPUT"
 
-      - name: Create tarball
+      - name: Create tarball and checksums
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
-          mkdir -p dist/t-pgsql-${{ steps.version.outputs.VERSION }}
-          cp t-pgsql dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
-          cp LICENSE dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
-          cp -r man dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
-          cp -r completions dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
-          cd dist
-          tar -czf t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz t-pgsql-${{ steps.version.outputs.VERSION }}
-          sha256sum t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz > t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz.sha256
+          mkdir -p "dist/t-pgsql-$VERSION" release-assets
+          cp t-pgsql LICENSE "dist/t-pgsql-$VERSION/"
+          cp -r man completions "dist/t-pgsql-$VERSION/"
+          tar -czf "release-assets/t-pgsql-$VERSION.tar.gz" -C dist "t-pgsql-$VERSION"
+          cp t-pgsql release-assets/t-pgsql
+          # One checksum file covering every uploaded asset (install.sh reads it).
+          cd release-assets
+          sha256sum t-pgsql "t-pgsql-$VERSION.tar.gz" t-pgsql_*_all.deb > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
-            t-pgsql
-            ${{ steps.deb.outputs.DEB_FILE }}
-            dist/t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz
-            dist/t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz.sha256
+            release-assets/t-pgsql
+            release-assets/${{ steps.deb.outputs.DEB_FILE }}
+            release-assets/t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz
+            release-assets/SHA256SUMS
           generate_release_notes: true
           draft: false
           prerelease: false
@@ -65,9 +134,12 @@ jobs:
   update-homebrew:
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: Checkout default branch
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # Check out the branch (not the detached tag) so we can push back.
           ref: master
@@ -76,22 +148,39 @@ jobs:
       - name: Get version and SHA
         id: info
         run: |
-          VERSION=$(echo "${GITHUB_REF#refs/tags/}" | sed 's/^[^0-9]*//')
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          SHA=$(curl -fsSL "https://github.com/${{ github.repository }}/archive/refs/tags/v${VERSION}.tar.gz" | sha256sum | cut -d' ' -f1)
-          echo "SHA256=$SHA" >> $GITHUB_OUTPUT
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' is not vX.Y.Z; refusing to touch the formula"
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          # The formula downloads GitHub's auto-generated tag archive (its
+          # layout differs from the release tarball), so that is what is hashed.
+          SHA=$(curl --fail --silent --show-error --location "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" | sha256sum | cut -d' ' -f1)
+          if ! [[ "$SHA" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::Could not compute a sha256 for the tag archive"
+            exit 1
+          fi
+          echo "SHA256=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Update Formula
+        env:
+          VERSION: ${{ steps.info.outputs.VERSION }}
+          SHA256: ${{ steps.info.outputs.SHA256 }}
         run: |
-          VERSION="${{ steps.info.outputs.VERSION }}"
-          SHA256="${{ steps.info.outputs.SHA256 }}"
           # Update the url version, the sha256 and the test assertion using
           # patterns that actually exist in Formula/t-pgsql.rb.
           sed -i -E "s|archive/refs/tags/v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz|archive/refs/tags/v${VERSION}.tar.gz|" Formula/t-pgsql.rb
           sed -i -E "s|sha256 \"[a-f0-9]{64}\"|sha256 \"${SHA256}\"|" Formula/t-pgsql.rb
           sed -i -E "s|assert_match \"v[0-9]+\.[0-9]+\.[0-9]+\"|assert_match \"v${VERSION}\"|" Formula/t-pgsql.rb
+          # Fail loudly if any pattern did not match instead of pushing a half-updated formula.
+          grep -q "archive/refs/tags/v${VERSION}.tar.gz" Formula/t-pgsql.rb || { echo "::error::formula url was not updated"; exit 1; }
+          grep -q "sha256 \"${SHA256}\"" Formula/t-pgsql.rb || { echo "::error::formula sha256 was not updated"; exit 1; }
+          grep -q "assert_match \"v${VERSION}\"" Formula/t-pgsql.rb || { echo "::error::formula test was not updated"; exit 1; }
 
       - name: Commit and push Formula update
+        env:
+          VERSION: ${{ steps.info.outputs.VERSION }}
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
@@ -99,6 +188,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Formula already up to date; nothing to commit."
           else
-            git commit -m "Update Homebrew formula to v${{ steps.info.outputs.VERSION }}"
+            git commit -m "Update Homebrew formula to v${VERSION}"
             git push origin HEAD:master
           fi
