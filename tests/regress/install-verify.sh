@@ -70,7 +70,7 @@ GOOD_TAR="$(sha "$FIX/t-pgsql-$VER.tar.gz")"
 BAD="0000000000000000000000000000000000000000000000000000000000000000"
 
 run() { # extra args...; env from caller
-    rm -rf "$T/home" "$T/log"; mkdir -p "$T/home" "$T/log"
+    rm -rf "${T:?}/home" "${T:?}/log"; mkdir -p "$T/home" "$T/log"
     env -i PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" HOME="$T/home" \
         INSTALL_DIR="$T/home/bin" FAKE_FIX="$FIX" FAKE_LOG="$T/log" \
         ${ENVX:-} "$SHELL_BIN" "$INSTALL_SH" "$@" > "$T/out.txt" 2>&1
