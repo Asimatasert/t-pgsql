@@ -42,25 +42,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Regression tests (tests/regress/*.sh, when present)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The tests use fake binaries only: no services, network or database.
-          status=0
-          ran=0
-          for t in tests/regress/*.sh; do
-            [ -e "$t" ] || continue
-            ran=$((ran + 1))
-            echo "::group::$t"
-            bash "$t" || status=1
-            echo "::endgroup::"
-          done
-          if [ -f tests/run.sh ]; then
-            ran=$((ran + 1))
-            bash tests/run.sh || status=1
-          fi
-          echo "ran $ran test script(s)"
-          exit "$status"
+        run: bash scripts/run-tests.sh
 
   # NOT a required check. Fails on any branch where the version numbers in the
   # repository disagree (for example while the stale man page / example config

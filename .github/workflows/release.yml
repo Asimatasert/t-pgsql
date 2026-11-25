@@ -60,21 +60,8 @@ jobs:
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck -S error t-pgsql install.sh scripts/*.sh
 
-      - name: Tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          status=0
-          for t in tests/regress/*.sh; do
-            [ -e "$t" ] || continue
-            echo "::group::$t"
-            bash "$t" || status=1
-            echo "::endgroup::"
-          done
-          if [ -f tests/run.sh ]; then
-            bash tests/run.sh || status=1
-          fi
-          exit "$status"
+      - name: Tests (per-test timeout, output only on failure)
+        run: bash scripts/run-tests.sh
 
   release:
     needs: verify

@@ -39,13 +39,13 @@ check "no github/steps expression inside run: scripts" \
     bash -c "! awk '/^ *run: *[|>]?/{r=1;next} /^ *[a-z-]+:/{ if (\$0 !~ /^ {10,}/) r=0 } r && /\\\$\\{\\{/{print; f=1} END{exit f?0:1}' '$CI' '$REL' | grep -q ."
 
 check "ShellCheck is blocking in ci.yml (no || true)" hasnt 'shellcheck.*\|\| *true' "$CI"
-check "ci.yml has a tests job running tests/regress" has 'tests/regress/\*\.sh' "$CI"
+check "ci.yml has a tests job using the timeout runner" has 'scripts/run-tests\.sh' "$CI"
 check "ci.yml has an advisory version-consistency job" has 'version-consistency' "$CI"
 check "release.yml publishes SHA256SUMS" has 'SHA256SUMS' "$REL"
 check "release.yml checks tag against ./t-pgsql --version" has 't-pgsql --version' "$REL"
 check "release.yml runs build.sh --check before publishing" has 'build\.sh --check' "$REL"
 check "release.yml runs shellcheck before publishing" has 'shellcheck -S error' "$REL"
-check "release.yml runs the regression tests" has 'tests/regress' "$REL"
+check "release.yml runs the regression tests through the timeout runner" has 'scripts/run-tests\.sh' "$REL"
 check "release job needs the verify job" has 'needs: verify' "$REL"
 check "dependabot covers github-actions and docker" \
     bash -c "grep -q 'package-ecosystem: github-actions' '$DEP' && grep -q 'package-ecosystem: docker' '$DEP'"
