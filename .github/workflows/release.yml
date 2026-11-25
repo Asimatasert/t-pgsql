@@ -21,9 +21,11 @@ jobs:
           persist-credentials: false
 
       - name: Tag is vX.Y.Z and equals the script version
+        shell: bash
         env:
           TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Tag '$TAG' is not of the form vX.Y.Z"
             exit 1
@@ -43,19 +45,25 @@ jobs:
         run: ./build.sh --check
 
       - name: Syntax check (bash -n)
+        shell: bash
         run: |
+          set -euo pipefail
           bash -n t-pgsql
           bash -n build.sh
           bash -n install.sh
           for f in scripts/*.sh; do bash -n "$f"; done
 
       - name: ShellCheck (errors)
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck -S error t-pgsql install.sh scripts/*.sh
 
       - name: Tests
+        shell: bash
         run: |
+          set -euo pipefail
           status=0
           for t in tests/regress/*.sh; do
             [ -e "$t" ] || continue
@@ -82,30 +90,40 @@ jobs:
 
       - name: Get version
         id: version
+        shell: bash
         run: |
+          set -euo pipefail
           # The verify job already enforced vX.Y.Z.
           echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends debhelper dpkg-dev build-essential
 
       - name: Build Debian package
         id: deb
+        shell: bash
         run: |
+          set -euo pipefail
           # Build straight from the repo's debian/ dir so the packaged
           # control fields, changelog and any copyright are the real ones.
           dpkg-buildpackage -us -uc -b
-          DEB=$(ls ../t-pgsql_*_all.deb | head -n1)
+          set -- ../t-pgsql_*_all.deb
+          DEB="$1"
+          [ -f "$DEB" ] || { echo "::error::no .deb was built"; exit 1; }
           mkdir -p release-assets
           cp "$DEB" release-assets/
           echo "DEB_FILE=$(basename "$DEB")" >> "$GITHUB_OUTPUT"
 
       - name: Create tarball and checksums
+        shell: bash
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
+          set -euo pipefail
           mkdir -p "dist/t-pgsql-$VERSION" release-assets
           cp t-pgsql LICENSE "dist/t-pgsql-$VERSION/"
           cp -r man completions "dist/t-pgsql-$VERSION/"
@@ -147,7 +165,9 @@ jobs:
 
       - name: Get version and SHA
         id: info
+        shell: bash
         run: |
+          set -euo pipefail
           if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Tag '$GITHUB_REF_NAME' is not vX.Y.Z; refusing to touch the formula"
             exit 1
@@ -156,7 +176,22 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
           # The formula downloads GitHub's auto-generated tag archive (its
           # layout differs from the release tarball), so that is what is hashed.
-          SHA=$(curl --fail --silent --show-error --location "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" | sha256sum | cut -d' ' -f1)
+          # Download to a file first so a failed download aborts the step
+          # instead of hashing empty input.
+          ARCHIVE="${RUNNER_TEMP}/tag-archive.tar.gz"
+          rm -f "$ARCHIVE"
+          curl --fail --silent --show-error --location \
+            -o "$ARCHIVE" "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          if [ ! -s "$ARCHIVE" ]; then
+            echo "::error::Tag archive download is missing or empty"
+            exit 1
+          fi
+          SHA="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
+          EMPTY_SHA="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          if [ "$SHA" = "$EMPTY_SHA" ]; then
+            echo "::error::Tag archive hashes to the empty-input sha256; refusing to write it"
+            exit 1
+          fi
           if ! [[ "$SHA" =~ ^[a-f0-9]{64}$ ]]; then
             echo "::error::Could not compute a sha256 for the tag archive"
             exit 1
@@ -164,10 +199,12 @@ jobs:
           echo "SHA256=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Update Formula
+        shell: bash
         env:
           VERSION: ${{ steps.info.outputs.VERSION }}
           SHA256: ${{ steps.info.outputs.SHA256 }}
         run: |
+          set -euo pipefail
           # Update the url version, the sha256 and the test assertion using
           # patterns that actually exist in Formula/t-pgsql.rb.
           sed -i -E "s|archive/refs/tags/v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz|archive/refs/tags/v${VERSION}.tar.gz|" Formula/t-pgsql.rb
@@ -179,9 +216,11 @@ jobs:
           grep -q "assert_match \"v${VERSION}\"" Formula/t-pgsql.rb || { echo "::error::formula test was not updated"; exit 1; }
 
       - name: Commit and push Formula update
+        shell: bash
         env:
           VERSION: ${{ steps.info.outputs.VERSION }}
         run: |
+          set -euo pipefail
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add Formula/t-pgsql.rb

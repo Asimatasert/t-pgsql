@@ -19,14 +19,18 @@ jobs:
       - name: t-pgsql matches src/ (generated file in sync)
         run: ./build.sh --check
       - name: Syntax check (bash -n)
+        shell: bash
         run: |
+          set -euo pipefail
           bash -n t-pgsql
           bash -n build.sh
           bash -n install.sh
           for f in scripts/*.sh; do bash -n "$f"; done
           for f in src/*.sh; do bash -n "$f" || echo "note: $f is a fragment, not standalone"; done
       - name: ShellCheck (blocking, errors only)
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck -S error t-pgsql install.sh scripts/*.sh
 
@@ -38,7 +42,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Regression tests (tests/regress/*.sh, when present)
+        shell: bash
         run: |
+          set -euo pipefail
           # The tests use fake binaries only: no services, network or database.
           status=0
           ran=0

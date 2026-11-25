@@ -50,5 +50,18 @@ check "release job needs the verify job" has 'needs: verify' "$REL"
 check "dependabot covers github-actions and docker" \
     bash -c "grep -q 'package-ecosystem: github-actions' '$DEP' && grep -q 'package-ecosystem: docker' '$DEP'"
 
+# multi-line run steps run under bash with strict mode
+for f in "$CI" "$REL"; do
+    n_run="$(grep -c 'run: |' "$f")"
+    check "$(basename "$f"): every multi-line run step has set -euo pipefail" \
+        test "$n_run" = "$(grep -c 'set -euo pipefail' "$f")"
+    check "$(basename "$f"): every multi-line run step sets shell: bash" \
+        test "$n_run" = "$(grep -c 'shell: bash' "$f")"
+done
+check "formula step does not hash a curl pipe" hasnt 'curl[^|]*\|[^|]*sha256sum' "$REL"
+check "formula step rejects the empty-input sha256" \
+    has 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' "$REL"
+check "formula step downloads to a file and rejects an empty file" has '\[ ! -s "\$ARCHIVE" \]' "$REL"
+
 if [ "$FAILS" -ne 0 ]; then echo "$FAILS assertion(s) failed"; exit 1; fi
 echo "all workflow assertions passed"
