@@ -79,6 +79,8 @@ send_notification() {
     fi
 
     [ ${#NOTIFY[@]} -eq 0 ] && return 0
+    # A dry run must send nothing.
+    [ "$DRY_RUN" = true ] && return 0
     # --quiet only reduces console output and success notifications; a failure is always sent.
     if [ "$QUIET" = true ] && [ "$status" != "failed" ] && [ "$status" != "error" ]; then
         return 0

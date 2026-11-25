@@ -76,6 +76,12 @@ save_job() {
     [ "$FORCE" = true ] && args="$args --force"
     [ "$VERBOSE" = true ] && args="$args --verbose"
 
+    # A dry run must not write anything
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] Would save job '$job_name' to $JOBS_FILE"
+        return 0
+    fi
+
     # Create jobs file if not exists
     [ ! -f "$JOBS_FILE" ] && echo "jobs:" > "$JOBS_FILE"
 
@@ -210,7 +216,12 @@ remove_job() {
         return 1
     fi
 
-    # Remove job using awk
+    # Remove job using awk (a dry run only reports what would happen)
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] Would remove job '$job_name' from $JOBS_FILE"
+        return 0
+    fi
+
     local tmp_file=$(mktemp)
     awk -v name="$job_name" '
     BEGIN { skip=0 }
