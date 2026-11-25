@@ -81,8 +81,8 @@ apply_globals_to_target() {
         # The terminator is random per call and verified not to occur as a line of the
         # dump, so dump content (role names, comments) can never close the here-doc and
         # reach the remote shell.
-        local term="" try
-        for try in 1 2 3 4 5; do
+        local term=""
+        for _ in 1 2 3 4 5; do
             term="__TPG_GLOBALS_$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')__"
             [ "${#term}" -gt 20 ] || { log_error "Cannot generate a random here-doc terminator"; return 1; }
             grep -Fxq -- "$term" "$gfile" || break
