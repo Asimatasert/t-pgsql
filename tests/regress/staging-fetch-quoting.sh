@@ -13,8 +13,8 @@ nok() { echo "not ok - $1"; FAIL=1; }
 SB="$TMP/sandbox"; FAKE="$TMP/fake"; REC="$TMP/rec"
 mkdir -p "$SB/t-pgsql" "$FAKE" "$REC" "$TMP/out"
 chmod 700 "$SB/t-pgsql"
-printf 'x\n' > "$SB/t-pgsql/appdb_20200101_000000.dump"
-printf 'x\n' > "$SB/outside.dump"
+printf 'PGDMP-fake\n' > "$SB/t-pgsql/appdb_20200101_000000.dump"
+printf 'PGDMP-fake\n' > "$SB/outside.dump"
 
 cat > "$FAKE/ssh" <<'EOF'
 #!/usr/bin/env bash
@@ -31,6 +31,9 @@ src="${src#*@*:}"
 src="${src//\/tmp\/t-pgsql/$SB/t-pgsql}"
 cp "$src" "$dst"
 EOF
+for t in psql pg_restore pg_dump pg_isready createdb dropdb pg_dumpall; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE/$t"
+done
 chmod +x "$FAKE"/*
 export SB REC
 export PATH="$FAKE:$PATH"

@@ -12,7 +12,7 @@ ok()  { echo "ok - $1"; }
 nok() { echo "not ok - $1"; FAIL=1; }
 
 FAKE="$TMP/fake"; mkdir -p "$FAKE"
-for t in psql pg_restore createdb dropdb pg_dump; do
+for t in psql pg_restore createdb dropdb pg_dump pg_isready pg_dumpall; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE/$t"
 done
 chmod +x "$FAKE"/*
@@ -21,8 +21,8 @@ export T_PGSQL_TO_PASSWORD=x
 export HOME="$TMP/home"; mkdir -p "$HOME"
 
 D="$TMP/dumps"; mkdir -p "$D"
-printf 'x\n' > "$D/appdb_20200101_000000.dump"
-printf 'x\n' > "$D/otherdb_20200201_000000.dump"
+printf 'PGDMP-fake\n' > "$D/appdb_20200101_000000.dump"
+printf 'PGDMP-fake\n' > "$D/otherdb_20200201_000000.dump"
 touch -t 202001010000 "$D/appdb_20200101_000000.dump"
 touch -t 202002010000 "$D/otherdb_20200201_000000.dump"
 
