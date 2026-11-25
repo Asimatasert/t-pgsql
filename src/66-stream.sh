@@ -40,7 +40,10 @@ clone_stream() {
 
     for to_conn in "${TO_CONNECTIONS[@]}"; do
         parse_connection "$to_conn" "TO" || { log_error "Invalid target connection: $to_conn"; result=1; idx=$((idx + 1)); continue; }
-        get_password "TO" "$idx"
+        # Reset first: get_password leaves the variable untouched when it finds no password,
+        # which would otherwise let this target inherit the previous target's credential.
+        TO_DB_PASSWORD=""
+        get_password "TO" "$idx" || { log_error "No password available for target #$((idx + 1)): $to_conn"; result=1; idx=$((idx + 1)); continue; }
 
         log_info "Streaming: ${FROM_SSH_HOST:-$FROM_DB_HOST}/${FROM_DATABASE} → ${TO_SSH_HOST:-$TO_DB_HOST}/${TO_DATABASE}"
 
