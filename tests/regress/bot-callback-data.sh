@@ -60,12 +60,15 @@ run_bot() {
     local upd="$1"; shift
     printf '{"ok":true,"result":[%s]}' "$upd" > "$FAKE/updates.json"
     rm -f "$FAKE/done" "$FAKE/n"; : > "$FAKE/curl.log"
-    ( cd "$TMP" && env PATH="$FAKEBIN:$PATH" FAKE_DIR="$FAKE" HOME="$TMP/home" TMPDIR="$TMP/tmp" \
+    ( cd "$TMP" && exec env PATH="$FAKEBIN:$PATH" FAKE_DIR="$FAKE" HOME="$TMP/home" TMPDIR="$TMP/tmp" \
         XDG_STATE_HOME="$TMP/state" "$@" "${BASH:-bash}" "$APP/t-pgsql" bot --yaml jobs --cooldown 0 \
         > "$TMP/bot.out" 2>&1 ) &
     BOT_PID=$!
     local i; for i in $(seq 1 150); do [ -e "$FAKE/done" ] && break; sleep 0.2; done
-    kill "$BOT_PID" 2>/dev/null; wait "$BOT_PID" 2>/dev/null; BOT_PID=""
+    kill "$BOT_PID" 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$BOT_PID" 2>/dev/null || break; sleep 0.2; done
+    kill -9 "$BOT_PID" 2>/dev/null   # older versions ignore TERM
+    wait "$BOT_PID" 2>/dev/null; BOT_PID=""
     sleep 0.3
 }
 started() { grep -c 'Starting backup' "$FAKE/curl.log"; }

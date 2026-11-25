@@ -1,3 +1,42 @@
+# Owner uid of a path (GNU stat first, BSD stat as fallback).
+bot_file_owner() {
+    stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null
+}
+
+# True when the path is a regular file (not a symlink) owned by the current user.
+bot_safe_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ "$(bot_file_owner "$1")" = "$(id -u)" ]
+}
+
+# Print the per-user state directory (created 700); fail if it is a symlink,
+# not a directory, or not owned by the current user.
+bot_state_dir() {
+    local base="${XDG_STATE_HOME:-}"
+    [ -z "$base" ] && [ -n "$HOME" ] && base="$HOME/.local/state"
+    [ -z "$base" ] && return 1
+    local dir="$base/t-pgsql"
+    [ -L "$dir" ] && return 1
+    if [ ! -e "$dir" ]; then
+        (umask 077; mkdir -p "$dir") 2>/dev/null || return 1
+    fi
+    [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(bot_file_owner "$dir")" = "$(id -u)" ] || return 1
+    chmod 700 "$dir" 2>/dev/null
+    echo "$dir"
+}
+
+# Print the integer stored in an offset file, or 0 if it is not a plain integer.
+bot_read_offset() {
+    local v=""
+    read -r v < "$1" 2>/dev/null || true
+    [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0
+}
+
+# Persist the poll offset (no-op when no safe offset file is available).
+bot_save_offset() {
+    [ -n "$1" ] || return 0
+    (umask 077; printf '%s\n' "$2" > "$1") 2>/dev/null || true
+}
+
 bot_valid_job_name() {
     # Job names from chat or button data: the safe set YAML job keys use, and never
     # a leading dash (the name is passed to --only).
@@ -75,7 +114,7 @@ bot_run_backup() {
         local start_time=$(date +%s)
         # Unique per-run temp log (a fixed /tmp path was symlink-clobberable: a
         # pre-placed symlink would redirect this truncating write to an arbitrary file).
-        local log_file; log_file=$(mktemp "${TMPDIR:-/tmp}/.t-pgsql-bot-$(id -u)-XXXXXX" 2>/dev/null) || log_file="${TMPDIR:-/tmp}/.t-pgsql-bot-$(id -u)-$$.log"
+        local log_file; log_file=$(mktemp "${_BOT_SCRATCH:-${TMPDIR:-/tmp}}/run-XXXXXX" 2>/dev/null) || log_file=/dev/null
 
         # Run with --skip-if-recent 0 to bypass YAML's skip_if_recent
         "$0" batch all --yaml "$yaml_path" --only "$job_name" --skip-if-recent 0 -y > "$log_file" 2>&1
@@ -109,6 +148,7 @@ bot_run_backup() {
         # raw log output, which routinely contains Markdown metacharacters -> parse_mode would
         # 400 and drop the alert; bot_send_message falls back to plain text.
         bot_send_message "$notify_token" "$notify_chat" "$notify_thread" "$result_text"
+        [ "$log_file" != /dev/null ] && rm -f "$log_file"
     ) &
     log_info "Backup started in background (PID: $!)"
 }

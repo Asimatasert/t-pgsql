@@ -40,13 +40,44 @@ cmd_bot() {
     # Fail-closed: without a configured chat_id the bot ignores every command/callback.
     [ -z "$default_chat_id" ] && log_warn "No chat_id configured (telegram config in YAML) — the bot will IGNORE all commands until an allowed chat is set."
 
-    # Per-user temp files, created 600 (the response holds Telegram message content,
-    # so it must not be world-readable on a shared host).
-    local offset_file="${TMPDIR:-/tmp}/.t-pgsql-bot-offset-$(id -u)"
-    local tmp_resp="${TMPDIR:-/tmp}/.t-pgsql-bot-resp-$(id -u).json"
-    (umask 077; : >> "$offset_file"; : >> "$tmp_resp") 2>/dev/null
-    chmod 600 "$offset_file" "$tmp_resp" 2>/dev/null
-    [ -f "$offset_file" ] && offset=$(cat "$offset_file" 2>/dev/null || echo 0)
+    # Scratch space for the raw API response: a private (700) mktemp directory that is
+    # removed on exit. The response holds Telegram message content.
+    local scratch
+    scratch=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/t-pgsql-bot.XXXXXX" 2>/dev/null) || {
+        log_error "Cannot create a private scratch directory under ${TMPDIR:-/tmp}"
+        return 1
+    }
+    chmod 700 "$scratch" 2>/dev/null
+    reg_tmp "$scratch"
+    _BOT_SCRATCH="$scratch"
+    # The tmp cleanup trap does not exit on INT/TERM; stop the loop so the scratch
+    # directory is not removed underneath it. (exit runs the EXIT trap.)
+    trap 'exit 130' INT TERM
+    local tmp_resp="$scratch/resp.json"
+
+    # Persistent poll offset in a per-user state directory (never in a shared dir).
+    local offset_file="" state_dir
+    state_dir=$(bot_state_dir) || state_dir=""
+    if [ -n "$state_dir" ]; then
+        offset_file="$state_dir/bot-offset"
+        if [ -L "$offset_file" ] || { [ -e "$offset_file" ] && ! bot_safe_file "$offset_file"; }; then
+            log_warn "Ignoring unsafe offset file (symlink or not owned by you): $offset_file"
+            offset_file=""
+        fi
+    fi
+    if [ -z "$offset_file" ]; then
+        log_warn "No safe state directory: the poll offset is kept in memory only (old updates may be replayed after a restart)."
+    elif [ -f "$offset_file" ]; then
+        offset=$(bot_read_offset "$offset_file")
+    else
+        # First start with the new location: import the legacy offset once, but only
+        # from a regular file we own.
+        local legacy_file="${TMPDIR:-/tmp}/.t-pgsql-bot-offset-$(id -u)"
+        if bot_safe_file "$legacy_file"; then
+            offset=$(bot_read_offset "$legacy_file")
+        fi
+        bot_save_offset "$offset_file" "$offset"
+    fi
 
     # Main polling loop (errexit already disabled globally)
     set +e
@@ -78,7 +109,7 @@ cmd_bot() {
         if command -v python3 &>/dev/null; then
             update_ids=$(python3 -c "
 import json,sys
-data=json.load(open('$tmp_resp'))
+data=json.load(open(sys.argv[1]))
 def s(v):
     # CRITICAL: strip the field/record delimiters from EVERY user-controlled value so a
     # message text (or callback data / first_name) containing a newline or '|' cannot forge
@@ -98,7 +129,7 @@ for u in data.get('result',[]):
         chat_id=m['chat']['id']
         thread=m.get('message_thread_id','')
         print(f\"{uid}|message|{chat_id}|{s(m.get('text',''))}|{thread}\")
-" 2>/dev/null)
+" "$tmp_resp" 2>/dev/null)
         fi
 
         if [ -z "$update_ids" ]; then
@@ -107,7 +138,7 @@ for u in data.get('result',[]):
             max_uid=$(grep -o '"update_id":[0-9]*' "$tmp_resp" 2>/dev/null | grep -o '[0-9]*' 2>/dev/null | sort -n | tail -1)
             if [ -n "$max_uid" ]; then
                 offset=$((max_uid + 1))
-                echo "$offset" > "$offset_file"
+                bot_save_offset "$offset_file" "$offset"
             fi
             sleep "$poll_interval"
             continue
@@ -119,7 +150,7 @@ for u in data.get('result',[]):
 
             # Advance offset
             offset=$((uid + 1))
-            echo "$offset" > "$offset_file"
+            bot_save_offset "$offset_file" "$offset"
 
             if [ "$utype" = "callback" ]; then
                 local cb_id="$field1"
