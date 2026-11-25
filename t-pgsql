@@ -4878,6 +4878,37 @@ remove_job() {
     log_success "Removed job: $job_name"
 }
 
+# Keys a job may carry in jobs.yaml (everything parse_job_to_args / run_job reads, plus the
+# command itself). Anything else is silently ignored by the parser, so run_job warns.
+_JOB_KNOWN_KEYS=" command args from to password from_password to_password from_password_file to_password_file
+ force verbose quiet dry_run no_meta sudo stream notify notify_on_error output dump_name keep from_keep
+ archive_output archive_keep from_stale skip_if_recent exclude_table exclude_data exclude_schema
+ only_table only_schema compress compress_level pg_compress_level compress_where stream_buffer bwlimit
+ retries health_check health_check_after no_health_check health_check_fail retention retention_daily
+ retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level "
+
+# Warn (once per key) about job keys the tool does not know, naming the closest valid key
+# when it is just a hyphen/underscore or case difference. Warning only, never an error.
+# Usage: warn_unknown_job_keys "job_name"
+warn_unknown_job_keys() {
+    local job="$1" key norm lower
+    [ -f "$JOBS_FILE" ] || return 0
+    while IFS= read -r key; do
+        [ -z "$key" ] && continue
+        [[ "$_JOB_KNOWN_KEYS" == *[[:space:]]"$key"[[:space:]]* ]] && continue
+        norm="${key//-/_}"
+        lower="$(printf '%s' "$norm" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$_JOB_KNOWN_KEYS" == *[[:space:]]"$lower"[[:space:]]* ]]; then
+            log_warn "Job '$job': unknown key '$key' is ignored (did you mean '$lower'?)"
+        else
+            log_warn "Job '$job': unknown key '$key' is ignored"
+        fi
+    done < <(JOB="$job" awk '
+        /^  [a-zA-Z0-9_-]+:/ { k=$1; sub(/:.*/, "", k); in_job = (k == ENVIRON["JOB"]); next }
+        in_job && /^    [a-zA-Z0-9_-]+:/ { k=$1; sub(/:.*/, "", k); if (!(k in seen)) { seen[k]=1; print k } }
+    ' "$JOBS_FILE")
+}
+
 run_job() {
     local job_name="$1"
 
@@ -4900,6 +4931,8 @@ run_job() {
         dump|restore|clone|upgrade|fetch|batch|list|meta|clean) ;;
         *) log_error "Job $(pq "$job_name") has an invalid command: $(pq "$job_cmd")"; return 1 ;;
     esac
+
+    warn_unknown_job_keys "$job_name"
 
     # Parse job args (supports both old and new format). Inline passwords are NOT in here
     # (parse_job_to_args deliberately omits them); they travel via the environment below.
