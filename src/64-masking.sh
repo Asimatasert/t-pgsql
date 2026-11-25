@@ -53,7 +53,7 @@ apply_masking() {
     }
 
     if [ "$type" != "ssh" ]; then
-        _MASK_PGPASS="$(make_pgpass_file "$user" "$password")" || { log_error "Masking: credential setup failed"; return 0; }; reg_tmp "$_MASK_PGPASS"
+        _MASK_PGPASS="$(make_pgpass_file "$user" "$password")" || { log_error "Masking: credential setup failed"; return 1; }; reg_tmp "$_MASK_PGPASS"
     fi
 
     local mask_sql=""
