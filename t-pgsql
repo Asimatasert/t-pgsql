@@ -5221,6 +5221,12 @@ for u in data.get('result',[]):
                 cb_yaml=$(echo "$cb_data" | cut -d: -f2)
                 cb_job=$(echo "$cb_data" | cut -d: -f3)
 
+                # Tolerate the short form "backup:<job>" (a sender may drop the yaml name to
+                # stay within Telegram's 64-byte callback_data limit): use the bot's own yaml.
+                if [ "$cb_action" = "backup" ] && [[ "$cb_data" != *:*:* ]] && [ -n "$cb_yaml" ]; then
+                    cb_job="$cb_yaml"
+                    cb_yaml=$(basename "$JOBS_FILE")
+                fi
                 if [ "$cb_action" = "backup" ] && ! bot_valid_job_name "$cb_job"; then
                     bot_answer_callback "$bot_token" "$cb_id" "❌ Invalid job name"
                 elif [ "$cb_action" = "backup" ]; then
