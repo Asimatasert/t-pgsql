@@ -34,10 +34,20 @@ cmd_bot() {
         fi
     fi
 
+    # Optional allowlist of Telegram user ids (TELEGRAM_ALLOWED_USERS, comma separated, or
+    # "telegram_allowed_users" under defaults: in the YAML). Empty = chat-id check only.
+    local allowed_users
+    allowed_users=$(bot_allowed_users)
+
     log_info "🤖 t-pgsql bot started (cooldown: ${bot_cooldown})"
     log_info "Listening for commands and callbacks..."
     log_info "Press Ctrl+C to stop"
     # Fail-closed: without a configured chat_id the bot ignores every command/callback.
+    if [ -z "$allowed_users" ]; then
+        log_warn "No sender allowlist (TELEGRAM_ALLOWED_USERS): ANY member of the configured chat can run jobs, including restore/clone/upgrade jobs, via /backup and buttons."
+    elif [ "$allowed_users" = "," ]; then
+        log_warn "Sender allowlist is set but contains no valid numeric user id: the bot will reject every sender."
+    fi
     [ -z "$default_chat_id" ] && log_warn "No chat_id configured (telegram config in YAML) — the bot will IGNORE all commands until an allowed chat is set."
 
     # Scratch space for the raw API response: a private (700) mktemp directory that is
@@ -123,12 +133,12 @@ for u in data.get('result',[]):
     if 'callback_query' in u:
         cb=u['callback_query']
         cb_chat=cb.get('message',{}).get('chat',{}).get('id','')
-        print(f\"{uid}|callback|{s(cb.get('id',''))}|{s(cb.get('data',''))}|{cb_chat}|{s(cb.get('from',{}).get('first_name',''))}\")
+        print(f\"{uid}|callback|{s(cb.get('id',''))}|{s(cb.get('data',''))}|{cb_chat}|{s(cb.get('from',{}).get('first_name',''))}|{s(cb.get('from',{}).get('id',''))}\")
     elif 'message' in u:
         m=u['message']
         chat_id=m['chat']['id']
         thread=m.get('message_thread_id','')
-        print(f\"{uid}|message|{chat_id}|{s(m.get('text',''))}|{thread}\")
+        print(f\"{uid}|message|{chat_id}|{s(m.get('text',''))}|{thread}|{s(m.get('from',{}).get('id',''))}\")
 " "$tmp_resp" 2>/dev/null)
         fi
 
@@ -145,7 +155,7 @@ for u in data.get('result',[]):
         fi
 
         # Process each update line
-        while IFS='|' read -r uid utype field1 field2 field3 field4; do
+        while IFS='|' read -r uid utype field1 field2 field3 field4 field5; do
             [ -z "$uid" ] && continue
 
             # Advance offset
@@ -157,12 +167,20 @@ for u in data.get('result',[]):
                 local cb_data="$field2"
                 local cb_chat="$field3"
                 local cb_user="$field4"
+                local cb_uid="$field5"
 
                 # Authorize the callback the same way messages are: only act on button
                 # presses coming from the configured chat. FAIL CLOSED — if no allowed chat
                 # is configured, reject everything rather than accepting any chat.
                 if [ -z "$default_chat_id" ] || [ "$cb_chat" != "$default_chat_id" ]; then
                     log_warn "Ignoring callback from unauthorized chat: ${cb_chat}"
+                    bot_answer_callback "$bot_token" "$cb_id" "⛔ Not authorized"
+                    continue
+                fi
+
+                # Optional sender allowlist (fail closed: an unknown sender is rejected).
+                if ! bot_user_allowed "$allowed_users" "$cb_uid"; then
+                    log_warn "Ignoring callback from unauthorized user: $(bot_user_label "$cb_uid")"
                     bot_answer_callback "$bot_token" "$cb_id" "⛔ Not authorized"
                     continue
                 fi
@@ -205,10 +223,17 @@ for u in data.get('result',[]):
                 local chat_id="$field1"
                 local msg_text="$field2"
                 local msg_thread="$field3"
+                local msg_uid="$field4"
 
                 # Only respond in the configured group chat. FAIL CLOSED — with no allowed
                 # chat configured, ignore all commands rather than answering any chat.
                 if [ -z "$default_chat_id" ] || [ "$chat_id" != "$default_chat_id" ]; then
+                    continue
+                fi
+
+                # Optional sender allowlist (fail closed: an unknown sender is rejected).
+                if ! bot_user_allowed "$allowed_users" "$msg_uid"; then
+                    [[ "$msg_text" == /* ]] && log_warn "Ignoring command from unauthorized user: $(bot_user_label "$msg_uid")"
                     continue
                 fi
 

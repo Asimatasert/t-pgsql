@@ -1,3 +1,34 @@
+# Print the normalized sender allowlist as ",id1,id2,". Prints nothing when no allowlist is
+# configured. A configured list without any valid numeric id prints "," (matches nobody).
+# Source: TELEGRAM_ALLOWED_USERS, else "telegram_allowed_users" under defaults: in the YAML.
+bot_allowed_users() {
+    local raw="${TELEGRAM_ALLOWED_USERS:-}"
+    if [ -z "$raw" ] && [ -f "$JOBS_FILE" ]; then
+        raw=$(get_default_value "telegram_allowed_users" 2>/dev/null) || true
+    fi
+    raw=$(printf '%s' "$raw" | tr -d '[]"\047 \t')
+    [ -z "$raw" ] && return 0
+    local out="," id ids=()
+    IFS=, read -ra ids <<< "$raw"
+    for id in "${ids[@]}"; do
+        [[ "$id" =~ ^[0-9]+$ ]] && out+="${id},"
+    done
+    printf '%s\n' "$out"
+}
+
+# bot_user_allowed <allowlist> <user_id>: succeeds when no allowlist is set, or when the
+# sender id is a number present in it. A missing or non-numeric id never matches.
+bot_user_allowed() {
+    [ -z "$1" ] && return 0
+    [[ "$2" =~ ^[0-9]+$ ]] || return 1
+    [[ "$1" == *",$2,"* ]]
+}
+
+# Printable sender id for logs (digits only, otherwise "unknown").
+bot_user_label() {
+    [[ "$1" =~ ^[0-9]+$ ]] && echo "$1" || echo unknown
+}
+
 # Owner uid of a path (GNU stat first, BSD stat as fallback).
 bot_file_owner() {
     stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null
