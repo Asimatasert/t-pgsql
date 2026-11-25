@@ -2974,12 +2974,18 @@ server_version_num() {
         local pre; pre="$(remote_pgpass_preamble "${!uvar}" "${!wvar}")"
         local rcmd="${pre}psql -U $(pq "${!uvar}") -h $(pq "${!hvar}") -p $(pq "${!pvar}") -d postgres -tAc $(pq "SHOW server_version_num") 2>/dev/null"
         v=$(ssh_exec "${!spvar}" "${!suvar}@${!shvar}" "$rcmd" | tr -d '[:space:]')
-        printf '%s' "$v"
-        return 0
+    else
+        setup_local_pgpass "${!uvar}" "${!wvar}"
+        v=$(psql -U "${!uvar}" -h "${!hvar}" -p "${!pvar}" -d postgres -tAc "SHOW server_version_num" 2>/dev/null | tr -d '[:space:]')
+        cleanup_local_pgpass
     fi
-    setup_local_pgpass "${!uvar}" "${!wvar}"
-    v=$(psql -U "${!uvar}" -h "${!hvar}" -p "${!pvar}" -d postgres -tAc "SHOW server_version_num" 2>/dev/null | tr -d '[:space:]')
-    cleanup_local_pgpass
+    # The answer comes from a remote server: it is later used in $(( )), where bash
+    # evaluates array subscripts and command substitutions. Accept plain digits only
+    # (no leading zero: avoids octal parsing); anything else counts as "unknown".
+    if [ -n "$v" ] && ! [[ "$v" =~ ^[1-9][0-9]{0,8}$ ]]; then
+        log_warn "Ignoring non-numeric server_version_num answer from ${prefix} server" >&2
+        v=""
+    fi
     printf '%s' "$v"
 }
 
