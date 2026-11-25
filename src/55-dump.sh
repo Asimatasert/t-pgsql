@@ -11,15 +11,17 @@ remote_stage_prepare() {
     local port="$1" dest="$2" dir="$3" script
     local body='umask 077
 bad() { echo "remote staging directory $d is unsafe: $1" >&2; exit 1; }
+perms() { ls -ldn "$d" 2>/dev/null | awk '"'"'{print substr($1,1,1), substr($1,5,6), $3}'"'"'; }
 [ -L "$d" ] && bad "it is a symlink"
 mkdir -p "$d" 2>/dev/null
-[ -d "$d" ] || bad "it cannot be created"
 [ -L "$d" ] && bad "it is a symlink"
-chmod 700 "$d" 2>/dev/null
-set -- $(ls -ldn "$d" 2>/dev/null | awk '"'"'{print substr($1,1,1), substr($1,5,6), $3}'"'"')
+[ -d "$d" ] || bad "it cannot be created"
+set -- $(perms)
 [ "$1" = d ] || bad "it is not a directory"
 [ "$3" = "$(id -u)" ] || bad "it is not owned by the connecting user"
-[ "$2" = "------" ] || bad "it grants group/other permissions"
+chmod 700 "$d" 2>/dev/null
+set -- $(perms)
+[ "$1" = d ] && [ "$2" = "------" ] || bad "it grants group/other permissions"
 exit 0'
     script="d=$(shq "$dir")
 $body"

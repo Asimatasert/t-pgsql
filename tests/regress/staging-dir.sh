@@ -45,6 +45,9 @@ cat > "$FAKE/psql" <<'EOF'
 #!/usr/bin/env bash
 echo "psql $*" >> "$REC/psql.log"; exit 0
 EOF
+for t in pg_isready createdb dropdb pg_dumpall; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE/$t"
+done
 chmod +x "$FAKE"/*
 export SB REC
 export PATH="$FAKE:$PATH"
@@ -62,19 +65,21 @@ mode=$(ls -ld "$SB/t-pgsql" | cut -c1-10)
 [ "$mode" = "drwx------" ] && ok "staging dir is mode 700" || nok "staging dir mode is $mode"
 
 # --- 2. symlink planted by another account -----------------------------------
-reset; mkdir "$SB/evil"; ln -s "$SB/evil" "$SB/t-pgsql"
+reset; mkdir "$SB/evil"; chmod 755 "$SB/evil"; ln -s "$SB/evil" "$SB/t-pgsql"
 out=$(run_dump); rc=$?
 [ $rc -ne 0 ] && ok "dump aborts when staging dir is a symlink" || nok "dump continued through a symlink"
 [ -z "$(ls -A "$SB/evil")" ] && ok "nothing written through the symlink" || nok "files landed in the symlink target"
+[ "$(ls -ld "$SB/evil" | cut -c1-10)" = "drwxr-xr-x" ] && ok "chmod never followed the symlink" || nok "symlink target mode was changed"
 [ ! -s "$REC/pg_dump.log" ] && ok "pg_dump never ran" || nok "pg_dump ran against an unsafe dir"
 case "$out" in *"unsafe"*) ok "clear error message" ;; *) nok "no clear error: $out" ;; esac
 
 # --- 3. directory owned by someone else (remote id -u differs) ---------------
-reset; mkdir "$SB/t-pgsql"
+reset; mkdir "$SB/t-pgsql"; chmod 755 "$SB/t-pgsql"
 printf '#!/bin/sh\necho 99999\n' > "$FAKE/id"; chmod +x "$FAKE/id"
 out=$(run_dump); rc=$?
 [ $rc -ne 0 ] && ok "dump aborts when the directory owner differs" || nok "dump continued with foreign owner"
 [ ! -s "$REC/pg_dump.log" ] && ok "pg_dump never ran (owner)" || nok "pg_dump ran (owner)"
+[ "$(ls -ld "$SB/t-pgsql" | cut -c1-10)" = "drwxr-xr-x" ] && ok "foreign-owned directory is not chmod'ed" || nok "mode changed before the owner check"
 rm -f "$FAKE/id"
 
 # --- 4. directory stays group/other accessible (chmod cannot fix it) ---------
