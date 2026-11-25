@@ -93,4 +93,71 @@ EOF
 ( cd "$TMP" && t-pgsql dump --from postgres@localhost/appdb --password x --config "$TMP/c2.conf" --no-meta --no-health-check >/dev/null 2>&1 </dev/null )
 [ -d "$TMP/cfgout2" ] && ok "config: a matching pair of quotes is stripped" || nok "config: a matching pair of quotes is stripped"
 
+# --- Corpus: new clean_value versus the base one (copied below), LF and CRLF.
+# Rows are  class@@raw value@@expected  ("<empty>" = empty string). "same" rows must come out
+# exactly as the base parser returned them; "diff" rows are the intended differences.
+BASE_AWK='
+function clean_value(v,   q, rest, idx) {
+    if (v ~ /^["'\'']/) {
+        q = substr(v, 1, 1)
+        rest = substr(v, 2)
+        idx = index(rest, q)
+        if (idx > 0) return substr(rest, 1, idx - 1)
+        return rest
+    }
+    sub(/[ \t]+#.*$/, "", v)
+    sub(/^#.*$/, "", v)
+    sub(/[ \t]+$/, "", v)
+    return v
+}
+'
+eval "$(sed -n "/^_YAML_AWK_LIB='/,/^'\$/p" "$BIN_SRC")"
+run_cv() { V="$2" awk "$1"'BEGIN { printf "%s", clean_value(ENVIRON["V"]) }'; }
+CR="$(printf '\r')"
+check_row() { # class raw expected
+    local class="$1" raw="$2" want="$3" new base
+    [ "$want" = "<empty>" ] && want=""
+    new="$(run_cv "$_YAML_AWK_LIB" "$raw"; echo x)"; new="${new%x}"
+    base="$(run_cv "$BASE_AWK" "$raw"; echo x)"; base="${base%x}"
+    [ "$new" = "$want" ] && ok "value [$raw] -> [$want]" || nok "value [$raw] -> [$want] (got [$new])"
+    if [ "$class" = same ]; then
+        [ "$new" = "$base" ] && ok "  unchanged from base: [$raw]" || nok "  unchanged from base: [$raw] (base [$base], new [$new])"
+        new="$(run_cv "$_YAML_AWK_LIB" "$raw$CR"; echo x)"; new="${new%x}"
+        base="$(run_cv "$BASE_AWK" "$raw$CR"; echo x)"; base="${base%x}"
+        [ "$new" = "$base" ] && ok "  unchanged from base with CRLF: [$raw]" || nok "  unchanged from base with CRLF: [$raw]"
+    else
+        [ "$base" != "$want" ] && ok "  differs from base on purpose: [$raw] (base [$base])" || nok "  expected a difference from base: [$raw]"
+    fi
+}
+while IFS= read -r row; do
+    [ -z "$row" ] && continue
+    class="${row%%@@*}"; rest="${row#*@@}"; raw="${rest%%@@*}"; want="${rest#*@@}"
+    check_row "$class" "$raw" "$want"
+done <<'ROWS'
+same@@plain@@plain
+same@@plain # comment@@plain
+same@@# only a comment@@<empty>
+same@@a#b@@a#b
+same@@http://h:1/x?y=1@@http://h:1/x?y=1
+same@@C:\dir\file@@C:\dir\file
+same@@"double"@@double
+same@@'single'@@single
+same@@"a\\b"@@a\\b
+same@@"C:\path\"@@C:\path\
+same@@"trail\"@@trail\
+same@@"x" # c@@x
+same@@"a#b"@@a#b
+same@@"q #name"@@q #name
+same@@'it' # c@@it
+same@@it's # comment@@it's
+same@@"unterminated@@unterminated
+same@@'unterminated@@unterminated
+same@@""@@<empty>
+diff@@'it''s'@@it's
+diff@@"say \"hi\""@@say "hi"
+diff@@"abc\" # c"@@abc" # c
+diff@@--a 'b # c' --d@@--a 'b # c' --d
+diff@@--a "b # c" --d@@--a "b # c" --d
+ROWS
+
 [ "$FAILS" -eq 0 ]

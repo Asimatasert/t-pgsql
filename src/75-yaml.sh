@@ -4,15 +4,18 @@
 
 # Shared awk helper prepended to every YAML value extractor. clean_value() turns a raw
 # value into its content:
-#   "double quoted"  -> \" and \\ are unescaped; a '#' inside is kept; the rest of the line
-#                       after the closing quote (e.g. a comment) is dropped
+#   "double quoted"  -> backslashes are kept verbatim EXCEPT \" in the middle of the value,
+#                       which is a literal quote (it only counts as an escape when another
+#                       quote follows; otherwise that quote closes the value, so "C:\x\"
+#                       gives C:\x\); a '#' inside is kept; the rest of the line after the
+#                       closing quote (e.g. a comment) is dropped
 #   'single quoted'  -> '' is an escaped quote; a '#' inside is kept; the rest is dropped
 #   plain            -> an unquoted ' #...' (or a leading '#') is a comment and is removed
 #                       with trailing whitespace; a ' #' inside a '...' or "..." run (as in a
 #                       saved "args:" line) is NOT a comment. If the quotes are unbalanced
 #                       (an apostrophe in prose) the first ' #' ends the value.
 _YAML_AWK_LIB='
-function clean_value(v,   n, i, c, d, out, state, cut, sq, dq) {
+function clean_value(v,   n, i, c, rest, out, state, cut, sq, dq) {
     sq = sprintf("%c", 39); dq = sprintf("%c", 34)
     n = length(v)
     c = substr(v, 1, 1)
@@ -20,12 +23,12 @@ function clean_value(v,   n, i, c, d, out, state, cut, sq, dq) {
         out = ""
         for (i = 2; i <= n; i++) {
             c = substr(v, i, 1)
-            if (c == "\\" && i < n) {
-                d = substr(v, i + 1, 1)
-                if (d == dq || d == "\\") { out = out d; i++; continue }
-            } else if (c == dq) {
-                return out
+            if (c == "\\" && substr(v, i + 1, 1) == dq) {
+                rest = substr(v, i + 2)
+                if (index(rest, dq) > 0) { out = out dq; i++; continue }
+                return out c
             }
+            if (c == dq) return out
             out = out c
         }
         return out
@@ -46,24 +49,23 @@ function clean_value(v,   n, i, c, d, out, state, cut, sq, dq) {
     for (i = 1; i <= n; i++) {
         c = substr(v, i, 1)
         if (state == 0) {
-            if (c == "\\") { i++; continue }
             if (c == sq) state = 1
             else if (c == dq) state = 2
-            else if (c == "#" && (i == 1 || substr(v, i - 1, 1) ~ /[ \t]/)) { cut = i; break }
+            else if (c == "#" && (i == 1 || substr(v, i - 1, 1) ~ /[[:blank:]]/)) { cut = i; break }
         } else if (state == 1) {
             if (c == sq) state = 0
         } else {
-            if (c == "\\") i++
+            if (c == "\\" && substr(v, i + 1, 1) == dq) i++
             else if (c == dq) state = 0
         }
     }
     if (cut > 0) {
         v = substr(v, 1, cut - 1)
     } else if (state != 0) {
-        sub(/[ \t]+#.*$/, "", v)
+        sub(/[[:blank:]]+#.*$/, "", v)
         sub(/^#.*$/, "", v)
     }
-    sub(/[ \t]+$/, "", v)
+    sub(/[[:blank:]]+$/, "", v)
     return v
 }
 '
