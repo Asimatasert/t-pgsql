@@ -65,6 +65,30 @@ clone_stream() {
             dump_cmd="PGPASSFILE=$(pq "$stream_from_pgpass") pg_dump -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -Fc $exclude_opts $only_opts $(pq "$FROM_DATABASE")"
         fi
 
+        # --force drops the target before a single byte is read from the source (a stream has
+        # no temp-database swap). Prove the source is reachable and the database exists first,
+        # and abort with the target untouched when it is not.
+        if [ "$FORCE" = true ]; then
+            local _src_probe="SELECT 1" _src_ok=""
+            if [ "$FROM_TYPE" = "ssh" ]; then
+                local _src_pre _src_uopt="-U $(pq "$FROM_DB_USER") "
+                if [ "$SUDO" = true ]; then
+                    _src_pre="sudo -u $(pq "$FROM_DB_USER") "; _src_uopt=""
+                else
+                    _src_pre="$(remote_pgpass_preamble "$FROM_DB_USER" "$FROM_DB_PASSWORD")"
+                fi
+                _src_ok=$(ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+                    "${_src_pre}psql ${_src_uopt}-h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -tAc $(pq "$_src_probe") -d $(pq "$FROM_DATABASE")" 2>/dev/null)
+            else
+                _src_ok=$(PGPASSFILE="$stream_from_pgpass" psql -w -U "$FROM_DB_USER" -h "$FROM_DB_HOST" -p "$FROM_DB_PORT" -tAc "$_src_probe" -d "$FROM_DATABASE" 2>/dev/null)
+            fi
+            if [ "$_src_ok" != "1" ]; then
+                log_error "Source database '$FROM_DATABASE' is not reachable; aborting before touching the target '$TO_DATABASE' (--force would have dropped it)"
+                [ -n "$stream_from_pgpass" ] && rm -f "$stream_from_pgpass"
+                result=1; idx=$((idx + 1)); continue
+            fi
+        fi
+
         # Build pg_restore command
         local restore_cmd=""
         if [ "$TO_TYPE" = "ssh" ]; then
