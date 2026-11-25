@@ -2,21 +2,67 @@
 # BATCH SYSTEM
 # ==============================================================================
 
-# Shared awk helper prepended to every YAML value extractor. clean_value() strips
-# a YAML inline comment and the surrounding quotes from a raw value. A '#' inside
-# a quoted value is preserved; an unquoted ' #...' (or a leading '#') is treated
-# as a comment and removed along with any trailing whitespace.
+# Shared awk helper prepended to every YAML value extractor. clean_value() turns a raw
+# value into its content:
+#   "double quoted"  -> \" and \\ are unescaped; a '#' inside is kept; the rest of the line
+#                       after the closing quote (e.g. a comment) is dropped
+#   'single quoted'  -> '' is an escaped quote; a '#' inside is kept; the rest is dropped
+#   plain            -> an unquoted ' #...' (or a leading '#') is a comment and is removed
+#                       with trailing whitespace; a ' #' inside a '...' or "..." run (as in a
+#                       saved "args:" line) is NOT a comment. If the quotes are unbalanced
+#                       (an apostrophe in prose) the first ' #' ends the value.
 _YAML_AWK_LIB='
-function clean_value(v,   q, rest, idx) {
-    if (v ~ /^["'\'']/) {
-        q = substr(v, 1, 1)
-        rest = substr(v, 2)
-        idx = index(rest, q)
-        if (idx > 0) return substr(rest, 1, idx - 1)
-        return rest
+function clean_value(v,   n, i, c, d, out, state, cut, sq, dq) {
+    sq = sprintf("%c", 39); dq = sprintf("%c", 34)
+    n = length(v)
+    c = substr(v, 1, 1)
+    if (c == dq) {
+        out = ""
+        for (i = 2; i <= n; i++) {
+            c = substr(v, i, 1)
+            if (c == "\\" && i < n) {
+                d = substr(v, i + 1, 1)
+                if (d == dq || d == "\\") { out = out d; i++; continue }
+            } else if (c == dq) {
+                return out
+            }
+            out = out c
+        }
+        return out
     }
-    sub(/[ \t]+#.*$/, "", v)
-    sub(/^#.*$/, "", v)
+    if (c == sq) {
+        out = ""
+        for (i = 2; i <= n; i++) {
+            c = substr(v, i, 1)
+            if (c == sq) {
+                if (substr(v, i + 1, 1) == sq) { out = out sq; i++; continue }
+                return out
+            }
+            out = out c
+        }
+        return out
+    }
+    state = 0; cut = 0
+    for (i = 1; i <= n; i++) {
+        c = substr(v, i, 1)
+        if (state == 0) {
+            if (c == "\\") { i++; continue }
+            if (c == sq) state = 1
+            else if (c == dq) state = 2
+            else if (c == "#" && (i == 1 || substr(v, i - 1, 1) ~ /[ \t]/)) { cut = i; break }
+        } else if (state == 1) {
+            if (c == sq) state = 0
+        } else {
+            if (c == "\\") i++
+            else if (c == dq) state = 0
+        }
+    }
+    if (cut > 0) {
+        v = substr(v, 1, cut - 1)
+    } else if (state != 0) {
+        sub(/[ \t]+#.*$/, "", v)
+        sub(/^#.*$/, "", v)
+    }
     sub(/[ \t]+$/, "", v)
     return v
 }
@@ -295,7 +341,7 @@ get_password_file() {
 # Get telegram notify config from defaults section
 # Usage: get_default_telegram_config
 get_default_telegram_config() {
-    awk '
+    awk "$_YAML_AWK_LIB"'
     BEGIN { in_defaults=0; in_notify=0; in_telegram=0; token=""; chat_id=""; thread_id="" }
     /^defaults:/ { in_defaults=1; next }
     /^[a-zA-Z]/ { if ($0 !~ /^defaults:/) { in_defaults=0; in_notify=0; in_telegram=0 } }
@@ -304,15 +350,15 @@ get_default_telegram_config() {
     in_notify && /^    telegram:/ { in_telegram=1; next }
     in_notify && /^    [a-zA-Z]/ { if ($0 !~ /^    telegram:/) in_telegram=0 }
     in_telegram && /^      token:/ {
-        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        val=$0; gsub(/^[^:]+: */, "", val); val=clean_value(val)
         token=val
     }
     in_telegram && /^      chat_id:/ {
-        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        val=$0; gsub(/^[^:]+: */, "", val); val=clean_value(val)
         chat_id=val
     }
     in_telegram && /^      message_thread_id:/ {
-        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        val=$0; gsub(/^[^:]+: */, "", val); val=clean_value(val)
         thread_id=val
     }
     END {
@@ -331,7 +377,7 @@ get_default_telegram_config() {
 get_job_telegram_config() {
     local job="$1"
 
-    local config=$(awk -v job="$job" '
+    local config=$(awk -v job="$job" "$_YAML_AWK_LIB"'
     BEGIN { in_job=0; in_notify=0; in_telegram=0; token=""; chat_id=""; thread_id="" }
     /^  [a-zA-Z0-9_-]+:/ {
         gsub(/:.*/, "", $1)
@@ -343,15 +389,15 @@ get_job_telegram_config() {
     in_notify && /^      telegram:/ { in_telegram=1; next }
     in_notify && /^      [a-zA-Z]/ { if ($0 !~ /^      telegram:/) in_telegram=0 }
     in_telegram && /^        token:/ {
-        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        val=$0; gsub(/^[^:]+: */, "", val); val=clean_value(val)
         token=val
     }
     in_telegram && /^        chat_id:/ {
-        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        val=$0; gsub(/^[^:]+: */, "", val); val=clean_value(val)
         chat_id=val
     }
     in_telegram && /^        message_thread_id:/ {
-        val=$0; gsub(/^[^:]+: */, "", val); gsub(/^["'\''"]|["'\''"]$/, "", val)
+        val=$0; gsub(/^[^:]+: */, "", val); val=clean_value(val)
         thread_id=val
     }
     END {
