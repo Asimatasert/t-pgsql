@@ -1,3 +1,17 @@
+# Parallel jobs write to a per-job log in a temp dir that is deleted when the batch ends, so
+# print what a FAILED job said (the last 50 lines) before it is lost.
+# Usage: show_failed_job_output <log-file> <job-name>
+show_failed_job_output() {
+    local logfile="$1" name="$2"
+    if [ -s "$logfile" ]; then
+        echo "---- output of failed job '$name' (last 50 lines) ----" >&2
+        tail -n 50 "$logfile" >&2
+        echo "---- end of output of '$name' ----" >&2
+    else
+        log_error "Job '$name' produced no output"
+    fi
+}
+
 cmd_batch() {
     local target="$1"
 
@@ -170,6 +184,7 @@ cmd_batch() {
                                 log_success "[${completed}/${total}] Completed: ${job_names[$i]}"
                             else
                                 log_error "[${completed}/${total}] Failed: ${job_names[$i]}"
+                                show_failed_job_output "$temp_dir/${job_names[$i]}.log" "${job_names[$i]}"
                                 failed=$((failed + 1))
                                 [ "$CONTINUE_ON_ERROR" != true ] && stop_launching=true
                             fi
@@ -207,6 +222,7 @@ cmd_batch() {
                     log_success "[${completed}/${total}] Completed: ${job_names[$i]}"
                 else
                     log_error "[${completed}/${total}] Failed: ${job_names[$i]}"
+                    show_failed_job_output "$temp_dir/${job_names[$i]}.log" "${job_names[$i]}"
                     failed=$((failed + 1))
                 fi
             done
