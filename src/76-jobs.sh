@@ -273,7 +273,7 @@ run_job() {
     _pw_to=$(get_job_field "$job_name" "to" "password");     [ -z "$_pw_to" ]   && _pw_to=$(get_job_value "$job_name" "to_password")
 
     log_info "Running job: $job_name"
-    log_debug "Command: $job_cmd $(redact_args "$job_args")"
+    log_debug "Command: $job_cmd $(redact_notify_args "$(redact_args "$job_args")")"
 
     # Notification specs (they contain the bot token) travel via the environment, like the
     # passwords: they must not appear in the argv of the re-exec'd process.

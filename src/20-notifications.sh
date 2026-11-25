@@ -26,6 +26,20 @@ tg_api() {
         | curl -s -K - "$@"
 }
 
+# Mask a notification channel spec for logs: keep the channel name, hide everything after
+# it (the Telegram token, a Slack/webhook URL and an e-mail address are all secrets).
+mask_notify_spec() {
+    case "$1" in
+        *:*) printf '%s:***' "${1%%:*}" ;;
+        *)   printf '%s' "$1" ;;
+    esac
+}
+
+# Mask the value of every --notify option in an argument string (for debug logs).
+redact_notify_args() {
+    printf '%s' "$1" | sed -E "s/(--notify[[:space:]]+['\"]?[A-Za-z]+:)[^[:space:]'\"]*/\1***/g"
+}
+
 send_notification() {
     local status="$1"      # success, failed, error
     local message="$2"     # Main message
@@ -61,7 +75,7 @@ send_notification() {
             webhook:*)  notify_webhook "$channel" "$status" "$message" "$details" "$timestamp" ;;
             slack:*)    notify_slack "$channel" "$emoji" "$message" "$details" "$timestamp" "$hostname" ;;
             email:*)    notify_email "$channel" "$status" "$message" "$details" ;;
-            *)          log_warn "Unknown notification channel: $channel" ;;
+            *)          log_warn "Unknown notification channel: $(mask_notify_spec "$channel")" ;;
         esac
     done
 }
