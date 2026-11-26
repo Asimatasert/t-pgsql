@@ -261,4 +261,18 @@ out=$(cd "$TMP" && DUMP_SLEEP=8 "$BASH" "$BIN" batch all --yaml "$TMP/jobs.yaml"
 [ "$(ndumps)" -eq 1 ] && ok "only one dump was written" || nok "only one dump was written ($(ndumps))"
 [ "$(nlocks)" -eq 0 ] && ok "batch left no lock behind" || nok "batch left no lock behind"
 
+# 13. two plain runs started at the same instant: exactly one may hold the lock (race probe)
+raced=0
+for n in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    reset
+    bg x 2; XP=$BGPID; bg y 2; YP=$BGPID
+    waitpid "$XP"; waitpid "$YP"; wait "$XP" "$YP" 2>/dev/null
+    if [ "$(grep -c '^start' "$REC/pg_dump.log" 2>/dev/null)" -ne 1 ]; then
+        raced=1
+        nok "simultaneous start $n: both runs held the lock | x: $(tr '\n' ' ' < "$TMP/x.out" | cut -c1-600) | y: $(tr '\n' ' ' < "$TMP/y.out" | cut -c1-600)"
+        break
+    fi
+done
+[ "$raced" -eq 0 ] && ok "12 simultaneous starts: exactly one run held the lock each time"
+
 [ "$FAIL" -eq 0 ]
