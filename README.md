@@ -864,7 +864,7 @@ jobs:
 
 - `/start` and `/fail` are inserted before a `?query` or `#fragment`. `--ping-start` / `--ping-fail` give explicit URLs and win over the derived ones. Without `--ping`, only the start and failure pings are sent (nothing on success).
 - Only `http://` and `https://` URLs; anything else is a startup error (exit `1`). `batch` does not accept `--ping*`: put `ping:` on the job instead.
-- Never sent with `--dry-run`, and **never for a run skipped by the lock (exit `75`)** — a job that is skipped for days shows up as "no ping" on the monitor, which is intended. A `--skip-if-recent` skip (exit `0`) does send start and success.
+- Never sent with `--dry-run`, and **never for a run skipped by the lock (exit `75`)** — a job that is skipped for days shows up as "no ping" on the monitor, which is intended. A `--skip-if-recent` skip (exit `0`) is a healthy state: it sends start and success, and the success body gets an extra line `skipped (recent dump)` so the run is recognisable in the monitor history.
 - A ping that cannot be delivered only prints a warning; it never changes the exit status. Each ping is a `curl` POST with a 10 s limit and two retries, so an unresponsive monitor can delay a run by up to about 30 s per ping. The URL goes to `curl` on stdin, never on the command line, and is shown as `https://host/***` in logs and `jobs show`.
 - `-q/--quiet` does not disable pings; `T_PGSQL_PING_DISABLE=1` does. A SIGKILL or power loss cannot send a failure ping: the monitor's own "no ping" alert covers it.
 
