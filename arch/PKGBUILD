@@ -18,7 +18,7 @@ optdepends=(
     'python: for bot JSON parsing'
 )
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('347a80416756e345910276b348312e4840084fd3303a0d257db1633a23f8bf5e')
+sha256sums=('a4eaf8362770ea6625f77a2ac4bd96147a4c3f4d834789e625812e036fbd4bb5')
 
 package() {
     cd "${srcdir}/${pkgname}-${pkgver}"
