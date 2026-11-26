@@ -5134,7 +5134,8 @@ status_counts() {
     local -a kept=()
     C_KEPT=0; C_SUS=0; C_INV=0
     [ -d "$dir" ] || return 0
-    mapfile -t kept < <(list_dumps_for_base "$dir" "$base")
+    kept=()
+    while IFS= read -r f; do [ -n "$f" ] && kept+=("$f"); done < <(list_dumps_for_base "$dir" "$base")
     C_KEPT=${#kept[@]}
     for f in "$dir/$base"_*.suspect "$dir/$base"_*.invalid; do
         [ -e "$f" ] || continue
@@ -5301,7 +5302,9 @@ status_history_view() {
     local file="$1" now="$2" US=$'\037' line i
     local -a lines=() rows=()
     if [ -n "$file" ]; then
-        mapfile -t lines < <(status_valid_lines "$file" | \
+        while IFS= read -r line; do
+            lines+=("$line")
+        done < <(status_valid_lines "$file" | \
             NAME_FILTER="$STATUS_NAME" awk 'BEGIN { FS = "\037" } $4 == ENVIRON["NAME_FILTER"]' | tail -n "$STATUS_LIMIT")
     fi
     for (( i = ${#lines[@]} - 1; i >= 0; i-- )); do
@@ -5336,6 +5339,12 @@ status_history_view() {
 STATUS_MAX_AGE_S=""
 cmd_status() {
     local num unit
+    # status reads the history with bash 4+ features; an older shell must not print a wrong
+    # "No runs recorded yet." (a monitoring check would trust it), so it refuses instead.
+    if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+        log_error "status needs bash 4 or newer (this is bash ${BASH_VERSION:-unknown})"
+        return 2
+    fi
     STATUS_MAX_AGE_S=""
     if [ -n "$STATUS_MAX_AGE" ]; then
         if ! [[ "$STATUS_MAX_AGE" =~ ^[0-9]{1,9}[smhd]$ ]]; then
@@ -5391,7 +5400,7 @@ cmd_status() {
         done < <(status_job_names "$JOBS_FILE")
     else
         local -a sorted=()
-        mapfile -t sorted < <({
+        while IFS= read -r n; do sorted+=("$n"); done < <({
             [ -n "$STATUS_SUMMARY" ] && printf '%s\n' "$STATUS_SUMMARY" | awk -F $'\037' '{ print $1 }'
             status_dir_bases
             [ -n "$STATUS_NAME" ] && printf '%s\n' "$STATUS_NAME"
