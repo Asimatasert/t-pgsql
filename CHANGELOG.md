@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- **Shrink guard `--min-size-ratio <percent>`** (planned for 3.13.0; also `min_size_ratio`
+- **Shrink guard `--min-size-ratio <percent>`** (also `min_size_ratio`
   in job YAML and `--config`): a new dump smaller than this percent (0-100, default 50,
   0 disables) of the previous dump of the same name no longer rotates anything. The new
   file is kept as `<name>.suspect`, keep-N, retention, archive and source-side cleanup are
@@ -18,9 +18,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `.suspect` files; `explain dump` / `explain retention` describe the guard.
 
 ### Changed
+- Files created by the tool (dumps, archives, logs, directories) are private by default
+  (umask 077). Set `T_PGSQL_UMASK=027` (one to four octal digits) to share through a group.
+- `-q/--quiet` no longer silences failure notifications; early failures (missing `--from`,
+  bad connection string, `--health-check-fail`) now notify when a channel is configured.
+- `--dry-run` sends no notifications and writes nothing (no summary, no `--save`, no
+  `jobs remove`, no output directory).
+- `restore` without `--file` picks the newest dump of the right database when the output
+  directory holds several; it errors and lists the bases when none matches.
+- `fetch` requires the connecting SSH user to own the remote staging directory.
+- A stream target without any password source fails instead of reusing the previous target's.
+- `install.sh` verifies `SHA256SUMS` and fails closed (`--allow-unverified` to opt out).
+- Translated READMEs and the internal audit report were removed; the project is English only.
 - Dump and clone notifications now use the job name instead of the raw database name
   in their titles, so alerts identify the job unambiguously when several jobs share a
   database name.
+
+### Security
+- `upgrade`: random verified here-doc terminator for the globals dump and a digits-only
+  `server_version_num`, so a hostile source server cannot run code on the target host or locally.
+- Telegram bot: optional sender allowlist (`TELEGRAM_ALLOWED_USERS`, `telegram_allowed_users`),
+  validated yaml and job names, private scratch and offset files, no replay after a lost offset.
+- Database passwords are kept off `ssh` argv in stream and masking runs; the bot token is not
+  on the argv of re-executed jobs; notification secrets are masked in logs.
+- The remote staging directory is verified before use; remote retention patterns are anchored
+  on the dump timestamp; `fetch --from-file` is quoted and restricted to a staged file name.
+- Connection strings reject option-like and unsafe values; the source==target guard handles
+  loopback aliases and SSH ports; stream `--force` probes the source before dropping the target.
+- `--exclude-data` fails closed; a new dump is verified before rotation (bad dumps are kept
+  as `.invalid`); notification curl calls have timeouts and `--fail`.
+
+### Fixed
+- The Telegram "re-run" button no longer breaks failure alerts when `callback_data` is too long.
+- Unknown job keys in jobs.yaml are reported; YAML quoting and trailing comments parse correctly.
+- `NO_COLOR` and non-terminal output are honoured; failed parallel jobs show their output.
 
 ## [3.12.1] - 2026-07-31
 
