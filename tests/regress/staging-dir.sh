@@ -54,7 +54,7 @@ export PATH="$FAKE:$PATH"
 export T_PGSQL_FROM_PASSWORD=x T_PGSQL_TO_PASSWORD=x
 export HOME="$TMP/home"; mkdir -p "$HOME"
 
-run_dump()  { "$BIN" dump --from "ssh://u@192.0.2.1/postgres@localhost/appdb" --output "$TMP/out" --from-keep 1 </dev/null 2>&1; }
+run_dump()  { "$BIN" dump --from "ssh://u@192.0.2.1/postgres@localhost/appdb" --output "$TMP/out" --from-keep 1 --min-size-ratio 0 </dev/null 2>&1; }
 reset()     { rm -rf "$SB/t-pgsql" "$SB/evil" "$FAKE/id" "$FAKE/chmod" "$REC"/*; }
 
 # --- 1. clean host: operation proceeds and the directory is 700 --------------
