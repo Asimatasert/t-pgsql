@@ -314,6 +314,14 @@ run_job() {
     if [ "$DRY_RUN" = true ] && [[ "$job_args" != *"--dry-run"* ]]; then
         job_args="$job_args --dry-run"
     fi
+    # Same for the lock options given to batch on the command line (a later option wins in
+    # the child, so these override the job's own lock_wait / no_lock keys).
+    if [ "$LOCK_WAIT_SET" = true ]; then
+        job_args="$job_args --lock-wait $(pq "$LOCK_WAIT")"
+    fi
+    if [ "$NO_LOCK" = true ] && [[ "$job_args" != *"--no-lock"* ]]; then
+        job_args="$job_args --no-lock"
+    fi
 
     # Read inline passwords to hand to the child via the ENVIRONMENT (not argv, so they stay
     # off the child's process argv / ps). Empty values are treated as unset by get_password.

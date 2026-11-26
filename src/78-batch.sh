@@ -266,7 +266,9 @@ cmd_batch() {
         fi
 
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        if [ $failed -eq 0 ] && [ $skipped -gt 0 ]; then
+        if [ $failed -eq 0 ] && [ $skipped -gt 0 ] && [ $((finished - skipped)) -le 0 ]; then
+            log_warn "All $skipped of $total jobs were skipped (locked: another run was already working on the same targets); nothing ran"
+        elif [ $failed -eq 0 ] && [ $skipped -gt 0 ]; then
             log_warn "No job failed; $skipped of $total skipped (locked: another run was already working on the same target)"
         elif [ $failed -eq 0 ]; then
             log_success "All $total jobs completed successfully"
@@ -285,12 +287,18 @@ cmd_batch() {
             if [ ${#NOTIFY[@]} -gt 0 ]; then
                 local status="success"
                 [ $failed -gt 0 ] && status="failed"
+                # Every job skipped by the run lock: nothing was backed up, so this is not a success
+                local _title="Batch completed: $total jobs"
+                if [ $failed -eq 0 ] && [ $skipped -gt 0 ] && [ $((finished - skipped)) -le 0 ]; then
+                    status="warning"
+                    _title="Batch skipped: all $total jobs were skipped (locked)"
+                fi
                 local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
                 local summary="Completed: $((finished - failed - skipped))/$total"$'\n'"Failed: $failed"
                 [ "$skipped" -gt 0 ] && summary+=$'\n'"Skipped (locked): $skipped"
                 [ "$finished" -lt "$total" ] && summary+=$'\n'"Not run: $((total - finished))"
                 summary+=$'\n'"Duration: $elapsed"
-                send_notification "$status" "Batch completed: $total jobs" "$summary"
+                send_notification "$status" "$_title" "$summary"
             fi
             NOTIFY=("${_saved_notify[@]}")
         fi

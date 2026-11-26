@@ -69,12 +69,56 @@ _lock_mtime() {
     stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
 }
 
-# Process start time text (identifies a process across pid reuse); empty when unavailable.
+# Process start identity (tells a live owner from a reused pid); empty when unavailable.
+#   Linux:  "proc:<field 22 of /proc/<pid>/stat>"  (start time in clock ticks, exact)
+#   other:  "ps:<epoch>"  from "ps -o lstart=" parsed to epoch seconds (compared with a tolerance)
 _lock_pstart() {
-    local out
-    out="$(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null)" || out=""
-    out="${out//$'\n'/ }"
-    printf '%s' "$(trim "$out")"
+    local pid="$1" st out e
+    local -a f
+    if [ -r "/proc/$pid/stat" ]; then
+        st="$(cat "/proc/$pid/stat" 2>/dev/null)" || st=""
+        st="${st##*) }"                 # drop "pid (comm) ": the name may hold spaces and ")"
+        read -r -a f <<< "$st"
+        [[ "${f[19]:-}" =~ ^[0-9]+$ ]] && { printf 'proc:%s' "${f[19]}"; return 0; }
+    fi
+    out="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || out=""
+    out="$(trim "${out//$'\n'/ }")"
+    [ -z "$out" ] && return 0
+    if date --version >/dev/null 2>&1; then
+        e="$(LC_ALL=C date -d "$out" +%s 2>/dev/null)"
+    else
+        e="$(LC_ALL=C date -j -f '%a %b %e %H:%M:%S %Y' "$out" +%s 2>/dev/null)"
+    fi
+    [[ "$e" =~ ^[0-9]+$ ]] && printf 'ps:%s' "$e"
+    return 0
+}
+
+# Is $2 (current start identity of a pid) the same process as $1 (recorded at acquire)?
+# Anything that cannot be compared (empty, other kind, old format, unparseable) counts as the
+# SAME process: an unknown must never make a live owner's lock look stale.
+_lock_pstart_same() {
+    local rec="$1" cur="$2" d
+    [ -n "$rec" ] && [ -n "$cur" ] || return 0
+    case "$rec:$cur" in
+        proc:*:proc:*) [ "${rec#proc:}" = "${cur#proc:}" ]; return $? ;;
+        ps:*:ps:*)
+            [[ "${rec#ps:}" =~ ^[0-9]+$ ]] && [[ "${cur#ps:}" =~ ^[0-9]+$ ]] || return 0
+            d=$(( ${rec#ps:} - ${cur#ps:} )); [ "$d" -lt 0 ] && d=$(( -d ))
+            [ "$d" -le 5 ]; return $? ;;
+    esac
+    return 0
+}
+
+# Stable identity of this host: lower-cased short name, so a changing domain suffix
+# (foo.local / foo.lan) does not make a crashed run's lock look foreign.
+_lock_host_id() {
+    local h="${1-}"
+    if [ "$#" -eq 0 ]; then
+        h="$(hostname -s 2>/dev/null)"
+        [ -z "$h" ] && h="$(hostname 2>/dev/null)"
+    fi
+    h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
+    printf '%s' "${h%%.*}"
 }
 
 _lock_fmt_epoch() {
@@ -126,14 +170,14 @@ _lock_is_stale() {
             return 0
         fi
     fi
-    [ "$m_host" = "$_LOCK_HOST" ] || return 1       # another host: only the hard maximum applies
+    [ -n "$m_host" ] && [ "$(_lock_host_id "$m_host")" = "$_LOCK_HOST" ] || return 1   # another host: only the hard maximum applies
     if ! kill -0 "$m_pid" 2>/dev/null; then
         _LOCK_STALE_WHY="owner pid $m_pid is not running"
         return 0
     fi
     if [ -n "$m_pstart" ]; then
         cur="$(_lock_pstart "$m_pid")"
-        if [ -n "$cur" ] && [ "$cur" != "$m_pstart" ]; then
+        if ! _lock_pstart_same "$m_pstart" "$cur"; then
             _LOCK_STALE_WHY="pid $m_pid was reused by another process"
             return 0
         fi
@@ -155,52 +199,90 @@ _lock_write_meta() {
     } > "$tmp" 2>/dev/null && mv -f "$tmp" "$dir/meta" 2>/dev/null || { rm -f "$tmp"; return 1; }
 }
 
+# The take-over mutex "<lock>.take": a directory that records its owner's pid. Taken with
+# mkdir; a held mutex is stolen only when its owner pid is dead or it is older than 60 s
+# (the steal is a rename, which only one stealer can win).
+_lock_mx_acquire() {
+    local mx="$1" owner now mt dead=false
+    if mkdir "$mx" 2>/dev/null; then
+        printf '%s\n' "$$" > "$mx/owner" 2>/dev/null
+        return 0
+    fi
+    [ -d "$mx" ] || return 1
+    owner="$(cat "$mx/owner" 2>/dev/null)"
+    now="$(date +%s)"; mt="$(_lock_mtime "$mx")"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+        dead=true
+    elif [[ "$mt" =~ ^[0-9]+$ ]] && [ $((now - mt)) -gt 60 ]; then
+        dead=true
+    fi
+    [ "$dead" = true ] || return 1
+    mv "$mx" "$mx.dead.$$" 2>/dev/null || return 1
+    rm -rf "$mx.dead.$$" 2>/dev/null
+    mkdir "$mx" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$mx/owner" 2>/dev/null
+    return 0
+}
+
+# Release the mutex, only when this process owns it (it may have been stolen after 60 s).
+_lock_mx_release() {
+    [ "$(cat "$1/owner" 2>/dev/null)" = "$$" ] || return 0
+    rm -f "$1/owner" 2>/dev/null
+    rmdir "$1" 2>/dev/null
+    return 0
+}
+
 # Try once to take one lock. 0 = acquired, 1 = held by a live owner (_LOCK_HOLDER set),
-# 2 = the lock directory cannot be used (caller runs without it).
+# 2 = the lock directory cannot be used (caller runs without it), 3 = a competitor created
+# the directory while a stale one was being taken over (caller tries again right away).
 _lock_try() {
-    local dir="$1" key="$2" mx old now mt
+    local dir="$1" key="$2" mx old
     if mkdir "$dir" 2>/dev/null; then
         _lock_write_meta "$dir" "$key" || { rm -rf "$dir" 2>/dev/null; return 2; }
         _LOCK_HELD+=("$dir")
         return 0
     fi
     [ -d "$dir" ] || return 2                          # failed for a reason other than "exists"
-    if _lock_is_stale "$dir"; then
-        # Take-over is serialised by a second mkdir mutex, then the stale directory is
-        # renamed away (atomic) before the new lock is created; the staleness is re-checked
-        # under the mutex so a lock a faster process just created is never removed.
-        mx="$dir.take"
-        if ! mkdir "$mx" 2>/dev/null; then
-            now="$(date +%s)"; mt="$(_lock_mtime "$mx")"
-            if [[ "$mt" =~ ^[0-9]+$ ]] && [ $((now - mt)) -gt 60 ]; then
-                rmdir "$mx" 2>/dev/null
-                mkdir "$mx" 2>/dev/null || { _lock_describe "$dir"; return 1; }
-            else
-                _lock_describe "$dir"; return 1
+    if ! _lock_is_stale "$dir"; then
+        _lock_describe "$dir"; return 1
+    fi
+    # Take-over is serialised by the mutex, then the stale directory is renamed away
+    # (atomic) before the new lock is created; the staleness is re-checked under the mutex
+    # so a lock a faster process just created is never removed.
+    mx="$dir.take"
+    if ! _lock_mx_acquire "$mx"; then
+        _lock_describe "$dir"; return 1
+    fi
+    if [ -d "$dir" ]; then
+        if _lock_is_stale "$dir"; then
+            old="$dir.old.$$"
+            log_warn "Taking over stale lock (${_LOCK_STALE_WHY}; held by ${m_cmd:-unknown command}${m_job:+, job $m_job})"
+            if ! mv "$dir" "$old" 2>/dev/null; then
+                _lock_mx_release "$mx"
+                [ -d "$dir" ] && return 2
+                return 3
             fi
+            rm -rf "$old" 2>/dev/null
+        else
+            _lock_mx_release "$mx"
+            _lock_describe "$dir"; return 1
         fi
-        if [ -d "$dir" ]; then
-            if _lock_is_stale "$dir"; then
-                old="$dir.old.$$"
-                log_warn "Taking over stale lock (${_LOCK_STALE_WHY}; held by ${m_cmd:-unknown command}${m_job:+, job $m_job})"
-                if ! mv "$dir" "$old" 2>/dev/null; then rmdir "$mx" 2>/dev/null; return 2; fi
-                rm -rf "$old" 2>/dev/null
-            else
-                rmdir "$mx" 2>/dev/null
-                _lock_describe "$dir"; return 1
-            fi
-        fi
-        if mkdir "$dir" 2>/dev/null && _lock_write_meta "$dir" "$key"; then
-            rmdir "$mx" 2>/dev/null
+    fi
+    if mkdir "$dir" 2>/dev/null; then
+        # created by this process just now: it is ours to write and, on failure, to remove
+        if _lock_write_meta "$dir" "$key"; then
+            _lock_mx_release "$mx"
             _LOCK_HELD+=("$dir")
             return 0
         fi
-        rmdir "$mx" 2>/dev/null
-        [ -d "$dir" ] && [ ! -f "$dir/meta" ] && rmdir "$dir" 2>/dev/null
+        rm -rf "$dir" 2>/dev/null
+        _lock_mx_release "$mx"
         return 2
     fi
-    _lock_describe "$dir"
-    return 1
+    # A plain acquirer's mkdir landed between the rename and ours: the directory is
+    # theirs. Leave it alone and look again (never run unlocked because of this).
+    _lock_mx_release "$mx"
+    return 3
 }
 
 # Fill _LOCK_HOLDER with a one-line description of the lock's owner.
@@ -263,7 +345,7 @@ _lock_compute_keys() {
 # unlocked on purpose / because the lock directory is unusable) and 75 when another run
 # holds one of them (nothing is held then). Callers do: lock_acquire_command || exit $?
 lock_acquire_command() {
-    local sd locks key dir rc deadline now waited=false
+    local sd locks key dir rc deadline now waited=false retries
     [ "$NO_LOCK" = true ] && return 0
     [ "$DRY_RUN" = true ] && return 0
     case "$COMMAND" in dump|fetch|restore|clone|upgrade) ;; *) return 0 ;; esac
@@ -273,7 +355,7 @@ lock_acquire_command() {
     fi
     _lock_compute_keys
     [ "${#_LOCK_KEYS[@]}" -gt 0 ] || return 0
-    _LOCK_HOST="$(hostname 2>/dev/null)"
+    _LOCK_HOST="$(_lock_host_id)"
 
     sd="$(lock_state_dir)" || { log_warn "Run lock disabled: state directory is not usable; continuing without a lock"; return 0; }
     locks="$sd/locks"
@@ -286,8 +368,15 @@ lock_acquire_command() {
     while IFS= read -r key; do
         [ -z "$key" ] && continue
         dir="$locks/$(_lock_safe_name "$key").lock"
+        retries=0
         while :; do
             _lock_try "$dir" "$key"; rc=$?
+            if [ "$rc" -eq 3 ]; then
+                # lost a race while taking over a stale lock: look again at once (bounded)
+                retries=$((retries + 1))
+                [ "$retries" -le 5 ] && continue
+                _lock_describe "$dir"; rc=1
+            fi
             [ "$rc" -ne 1 ] && break
             now="$(date +%s)"
             if [ "$now" -ge "$deadline" ]; then
