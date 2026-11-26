@@ -89,10 +89,17 @@ and
 .B \-\-to
 it also tests connectivity.
 .TP
+.BR status " [\fIoptions\fR]"
+Show the last run of each job from the run history (read-only; it creates nothing).
+Columns: name, last run, result (ok, failed, suspect, skipped, locked, never),
+duration, size, dumps kept and a note.
+See
+.BR "STATUS OPTIONS" .
+.TP
 .BR explain " [\fItopic\fR]"
 Print a built-in explanation of what a command is for. Without a topic the topics
 are listed (dump, restore, clone, stream, upgrade, fetch, batch, bot, list, meta,
-clean, doctor, masking, retention).
+clean, doctor, status, ping, lock, masking, retention).
 .TP
 .B version
 Show the version.
@@ -340,6 +347,195 @@ Run only these jobs (comma-separated). Alias:
 .BI \-\-exclude\-jobs " jobs"
 Skip these jobs (comma-separated). Alias:
 .BR \-\-exclude .
+.SH HEARTBEAT PING OPTIONS
+Heartbeat pings (a dead-man's switch for a monitor such as healthchecks.io or an
+Uptime Kuma push monitor) are sent by
+.BR dump ,
+.BR clone ,
+.BR restore ,
+.B upgrade
+and
+.BR fetch .
+The start ping is sent after validation and after the lock was taken; then exactly
+one success ping (exit status 0) or failure ping (any other exit status, including
+SIGINT and SIGTERM) follows.
+Nothing is sent with
+.BR \-\-dry\-run ,
+for a run skipped by the lock (exit status 75), or by
+.BR batch ,
+.BR list ,
+.BR doctor ,
+.B status
+and the other commands.
+.B \-\-quiet
+does not disable pings.
+A ping that cannot be delivered only prints a warning and never changes the exit
+status.
+Each ping is an HTTP POST made by curl with a 10 second limit and two retries, so a
+monitor that never answers can delay a run by up to about 30 seconds per ping.
+The URL is passed to curl on standard input, never on its command line, and is masked
+as scheme://host/*** in logs and in
+.BR "jobs show" .
+.TP
+.BI \-\-ping " url"
+Base monitor URL (http:// or https:// only).
+The start ping goes to
+.IR url /start,
+the success ping to
+.I url
+and the failure ping to
+.IR url /fail.
+The suffix is inserted before a query string or fragment.
+Config file key and jobs file key:
+.BR ping .
+.TP
+.BI \-\-ping\-start " url"
+Explicit start URL; wins over the one derived from
+.BR \-\-ping .
+Key:
+.BR ping_start .
+.TP
+.BI \-\-ping\-fail " url"
+Explicit failure URL; wins over the one derived from
+.BR \-\-ping .
+Key:
+.BR ping_fail .
+Without
+.BR \-\-ping ,
+.B \-\-ping\-start
+and
+.B \-\-ping\-fail
+still work on their own: only the start and the failure ping are sent and nothing is
+sent on success.
+.PP
+.B batch
+does not accept these options (it exits with 1).
+Put
+.BR ping: ,
+.B ping_start:
+and
+.B ping_fail:
+on the job, or under
+.BR defaults: ,
+in the jobs file; each job then pings on its own run.
+A job value wins over
+.BR defaults: .
+.SH RUN LOCK OPTIONS
+.BR dump ,
+.BR fetch ,
+.BR restore ,
+.B clone
+and
+.B upgrade
+take a lock before working, so two runs never work on the same dump or target at the
+same time.
+.B dump
+and
+.B fetch
+lock the output directory together with the dump name;
+.BR restore ,
+.B clone
+and
+.B upgrade
+lock every
+.B \-\-to
+database (a non-streaming clone or upgrade also locks the dump name it writes).
+The lock is not taken with
+.BR \-\-dry\-run ,
+by
+.B batch
+itself, or by the other commands.
+If the lock is held, the run prints a warning and exits with status 75; no failure
+notification and no ping is sent, and the history records the result
+.BR locked .
+A lock whose owner is gone (process not running, process id reused, or older than
+.BR T_PGSQL_LOCK_MAX_AGE )
+is taken over by the next run.
+If the state directory cannot be used, the run continues without a lock and prints a
+warning.
+.TP
+.BI \-\-lock\-wait " seconds"
+Wait up to this many seconds for a held lock before skipping the run (default 0:
+skip at once). A non-negative integer.
+Config and jobs file key:
+.BR lock_wait .
+With
+.B batch
+the option is forwarded to every job that the batch starts.
+.TP
+.B \-\-no\-lock
+Do not take the lock.
+Config and jobs file key:
+.B no_lock
+(true).
+With
+.B batch
+the option is forwarded to every job.
+.PP
+In a batch, a job that exits with status 75 is reported as skipped (locked), is not
+a failure and does not stop the batch.
+.SH STATUS OPTIONS
+Used by the
+.B status
+command.
+.TP
+.BI \-\-yaml " file"
+List exactly the jobs of this jobs file; a job that never ran is shown as
+.BR never .
+Without it, the names come from the history and from the dump files in the output
+directory.
+.TP
+.BI \-\-output " directory"
+Dump directory used for the DUMPS KEPT column and the counts of
+.B .suspect
+and
+.B .invalid
+files. A missing directory is not an error.
+.TP
+.BI \-\-name " name"
+Show only this name (an unknown name is shown as
+.BR never ).
+.TP
+.BI \-\-limit " n"
+Show the last n runs of
+.BR \-\-name ,
+newest first. Requires
+.BR \-\-name ;
+cannot be combined with
+.BR \-\-max\-age .
+.TP
+.B \-\-json
+Print a JSON array instead of the table.
+.TP
+.BI \-\-max\-age " duration"
+Monitoring check: exit with status 3 when a listed name has no fresh successful run,
+has never run, or when nothing is listed.
+.I duration
+is an integer with an optional unit s, m, h or d (upper or lower case); a bare number
+is seconds (for example 3600, 90s, 30m, 26h, 1d).
+Only runs with result
+.B ok
+and
+.B skipped
+(a run skipped by
+.BR \-\-skip\-if\-recent )
+count as fresh; failed, suspect and locked runs do not.
+.PP
+.B status
+needs bash 4 or newer (on an older bash it prints a message and exits with status 2).
+The history is written by every
+.BR dump ,
+.BR clone ,
+.BR restore ,
+.B upgrade
+and
+.B fetch
+run (not with
+.BR \-\-dry\-run ),
+including failed, suspect and lock-skipped runs.
+Messages are shortened to 200 bytes and stripped of passwords, URLs and
+user@host words.
+A run killed by SIGKILL, or lost to power failure, leaves no line.
 .SH BOT OPTIONS
 .TP
 .BI \-\-token " token"
@@ -406,6 +602,15 @@ t-pgsql doctor
 Learn what a command does:
 t-pgsql explain clone
 .TP
+Heartbeat to a monitor, and skip if another run is active:
+t-pgsql dump \-\-from postgres@localhost/mydb \-\-ping https://hc.example.com/ping/UUID \-\-lock\-wait 60
+.TP
+Show the last run of each job:
+t-pgsql status \-\-yaml jobs.yaml
+.TP
+Cron check that fails when a job has no successful run within 26 hours:
+t-pgsql status \-\-yaml jobs.yaml \-\-max\-age 26h \-\-json >/dev/null || echo stale
+.TP
 Run the Telegram bot:
 t-pgsql bot \-\-yaml prod \-\-cooldown 30m
 .SH FILES
@@ -420,6 +625,24 @@ See
 Written to the output directory as .tar.gz (gzip), or as .dump, .dump.zst, .dump.xz
 and .dump.bz2. Dumps that are not wrapped in a .tar.gz have a .meta metadata file
 next to them.
+.TP
+.I $XDG_STATE_HOME/t-pgsql
+State directory (default ~/.local/state/t-pgsql; override with
+.BR T_PGSQL_STATE_DIR ).
+Mode 0700; it is refused when it is a symbolic link or owned by another user.
+A run under another HOME (for example through sudo) uses another state directory.
+.TP
+.I history.tsv
+In the state directory. One tab-separated line per run of dump, clone, restore,
+upgrade and fetch: epoch, ISO 8601 UTC time, command, name, status (ok, failed,
+suspect, skipped, locked), exit code, duration in seconds, size in bytes, message.
+Mode 0600. Above 2000 lines it is cut to the newest 1000.
+.TP
+.I locks/
+In the state directory. One
+.I NAME-CHECKSUM.lock
+directory per held run lock, removed on release. After a SIGKILL it stays and is
+taken over by the next run.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -442,7 +665,29 @@ exits with 1 when at least one job failed, also with
 exits with 1 when it found a problem.
 .PP
 Other non-zero values may be returned when an underlying tool such as pg_restore or
-ssh fails; do not rely on a specific value other than 0.
+ssh fails; do not rely on a specific value other than 0, 2, 3 and 75.
+.TP
+.B 2
+A usage error of
+.BR status :
+bad
+.B \-\-max\-age
+or
+.BR \-\-limit ,
+.B \-\-limit
+without
+.BR \-\-name ,
+a missing
+.B \-\-yaml
+file, an unknown option or stray argument, or a bash older than 4.
+.TP
+.B 3
+.B status \-\-max\-age
+found a listed name without a fresh successful run (or nothing listed).
+.TP
+.B 75
+The run was skipped because another run holds the lock. This is not a failure
+(EX_TEMPFAIL): a cron wrapper should treat it as success or retry later.
 .SH ENVIRONMENT
 .TP
 .B T_PGSQL_PASSWORD
@@ -456,6 +701,17 @@ Target password (overridden by \-\-to\-password).
 .TP
 .B T_PGSQL_OUTPUT_DIR
 Default output directory for dumps (overridden by \-\-output).
+.TP
+.B T_PGSQL_STATE_DIR
+State directory for the run history and the run locks (default
+$XDG_STATE_HOME/t-pgsql, or ~/.local/state/t-pgsql).
+.TP
+.B T_PGSQL_LOCK_MAX_AGE
+Maximum age in seconds after which a run lock counts as stale and is taken over
+(default 86400).
+.TP
+.B T_PGSQL_PING_DISABLE
+Set to 1 to disable all heartbeat pings.
 .TP
 .B PGCONNECT_TIMEOUT
 libpq connection timeout in seconds (default 10).
