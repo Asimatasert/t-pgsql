@@ -1,0 +1,26 @@
+# Example: run the Telegram bot as a long-lived service.
+# Adjust PG_MAJOR to your target server version, mount your jobs file, dumps
+# directory, password files and SSH key (read-only), then:
+#
+#   docker compose up -d --build
+#
+# One-off commands (dump/restore/clone) can reuse the same image:
+#   docker compose run --rm bot dump --from ... --output /data/dumps -y
+services:
+  bot:
+    build:
+      context: .
+      args:
+        PG_MAJOR: "18"
+    image: t-pgsql:18
+    restart: unless-stopped
+    command: ["bot", "--yaml", "/data/jobs.yaml"]
+    volumes:
+      - ./jobs.yaml:/data/jobs.yaml:ro
+      - ./secrets:/data/.secrets:ro
+      - ~/.ssh/id_backup:/home/tpgsql/.ssh/id_backup:ro
+      - dumps:/data/dumps
+    # environment:
+    #   - T_PGSQL_PASSWORD=...   # prefer password files or a secrets manager
+volumes:
+  dumps:

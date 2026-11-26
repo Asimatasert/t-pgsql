@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: t-pgsql matches src/ (generated file in sync)
+        run: ./build.sh --check
+      - name: Syntax check (bash -n)
+        run: |
+          bash -n t-pgsql
+          bash -n build.sh
+          for f in src/*.sh; do bash -n "$f" || echo "note: $f is a fragment, not standalone"; done || true
+      - name: ShellCheck (advisory)
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -S error t-pgsql || true

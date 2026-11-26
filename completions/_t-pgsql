@@ -1,0 +1,114 @@
+#compdef t-pgsql
+
+_t-pgsql() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    _arguments -C \
+        '1:command:->commands' \
+        '*:options:->options'
+
+    case $state in
+        commands)
+            local -a commands
+            commands=(
+                'dump:Create database backup'
+                'restore:Restore backup to database'
+                'clone:Dump + Restore (full sync)'
+                'upgrade:Logical major-version migration'
+                'fetch:Fetch existing dump from remote'
+                'batch:Run multiple jobs'
+                'bot:Telegram bot (listen for commands)'
+                'jobs:Manage saved jobs'
+                'list:List dump files'
+                'meta:Show metadata'
+                'clean:Clean old dumps'
+                'doctor:Check environment and backup health'
+                'explain:Explain what a command is for'
+                'version:Show version'
+                'help:Show help'
+            )
+            _describe -t commands 'command' commands
+            ;;
+        options)
+            # jobs subcommand completion (position right after "jobs")
+            if [[ $words[2] == jobs && $CURRENT -eq 3 ]]; then
+                local -a jobs_subcommands
+                jobs_subcommands=(
+                    'list:List all jobs'
+                    'show:Show job details'
+                    'remove:Remove a job'
+                )
+                _describe -t jobs-subcommands 'jobs subcommand' jobs_subcommands
+                return
+            fi
+
+            _arguments -s \
+                '--from[Source connection]:connection:' \
+                '--to[Target connection]:connection:' \
+                '--password[Password]:password:' \
+                '--from-password[Source password]:password:' \
+                '--to-password[Target password]:password:' \
+                '--password-file[Password file]:file:_files' \
+                '--from-password-file[Source password file]:file:_files' \
+                '--to-password-file[Target password file]:file:_files' \
+                '--config[Config file]:file:_files' \
+                '--exclude-table[Exclude tables]:tables:' \
+                '--exclude-schema[Exclude schemas]:schemas:' \
+                '--exclude-data[Exclude data only]:tables:' \
+                '--only-table[Only these tables]:tables:' \
+                '--only-schema[Only these schemas]:schemas:' \
+                '--compress[Compression type]:type:(gzip zstd xz bzip2 none)' \
+                '--compress-level[Compression level 1-9]:level:(1 2 3 4 5 6 7 8 9)' \
+                '--pg-compress-level[pg_dump compression 0-9]:level:(0 1 2 3 4 5 6 7 8 9)' \
+                '--output[Output directory]:dir:_files -/' \
+                '--dump-name[Custom dump filename]:name:' \
+                '--keep[Keep N local dumps]:count:' \
+                '--from-keep[Keep N on source]:count:' \
+                '--skip-if-recent[Skip if recent dump exists]:time:(today 24h 12h 6h 1d)' \
+                '--from-file[Fetch existing dump]:pattern:' \
+                '--yaml[Custom YAML file]:yaml:_files -g "*.yaml"' \
+                '--retention[Enable GFS retention]' \
+                '--retention-daily[Daily backups]:count:' \
+                '--retention-weekly[Weekly backups]:count:' \
+                '--retention-monthly[Monthly backups]:count:' \
+                '--retention-yearly[Yearly backups]:count:' \
+                '--health-check[Check before]' \
+                '--health-check-after[Check after]' \
+                '--no-health-check[Disable checks]' \
+                '--health-check-fail[Fail on health check error]' \
+                '--notify[Notification channel]:channel:' \
+                '--notify-on-error[Only on error]' \
+                '--notify-summary[Send batch summary notification]' \
+                '--mask[Enable masking]' \
+                '--mask-rules[Masking rules]:file:_files' \
+                '--mask-tables[Tables to mask]:tables:' \
+                '--stream[Stream mode]' \
+                '--stream-buffer[Buffer size MB]:size:' \
+                '--sudo[Use sudo]' \
+                '--globals[Also migrate roles/tablespaces]' \
+                '--pg-bindir[PostgreSQL client bin dir]:dir:_files -/' \
+                '--parallel[Parallel jobs]:count:' \
+                '--continue-on-error[Continue on error]' \
+                '--only-jobs[Only run these batch jobs]:jobs:' \
+                '--exclude-jobs[Exclude these batch jobs]:jobs:' \
+                '--only[Alias for --only-jobs]:jobs:' \
+                '--exclude[Alias for --exclude-jobs]:jobs:' \
+                '--save[Save as job]:name:' \
+                '--batch[Run batch job]:job:' \
+                '--file[Dump file]:file:_files' \
+                '--log[Log file]:file:_files' \
+                '--log-level[Log level]:level:(debug info warn error)' \
+                {-v,--verbose}'[Verbose output]' \
+                {-q,--quiet}'[Quiet output]' \
+                {-y,--yes}'[Skip confirmations]' \
+                {-f,--force}'[Force overwrite]' \
+                '--dry-run[Dry run]' \
+                '--no-meta[No meta files]' \
+                {-h,--help}'[Show help]' \
+                '--version[Show version]'
+            ;;
+    esac
+}
+
+_t-pgsql "$@"

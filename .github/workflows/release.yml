@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Get version
+        id: version
+        run: |
+          # Strip everything up to the first digit so the version is digit-first
+          VERSION=$(echo "${GITHUB_REF#refs/tags/}" | sed 's/^[^0-9]*//')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends debhelper dpkg-dev build-essential
+
+      - name: Build Debian package
+        id: deb
+        run: |
+          # Build straight from the repo's debian/ dir so the packaged
+          # control fields, changelog and any copyright are the real ones.
+          dpkg-buildpackage -us -uc -b
+          DEB=$(ls ../t-pgsql_*_all.deb | head -n1)
+          cp "$DEB" "$GITHUB_WORKSPACE/"
+          echo "DEB_FILE=$(basename "$DEB")" >> $GITHUB_OUTPUT
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist/t-pgsql-${{ steps.version.outputs.VERSION }}
+          cp t-pgsql dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
+          cp LICENSE dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
+          cp -r man dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
+          cp -r completions dist/t-pgsql-${{ steps.version.outputs.VERSION }}/
+          cd dist
+          tar -czf t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz t-pgsql-${{ steps.version.outputs.VERSION }}
+          sha256sum t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz > t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz.sha256
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            t-pgsql
+            ${{ steps.deb.outputs.DEB_FILE }}
+            dist/t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz
+            dist/t-pgsql-${{ steps.version.outputs.VERSION }}.tar.gz.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v5
+        with:
+          # Check out the branch (not the detached tag) so we can push back.
+          ref: master
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get version and SHA
+        id: info
+        run: |
+          VERSION=$(echo "${GITHUB_REF#refs/tags/}" | sed 's/^[^0-9]*//')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          SHA=$(curl -fsSL "https://github.com/${{ github.repository }}/archive/refs/tags/v${VERSION}.tar.gz" | sha256sum | cut -d' ' -f1)
+          echo "SHA256=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Update Formula
+        run: |
+          VERSION="${{ steps.info.outputs.VERSION }}"
+          SHA256="${{ steps.info.outputs.SHA256 }}"
+          # Update the url version, the sha256 and the test assertion using
+          # patterns that actually exist in Formula/t-pgsql.rb.
+          sed -i -E "s|archive/refs/tags/v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz|archive/refs/tags/v${VERSION}.tar.gz|" Formula/t-pgsql.rb
+          sed -i -E "s|sha256 \"[a-f0-9]{64}\"|sha256 \"${SHA256}\"|" Formula/t-pgsql.rb
+          sed -i -E "s|assert_match \"v[0-9]+\.[0-9]+\.[0-9]+\"|assert_match \"v${VERSION}\"|" Formula/t-pgsql.rb
+
+      - name: Commit and push Formula update
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add Formula/t-pgsql.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date; nothing to commit."
+          else
+            git commit -m "Update Homebrew formula to v${{ steps.info.outputs.VERSION }}"
+            git push origin HEAD:master
+          fi

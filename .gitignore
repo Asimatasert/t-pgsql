@@ -1,0 +1,16 @@
+# Secrets and passwords
+.secrets/
+
+# Dump files
+dumps/
+
+# Active jobs config (contains credentials)
+jobs.yaml
+
+# Build artifacts
+build/
+dist/
+*.deb
+
+# OS files
+.DS_Store

@@ -1,0 +1,299 @@
+# ==============================================================================
+# t-pgsql - Example Jobs Configuration (v3.9.0)
+# ==============================================================================
+#
+# This file contains example job definitions.
+# To use: cp jobs.yaml.example jobs.yaml
+#
+# Commands:
+#   t-pgsql jobs              - List all jobs
+#   t-pgsql jobs show <name>  - Show job details
+#   t-pgsql --batch <name>    - Run single job
+#   t-pgsql --batch all       - Run all jobs
+#
+# ==============================================================================
+
+# ==============================================================================
+# PROFILES - Reusable connection configurations
+# ==============================================================================
+profiles:
+  # Production server
+  production:
+    type: ssh
+    ssh_user: admin
+    ssh_host: prod.example.com
+    db_user: postgres
+    db_host: localhost
+    db_port: 5432
+    password_file: ~/.secrets/prod.pass
+
+  # Staging server
+  staging:
+    type: ssh
+    ssh_user: deploy
+    ssh_host: staging.example.com
+    db_user: postgres
+    db_host: localhost
+    db_port: 5432
+    password_file: ~/.secrets/staging.pass
+
+  # Local development
+  local:
+    type: local
+    db_user: postgres
+    db_host: localhost
+    db_port: 5432
+    password_file: ~/.secrets/local.pass
+
+  # Test server
+  test:
+    type: ssh
+    ssh_user: tester
+    ssh_host: test.example.com
+    db_user: postgres
+    password_file: ~/.secrets/test.pass
+
+# ==============================================================================
+# JOBS
+# ==============================================================================
+jobs:
+  # ============================================================================
+  # PRODUCTION -> LOCAL SYNC (Profile-based - Recommended)
+  # ============================================================================
+
+  # Sync from production to local dev environment
+  prod-to-dev:
+    command: clone
+    from:
+      profile: production
+      database: myapp
+    to:
+      profile: local
+      database: myapp_dev
+    force: true
+    from_keep: 1
+    exclude_data: "audit.*,logs"
+
+  # Sync from production to staging
+  prod-to-staging:
+    command: clone
+    from:
+      profile: production
+      database: myapp
+    to:
+      profile: staging
+      database: myapp_staging
+    force: true
+    exclude_table: "temp_data,cache"
+
+  # ============================================================================
+  # DAILY BACKUPS (Profile-based)
+  # ============================================================================
+
+  # Production daily backup
+  daily-prod-backup:
+    command: dump
+    from:
+      profile: production
+      database: myapp
+    output: /backups/daily
+    keep: 7
+    from_keep: 1
+    # Two-tier retention: keep the last 7 dumps on the fast/redundant disk above,
+    # then move older ones to a second (e.g. cheaper, non-redundant) disk and
+    # keep up to 23 more there (7 + 23 = 30 days of total history).
+    archive_output: /backups/archive
+    archive_keep: 23
+
+  # Staging daily backup
+  daily-staging-backup:
+    command: dump
+    from:
+      profile: staging
+      database: myapp_staging
+    output: /backups/staging
+    keep: 14
+
+  # ============================================================================
+  # CONNECTION STRING FORMAT (Simpler for one-off jobs)
+  # ============================================================================
+
+  # Quick local backup
+  quick-backup:
+    command: dump
+    from: postgres@localhost/mydb
+    from_password_file: ~/.secrets/local.pass
+    output: ./dumps
+    keep: 3
+
+  # Direct remote sync
+  direct-sync:
+    command: clone
+    from: ssh://admin@prod.example.com/postgres@localhost/production
+    to: postgres@localhost/prod_copy
+    from_password_file: ~/.secrets/prod.pass
+    to_password_file: ~/.secrets/local.pass
+    force: true
+
+  # ============================================================================
+  # FILTERED SYNC (Using wildcard exclude)
+  # ============================================================================
+
+  # Exclude all audit schema tables (using schema.* wildcard)
+  sync-without-audit:
+    command: clone
+    from:
+      profile: production
+      database: enterprise
+    to:
+      profile: local
+      database: enterprise_dev
+    force: true
+    exclude_data: "audit.*,hr.*,public.logs"
+
+  # Exclude large tables data only (keep structure)
+  sync-light:
+    command: clone
+    from:
+      profile: production
+      database: analytics
+    to:
+      profile: local
+      database: analytics_dev
+    force: true
+    exclude_data: "public.events,public.page_views,public.raw_data"
+
+  # Only specific tables
+  sync-users-only:
+    command: clone
+    from:
+      profile: production
+      database: ecommerce
+    to:
+      profile: local
+      database: ecommerce_dev
+    force: true
+    only_table: "users,orders,products"
+
+  # ============================================================================
+  # SCHEMA BASED SYNC
+  # ============================================================================
+
+  # Only public schema
+  sync-public-schema:
+    command: clone
+    from:
+      profile: production
+      database: multidb
+    to:
+      profile: local
+      database: multidb_copy
+    force: true
+    only_schema: "public"
+
+  # Exclude multiple schemas
+  sync-without-schemas:
+    command: clone
+    from:
+      profile: production
+      database: enterprise
+    to:
+      profile: local
+      database: enterprise_dev
+    force: true
+    exclude_schema: "audit,logs,temp"
+
+  # ============================================================================
+  # FETCH & RESTORE OPERATIONS
+  # ============================================================================
+
+  # Fetch latest dump from production
+  fetch-latest-prod:
+    command: fetch
+    from:
+      profile: production
+      database: myapp
+    output: ./dumps
+
+  # Restore to local
+  restore-to-local:
+    command: restore
+    to:
+      profile: local
+      database: restored_db
+    output: ./dumps
+    force: true
+
+  # ============================================================================
+  # PUSH TO REMOTE (Local -> Remote)
+  # ============================================================================
+
+  # Push local to staging
+  push-to-staging:
+    command: clone
+    from:
+      profile: local
+      database: development
+    to:
+      profile: staging
+      database: staging
+    force: true
+
+  # ============================================================================
+  # VERBOSE / DEBUG JOBS
+  # ============================================================================
+
+  # Sync with detailed output
+  verbose-sync:
+    command: clone
+    from:
+      profile: production
+      database: myapp
+    to:
+      profile: local
+      database: myapp_dev
+    force: true
+    verbose: true
+
+  # ============================================================================
+  # LEGACY FORMAT (Backward Compatible)
+  # ============================================================================
+
+  # Old args format still works
+  legacy-job:
+    command: clone
+    args: --from 'ssh://admin@prod.example.com/postgres@localhost/mydb' --to 'postgres@localhost/mydb_copy' --from-password-file '.secrets/prod.pass' --to-password-file '.secrets/local.pass' --force
+
+# ==============================================================================
+# USAGE EXAMPLES
+# ==============================================================================
+#
+# Run single job:
+#   t-pgsql --batch prod-to-dev
+#   t-pgsql --batch daily-prod-backup
+#
+# Run all jobs:
+#   t-pgsql --batch all
+#
+# Continue on error:
+#   t-pgsql --batch all --continue-on-error
+#
+# List jobs:
+#   t-pgsql jobs
+#
+# Show job details:
+#   t-pgsql jobs show prod-to-dev
+#
+# ==============================================================================
+# NOTES
+# ==============================================================================
+#
+# 1. Password files should be stored in ~/.secrets/ directory
+# 2. Set permissions with: chmod 600 ~/.secrets/*.pass
+# 3. Add .secrets/ to .gitignore
+# 4. Using force: true will DROP the target database!
+# 5. Profiles can be overridden in job definitions
+# 6. Use exclude_data with schema.* wildcard: "audit.*,hr.*"
+# 7. Remote dumps are stored in /tmp/t-pgsql/ on remote servers
+#
+# ==============================================================================

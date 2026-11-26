@@ -1,0 +1,144 @@
+t-pgsql (3.12.1-1) unstable; urgency=high
+
+  * Fix: --dry-run was silently ignored under `batch` — each job is re-exec'd
+    as a new process built from its own YAML args, so the parent's --dry-run
+    flag never reached it and the job ran for real. Now forced through on
+    every re-exec when the parent process was invoked with --dry-run.
+
+ -- Asim Atasert <asimatasert@outlook.com>  Fri, 31 Jul 2026 16:10:00 +0300
+
+t-pgsql (3.12.0-1) unstable; urgency=medium
+
+  * New: two-tier retention. --archive-output <dir> / --archive-keep <N>
+    (also job YAML archive_output/archive_keep) move dumps that age out of
+    --keep to a second directory instead of deleting them, with their own
+    retention cap there.
+  * Fix: --keep/GFS cleanup now also removes the matching .meta sidecar
+    file when a dump is deleted (previously left orphaned).
+
+ -- Asim Atasert <asimatasert@outlook.com>  Fri, 31 Jul 2026 15:45:00 +0300
+
+t-pgsql (3.11.1-1) unstable; urgency=medium
+
+  * Fix: bwlimit and retries were CLI-only — a bwlimit/retries key in a jobs
+    YAML or config file was silently ignored. Both are now mapped in the
+    batch YAML runner, config loader and job serializer.
+
+ -- Asim Atasert <asimatasert@outlook.com>  Wed, 16 Jul 2026 16:30:00 +0300
+
+t-pgsql (3.11.0-1) unstable; urgency=medium
+
+  * New commands:
+    - doctor: read-only environment & backup health checks (toolchain, disk,
+      per-database dump freshness, archive readability, jobs file, optional
+      connectivity) with a non-zero exit on problems
+    - explain: built-in offline reference for commands and workflows
+
+ -- Asim Atasert <asimatasert@outlook.com>  Wed, 16 Jul 2026 16:00:00 +0300
+
+t-pgsql (3.10.0-1) unstable; urgency=medium
+
+  * New features for SSH dumps:
+    - --compress-where source|target: compress on the source host before
+      the transfer (falls back to target-side if the tool is missing)
+    - --from-stale <time>: purge leftover staging dumps from failed runs
+      on the source before dumping (default 72h, with --from-keep 0)
+    - Widened retention/fetch globs to match compressed staging artifacts
+
+ -- Asim Atasert <asimatasert@outlook.com>  Wed, 16 Jul 2026 15:00:00 +0300
+
+t-pgsql (3.9.0-1) unstable; urgency=medium
+
+  * Packaging and audit remediation:
+    - Synced package version across Homebrew, Arch and Debian metadata
+    - Declared curl runtime dependency (used for notifications)
+    - Hardened release workflow (real sha256, correct Formula patterns,
+      push to default branch, build .deb from debian/ dir)
+
+ -- Asim Atasert <asimatasert@outlook.com>  Thu, 02 Jul 2026 12:00:00 +0300
+
+t-pgsql (3.7.1-1) unstable; urgency=medium
+
+  * Bug fixes:
+    - Fixed compressed dump file detection (.dump.zst, .dump.xz, .dump.bz2)
+    - Fixed Linux/macOS stat command compatibility
+    - Fixed skip-if-recent, restore, clone, list, meta commands for compressed files
+    - Fixed retention cleanup for all dump formats
+
+ -- Asim Atasert <asimatasert@outlook.com>  Wed, 08 Jan 2026 18:00:00 +0300
+
+t-pgsql (3.7.0-1) unstable; urgency=medium
+
+  * New features:
+    - Skip if recent dump exists (--skip-if-recent parameter)
+  * Documentation:
+    - Added --skip-if-recent to README and help text
+
+ -- Asim Atasert <asimatasert@outlook.com>  Wed, 08 Jan 2026 14:30:00 +0300
+
+t-pgsql (3.6.0-1) unstable; urgency=medium
+
+  * New features:
+    - Custom YAML file support for jobs command (--yaml parameter)
+    - Custom dump naming with --dump-name parameter
+    - Notification support for fetch command
+  * Bug fixes:
+    - Fish shell compatibility (PGPASSWORD syntax)
+    - Health check fallback to postgres database
+    - Jobs command --yaml parameter parsing
+    - Clone command: Fixed undefined get_dump_name function
+  * Documentation:
+    - Updated help text and README with new features
+
+ -- Asim Atasert <asimatasert@outlook.com>  Wed, 08 Jan 2026 15:30:00 +0300
+
+t-pgsql (3.5.0-1) unstable; urgency=medium
+
+  * Bug fixes:
+    - Fixed macOS awk compatibility (regex negation syntax)
+    - Fixed batch command silent exit with set -e
+    - Fixed defaults not being applied to jobs (force, output, exclude_data)
+  * Improvements:
+    - Added get_job_value() for defaults fallback in job config
+    - Jobs now properly inherit defaults section values
+    - Added buffer/compression defaults support in YAML config
+
+ -- Asim Atasert <asimatasert@outlook.com>  Tue, 07 Jan 2026 14:00:00 +0300
+
+t-pgsql (3.4.0-1) unstable; urgency=medium
+
+  * New features:
+    - Streaming mode (--stream): Direct pipe clone without temp files
+    - Parallel batch execution (--parallel N)
+    - Job filtering (--only, --exclude)
+    - Batch summary notifications (--notify-summary)
+    - Config file support (--config)
+    - Health checks before operations (--health-check)
+    - GFS retention policy (--retention)
+    - Data masking after restore (--mask)
+  * Documentation updates
+  * Added Fish shell completion
+  * Added man page
+
+ -- Asim Atasert <asimatasert@outlook.com>  Mon, 06 Jan 2026 12:00:00 +0300
+
+t-pgsql (3.3.0-1) unstable; urgency=medium
+
+  * Added profile-based job configuration in jobs.yaml
+  * Enhanced exclude-data option to support schema.* wildcard
+
+ -- Asim Atasert <asimatasert@outlook.com>  Sat, 04 Jan 2026 12:00:00 +0300
+
+t-pgsql (1.0.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * Features:
+    - Dump: Backup from local or remote database
+    - Restore: Restore backup to local or remote database
+    - Clone: Single command dump + restore
+    - Fetch: Download existing dump from remote
+    - Batch: Run multiple jobs sequentially
+    - SSH tunnel support
+    - Password file support
+
+ -- Asim Atasert <asimatasert@outlook.com>  Tue, 31 Dec 2024 12:00:00 +0300
