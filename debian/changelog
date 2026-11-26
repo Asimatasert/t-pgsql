@@ -1,3 +1,9 @@
+t-pgsql (3.15.0-1) unstable; urgency=medium
+
+  * Release 3.15.0. See CHANGELOG.md for details.
+
+ -- Asim Atasert <asimatasert@outlook.com>  Fri, 27 Nov 2026 01:52:05 +0300
+
 t-pgsql (3.14.0-1) unstable; urgency=medium
 
   * Release 3.14.0. See CHANGELOG.md for details.
