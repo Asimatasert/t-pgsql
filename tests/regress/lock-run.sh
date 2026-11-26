@@ -255,7 +255,7 @@ waitpid "$A"; wait "$A" 2>/dev/null
 # two jobs of one parallel batch with the same target: one runs, one is skipped
 reset
 { echo "jobs:"; mkjob job-a appdb; mkjob job-b appdb; } > "$TMP/jobs.yaml"
-out=$(cd "$TMP" && DUMP_SLEEP=2 "$BASH" "$BIN" batch all --yaml "$TMP/jobs.yaml" --parallel 2 2>&1 </dev/null); rc=$?
+out=$(cd "$TMP" && DUMP_SLEEP=8 "$BASH" "$BIN" batch all --yaml "$TMP/jobs.yaml" --parallel 2 2>&1 </dev/null); rc=$?
 [ "$rc" -eq 0 ] && ok "parallel batch with one locked job exits 0" || nok "parallel batch with one locked job exits 0 (rc=$rc)"
 [ "$(printf '%s\n' "$out" | grep -c 'Skipped (locked)')" -eq 1 ] && ok "exactly one of the two jobs was skipped" || nok "exactly one of the two jobs was skipped: $out"
 [ "$(ndumps)" -eq 1 ] && ok "only one dump was written" || nok "only one dump was written ($(ndumps))"
