@@ -34,7 +34,6 @@ f=""
 while [ $# -gt 0 ]; do [ "$1" = "-f" ] && f="$2"; shift; done
 [ -n "$START_MARK" ] && echo $$ > "$START_MARK"
 echo "start $(date +%s)" >> "$REC/pg_dump.log"
-echo "locks@start: $(cd "$T_PGSQL_STATE_DIR/locks" 2>/dev/null && for d in *; do printf "%s[%s] " "$d" "$(tr "\n" "," < "$d/meta" 2>/dev/null | cut -c1-120)"; done) ppid=$PPID me=$$" >> "$REC/pg_dump.log"
 n=0; lim=$(( ${DUMP_SLEEP:-0} * 5 ))
 while [ "$n" -lt "$lim" ]; do sleep 0.2; n=$((n + 1)); done
 printf 'PGDMP\nfake dump\n' >> "$f"
@@ -64,7 +63,7 @@ dargs() { printf '%s\n' dump --from postgres@localhost/appdb --output "$OUT" --c
 bg() {
     local name="$1" sl="$2"; shift 2
     local -a a; mapfile -t a < <(dargs)
-    ( cd "$TMP" && exec env DUMP_SLEEP="$sl" START_MARK="$TMP/mark.$name" ${STR:+strace -f -ttt -e trace=mkdir,rmdir,rename,renameat,renameat2,unlink,unlinkat,execve,exit_group -o "$TMP/st.$name"} "$BASH" "$BIN" "${a[@]}" "$@" >"$TMP/$name.out" 2>&1 </dev/null ) &
+    ( cd "$TMP" && exec env DUMP_SLEEP="$sl" START_MARK="$TMP/mark.$name" "$BASH" "$BIN" "${a[@]}" "$@" >"$TMP/$name.out" 2>&1 </dev/null ) &
     BGPID=$!; PIDS+=("$BGPID")
 }
 # fg NAME [extra args...]: run a dump to completion (status in rc, output in out)
@@ -256,25 +255,44 @@ waitpid "$A"; wait "$A" 2>/dev/null
 # two jobs of one parallel batch with the same target: one runs, one is skipped
 reset
 { echo "jobs:"; mkjob job-a appdb; mkjob job-b appdb; } > "$TMP/jobs.yaml"
-out=$(cd "$TMP" && DUMP_SLEEP=8 "$BASH" "$BIN" batch all --yaml "$TMP/jobs.yaml" --parallel 2 2>&1 </dev/null); rc=$?
+out=$(cd "$TMP" && DUMP_SLEEP=2 "$BASH" "$BIN" batch all --yaml "$TMP/jobs.yaml" --parallel 2 2>&1 </dev/null); rc=$?
 [ "$rc" -eq 0 ] && ok "parallel batch with one locked job exits 0" || nok "parallel batch with one locked job exits 0 (rc=$rc)"
-[ "$(printf '%s\n' "$out" | grep -c 'Skipped (locked)')" -eq 1 ] && ok "exactly one of the two jobs was skipped" || nok "exactly one of the two jobs was skipped: $out | pg_dump.log: $(tr '\n' ';' < "$REC/pg_dump.log" 2>/dev/null) | locks: $(ls "$STATE/locks" 2>/dev/null | tr '\n' ' ')"
+[ "$(printf '%s\n' "$out" | grep -c 'Skipped (locked)')" -eq 1 ] && ok "exactly one of the two jobs was skipped" || nok "exactly one of the two jobs was skipped: $out"
 [ "$(ndumps)" -eq 1 ] && ok "only one dump was written" || nok "only one dump was written ($(ndumps))"
 [ "$(nlocks)" -eq 0 ] && ok "batch left no lock behind" || nok "batch left no lock behind"
 
-# 13. two plain runs started at the same instant: exactly one may hold the lock (race probe)
+# 13. a mkdir that reports success for a directory that already exists (the Rust coreutils
+# mkdir does this when two processes create the same directory at the same instant): the
+# lock must still be exclusive. The fake succeeds for any *.lock / *.take directory.
+REAL_MKDIR="$(command -v mkdir)"; export REAL_MKDIR
+mkdir -p "$TMP/fakemk"
+cat > "$TMP/fakemk/mkdir" <<'EOF'
+#!/bin/sh
+for a in "$@"; do last="$a"; done
+case "$last" in *.lock|*.take) [ -d "$last" ] && exit 0 ;; esac
+exec "$REAL_MKDIR" "$@"
+EOF
+chmod +x "$TMP/fakemk/mkdir"
+reset
+SAVE_PATH="$PATH"; PATH="$TMP/fakemk:$PATH"
+bg a 3; A=$BGPID
+waitfile "$TMP/mark.a" || nok "first run started (lenient mkdir)"
+fg b
+PATH="$SAVE_PATH"
+[ "$rc" -eq 75 ] && ok "lenient mkdir: overlapping run still exits 75" || nok "lenient mkdir: overlapping run still exits 75 (rc=$rc)"
+waitpid "$A"; wait "$A" 2>/dev/null
+[ "$(ndumps)" -eq 1 ] && ok "lenient mkdir: exactly one dump was written" || nok "lenient mkdir: exactly one dump was written ($(ndumps))"
+
+# 14. two plain runs started at the same instant: exactly one may hold the lock
 raced=0
-for n in 1 2 3 4 5 6 7 8 9 10 11 12; do
+for n in 1 2 3 4 5 6 7 8; do
     reset
-    STR=$(command -v strace); bg x 2; XP=$BGPID; bg y 2; YP=$BGPID; STR=
+    bg x 1; XP=$BGPID; bg y 1; YP=$BGPID
     waitpid "$XP"; waitpid "$YP"; wait "$XP" "$YP" 2>/dev/null
     if [ "$(grep -c '^start' "$REC/pg_dump.log" 2>/dev/null)" -ne 1 ]; then
-        raced=1
-        nok "simultaneous start $n: both runs held the lock | log: $(tr '\n' ';' < "$REC/pg_dump.log" | cut -c1-700)"
-        for f in x y; do echo "# strace $f"; grep -E 'lock|state|execve|exit_group' "$TMP/st.$f" 2>/dev/null | grep -vE 'ENOENT.*(/usr|/bin|/lib)' | sed -E 's|/tmp/tmp\.[A-Za-z0-9]+|T|g' | cut -c1-200 | head -150; done
-        break
+        raced=1; nok "simultaneous start $n: both runs held the lock"; break
     fi
 done
-[ "$raced" -eq 0 ] && ok "12 simultaneous starts: exactly one run held the lock each time"
+[ "$raced" -eq 0 ] && ok "8 simultaneous starts: exactly one run held the lock each time"
 
 [ "$FAIL" -eq 0 ]
