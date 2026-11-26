@@ -1964,12 +1964,12 @@ _lock_mtime() {
 #   other:  "ps:<epoch>"  from "ps -o lstart=" parsed to epoch seconds (compared with a tolerance)
 _lock_pstart() {
     local pid="$1" st out e
-    local -a f
+    local -a ps_fields
     if [ -r "/proc/$pid/stat" ]; then
         st="$(cat "/proc/$pid/stat" 2>/dev/null)" || st=""
         st="${st##*) }"                 # drop "pid (comm) ": the name may hold spaces and ")"
-        read -r -a f <<< "$st"
-        [[ "${f[19]:-}" =~ ^[0-9]+$ ]] && { printf 'proc:%s' "${f[19]}"; return 0; }
+        read -r -a ps_fields <<< "$st"
+        [[ "${ps_fields[19]:-}" =~ ^[0-9]+$ ]] && { printf 'proc:%s' "${ps_fields[19]}"; return 0; }
     fi
     out="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || out=""
     out="$(trim "${out//$'\n'/ }")"
