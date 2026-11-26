@@ -5,7 +5,7 @@
 #
 # Options:
 #   INSTALL_DIR=/path    - Installation directory (default: /usr/local/bin)
-#   VERSION=v3.14.0      - Specific release tag (default: latest release)
+#   VERSION=v3.15.0      - Specific release tag (default: latest release)
 #   SKIP_COMPLETIONS=1   - Skip completion installation
 #   UNINSTALL=1          - Remove t-pgsql and all installed files
 #

@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [3.15.0] - 2026-11-27
 
 ### Changed
 - Docker image: `PG_MAJOR` now defaults to the latest stable PostgreSQL major in PGDG (19);
@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is a healthy state), and its body now has the extra line `skipped (recent dump)`.
 
 ### Fixed
+- **Run lock** could be taken by two simultaneous runs on systems whose `mkdir` exits 0 when it loses the race (for example the Rust coreutils). The lock now also claims an owner file exclusively, so exactly one run wins.
 - **Telegram bot** reports a job skipped by the run lock (exit status 75) as "Already running" instead of a failed or completed backup.
 
 ## [3.14.0] - 2026-11-26
