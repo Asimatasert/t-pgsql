@@ -261,4 +261,38 @@ out=$(cd "$TMP" && DUMP_SLEEP=2 "$BASH" "$BIN" batch all --yaml "$TMP/jobs.yaml"
 [ "$(ndumps)" -eq 1 ] && ok "only one dump was written" || nok "only one dump was written ($(ndumps))"
 [ "$(nlocks)" -eq 0 ] && ok "batch left no lock behind" || nok "batch left no lock behind"
 
+# 13. a mkdir that reports success for a directory that already exists (the Rust coreutils
+# mkdir does this when two processes create the same directory at the same instant): the
+# lock must still be exclusive. The fake succeeds for any *.lock / *.take directory.
+REAL_MKDIR="$(command -v mkdir)"; export REAL_MKDIR
+mkdir -p "$TMP/fakemk"
+cat > "$TMP/fakemk/mkdir" <<'EOF'
+#!/bin/sh
+for a in "$@"; do last="$a"; done
+case "$last" in *.lock|*.take) [ -d "$last" ] && exit 0 ;; esac
+exec "$REAL_MKDIR" "$@"
+EOF
+chmod +x "$TMP/fakemk/mkdir"
+reset
+SAVE_PATH="$PATH"; PATH="$TMP/fakemk:$PATH"
+bg a 3; A=$BGPID
+waitfile "$TMP/mark.a" || nok "first run started (lenient mkdir)"
+fg b
+PATH="$SAVE_PATH"
+[ "$rc" -eq 75 ] && ok "lenient mkdir: overlapping run still exits 75" || nok "lenient mkdir: overlapping run still exits 75 (rc=$rc)"
+waitpid "$A"; wait "$A" 2>/dev/null
+[ "$(ndumps)" -eq 1 ] && ok "lenient mkdir: exactly one dump was written" || nok "lenient mkdir: exactly one dump was written ($(ndumps))"
+
+# 14. two plain runs started at the same instant: exactly one may hold the lock
+raced=0
+for n in 1 2 3 4 5 6 7 8; do
+    reset
+    bg x 1; XP=$BGPID; bg y 1; YP=$BGPID
+    waitpid "$XP"; waitpid "$YP"; wait "$XP" "$YP" 2>/dev/null
+    if [ "$(grep -c '^start' "$REC/pg_dump.log" 2>/dev/null)" -ne 1 ]; then
+        raced=1; nok "simultaneous start $n: both runs held the lock"; break
+    fi
+done
+[ "$raced" -eq 0 ] && ok "8 simultaneous starts: exactly one run held the lock each time"
+
 [ "$FAIL" -eq 0 ]
