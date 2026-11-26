@@ -138,6 +138,8 @@ main() {
         fi
     fi
 
+    history_begin   # arms the run-history line (work commands only; see 74-status.sh)
+
     case "$COMMAND" in
         dump)    cmd_dump;    notify_unreported_failure $? dump ;;
         restore) cmd_restore; notify_unreported_failure $? restore ;;
@@ -150,6 +152,7 @@ main() {
         meta)    cmd_meta ;;
         clean)   cmd_clean ;;
         doctor)  cmd_doctor ;;
+        status)  cmd_status ;;
         explain) cmd_explain ;;
         jobs)
             case "$JOBS_ACTION" in
