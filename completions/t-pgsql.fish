@@ -1,7 +1,7 @@
 # Fish completion for t-pgsql
 
 # Commands
-set -l commands dump restore clone upgrade fetch batch bot jobs list meta clean doctor explain version help
+set -l commands dump restore clone upgrade fetch batch bot jobs list meta clean doctor status explain version help
 
 # Disable file completion by default
 complete -c t-pgsql -f
@@ -19,6 +19,7 @@ complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "list" -d 
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "meta" -d "Show metadata"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "clean" -d "Clean old dumps"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "doctor" -d "Check environment and backup health"
+complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "status" -d "Show last run of each job (--max-age checks freshness)"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "explain" -d "Explain what a command is for"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "version" -d "Show version"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "help" -d "Show help"
@@ -29,7 +30,7 @@ complete -c t-pgsql -n "__fish_seen_subcommand_from jobs" -a "show" -d "Show job
 complete -c t-pgsql -n "__fish_seen_subcommand_from jobs" -a "remove" -d "Remove a job"
 
 # Explain topics
-complete -c t-pgsql -n "__fish_seen_subcommand_from explain" -a "dump restore clone stream upgrade fetch batch jobs bot list meta clean doctor masking retention" -d "Topic"
+complete -c t-pgsql -n "__fish_seen_subcommand_from explain" -a "dump restore clone stream upgrade fetch batch jobs bot list meta clean doctor status ping lock masking retention" -d "Topic"
 
 # Connection options
 complete -c t-pgsql -l from -d "Source connection"
@@ -110,6 +111,15 @@ complete -c t-pgsql -l only -d "Alias for --only-jobs"
 complete -c t-pgsql -l exclude -d "Alias for --exclude-jobs"
 complete -c t-pgsql -l save -d "Save as job"
 complete -c t-pgsql -l batch -d "Run batch job"
+complete -c t-pgsql -l ping -d "Heartbeat monitor URL (start, success, fail)"
+complete -c t-pgsql -l ping-start -d "Explicit heartbeat start URL"
+complete -c t-pgsql -l ping-fail -d "Explicit heartbeat failure URL"
+complete -c t-pgsql -l lock-wait -d "Wait N seconds for a held run lock" -xa "0 30 60 300"
+complete -c t-pgsql -l no-lock -d "Do not take the run lock"
+complete -c t-pgsql -l name -d "status: only this name"
+complete -c t-pgsql -l limit -d "status: last N runs of --name"
+complete -c t-pgsql -l max-age -d "status: fail (exit 3) if no fresh success within this time" -xa "1h 6h 12h 26h 1d 2d"
+complete -c t-pgsql -l json -d "status: JSON output"
 complete -c t-pgsql -l log -d "Log file" -r
 complete -c t-pgsql -l log-level -d "Log level" -xa "debug info warn error"
 complete -c t-pgsql -s v -l verbose -d "Verbose output"
