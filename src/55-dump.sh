@@ -231,7 +231,7 @@ cmd_dump() {
     # Run health check before operation
     run_health_checks true false
 
-    mkdir -p "$OUTPUT_DIR"
+    [ "$DRY_RUN" = true ] || mkdir -p "$OUTPUT_DIR"
 
     local ts=$(date '+%Y%m%d_%H%M%S')
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"

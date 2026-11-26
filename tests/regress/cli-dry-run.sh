@@ -69,6 +69,9 @@ EOF
 CALLS=$(ls "$TMP"/rec/curl.*.argv 2>/dev/null | wc -l | tr -d ' ')
 [ "$CALLS" -eq 0 ] && ok "batch --dry-run --notify-summary sends nothing" || nok "batch --dry-run --notify-summary sends nothing (curl calls=$CALLS)"
 ls "$TMP"/out/*.dump >/dev/null 2>&1 && nok "dry-run batch creates no dump file" || ok "dry-run batch creates no dump file"
+[ ! -e "$TMP/never-created" ] || nok "precondition"
+( cd "$TMP" && t-pgsql dump --from postgres@localhost/appdb --dry-run --output "$TMP/never-created" >/dev/null 2>&1 </dev/null )
+[ ! -e "$TMP/never-created" ] && ok "dump --dry-run does not create the output directory" || nok "dump --dry-run does not create the output directory"
 
 # control: without --dry-run the summary is sent
 ( cd "$TMP" && t-pgsql batch all --yaml "$TMP/jobs.yaml" --notify-summary --notify "telegram:515151:DRYSECRET:-100111" >/dev/null 2>&1 </dev/null )
