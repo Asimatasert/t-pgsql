@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Telegram bot** reports a job skipped by the run lock (exit status 75) as "Already running" instead of a failed or completed backup.
+
 ## [3.14.0] - 2026-11-26
 
 ### Added
