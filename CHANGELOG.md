@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Shrink guard `--min-size-ratio <percent>`** (planned for 3.13.0; also `min_size_ratio`
+  in job YAML and `--config`): a new dump smaller than this percent (0-100, default 50,
+  0 disables) of the previous dump of the same name no longer rotates anything. The new
+  file is kept as `<name>.suspect`, keep-N, retention, archive and source-side cleanup are
+  skipped, the job fails and a failure notification with both sizes is sent. Also applies
+  to `clone`. Run once with `--min-size-ratio 0` if the shrink is expected.
+- `doctor` shows the active ratio, warns when a base's newest dump is below it and reports
+  `.suspect` files; `explain dump` / `explain retention` describe the guard.
+
 ### Changed
 - Dump and clone notifications now use the job name instead of the raw database name
   in their titles, so alerts identify the job unambiguously when several jobs share a

@@ -93,6 +93,10 @@ STORAGE:
                                   (-1=keep all, 0=delete immediately; default: -1)
     --from-keep <N>               For SSH sources: how many dumps to keep in the remote
                                   /tmp staging dir (default: 1, -1=all, 0=delete)
+    --min-size-ratio <percent>    Shrink guard: fail when the new dump is smaller than
+                                  this percent of the previous dump of the same name
+                                  (0-100, default: 50, 0 disables). The new file is
+                                  kept as <name>.suspect and nothing is rotated.
     --from-stale <time>           With --from-keep 0: before dumping, purge this job's
                                   leftover dumps older than <time> from the remote
                                   staging dir — failed runs never reach the normal

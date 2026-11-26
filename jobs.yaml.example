@@ -127,6 +127,7 @@ jobs:
     retries: 3
     from_keep: 0
     from_stale: 48h
+    min_size_ratio: 50      # fail (and keep older dumps) if a new dump is < 50% of the previous; 0 disables
 
   # ============================================================================
   # CONNECTION STRING FORMAT (Simpler for one-off jobs)

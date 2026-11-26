@@ -193,6 +193,26 @@ default \-1).
 For SSH sources: dumps to keep in the remote staging directory (default 1, \-1 keeps
 all, 0 deletes).
 .TP
+.BI \-\-min\-size\-ratio " percent"
+Shrink guard.
+Fail when the new dump is smaller than
+.I percent
+of the newest previous dump of the same name in the output directory (integer
+0\-100, default 50, 0 disables).
+The new dump is kept as
+.IR name .suspect
+instead of being deleted, no older dump is rotated or removed (keep, retention,
+archive and source\-side cleanup are all skipped), a failure notification is sent and
+the command exits non\-zero.
+Run once with
+.B \-\-min\-size\-ratio 0
+if the shrink is expected; the next dump then becomes the baseline.
+Sizes are compared as stored, so switching
+.B \-\-compress
+can trigger the guard once.
+The same check applies to
+.BR clone .
+.TP
 .BI \-\-from\-stale " time"
 With
 .BR "\-\-from\-keep 0" ,

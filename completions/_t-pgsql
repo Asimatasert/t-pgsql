@@ -74,6 +74,7 @@ _t-pgsql() {
                 '--dump-name[Custom dump filename]:name:' \
                 '--keep[Keep N local dumps]:count:' \
                 '--from-keep[Keep N on source]:count:' \
+                '--min-size-ratio[Fail if new dump is smaller than this percent of the previous]:percent:(0 25 50 75 100)' \
                 '--from-stale[Purge stale remote dumps older than]:time:' \
                 '--archive-output[Move aged-out dumps here]:dir:_files -/' \
                 '--archive-keep[Keep N dumps in archive]:count:' \

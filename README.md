@@ -733,6 +733,7 @@ jobs:
 | `force` | Overwrite an existing database (restore into a temporary database, swapped in only on success) |
 | `verbose` | Show detailed output |
 | `from_keep` | Number of dumps to keep on source |
+| `min_size_ratio` | Shrink guard percent (0-100, default 50, 0 disables) |
 | `keep` | Number of local dumps to keep |
 | `dump_name` | Custom dump filename (without timestamp) |
 | `skip_if_recent` | Skip if dump exists within timeframe (e.g., `24h`, `1d`, `today`) |
@@ -777,6 +778,38 @@ jobs:
     retention_daily: 7
     retention_weekly: 4
 ```
+
+### Shrink guard
+
+A backup that suddenly comes out much smaller than the last one is usually broken
+(empty schema, wrong database, truncated output), and rotating it in would replace the
+last good copy. `--min-size-ratio <percent>` (0-100, default `50`, `0` disables) compares
+the size of the new dump, after compression, with the newest previous dump of the same
+name in the output directory (`prod` and `prod_v2` are separate). It also works as
+`min_size_ratio` in a jobs.yaml job or a `--config` file. A new dump passes when
+`new_size * 100 >= previous_size * percent`; the first dump of a name always passes.
+
+When the check fails:
+
+- the new dump is kept as `<name>.suspect` (never deleted; no keep, retention, restore,
+  list or fetch pattern matches it);
+- no older dump is rotated, archived or deleted, locally or on the SSH source
+  (`--from-keep`), and no metadata is written;
+- the command exits non-zero and a failure notification with both sizes is sent.
+
+```text
+[ERROR] Shrink guard: the new dump is much smaller than the previous one
+[ERROR]   new:      /backups/prod_20260301_020000.dump (1.2 MB, 1258291 bytes)
+[ERROR]   previous: /backups/prod_20260228_020000.dump (48.0 MB, 50331648 bytes)
+[ERROR]   ratio 2% is below the --min-size-ratio threshold of 50%
+[ERROR]   If the shrink is expected, run once with --min-size-ratio 0; the next dump then becomes the baseline
+```
+
+If the shrink is expected (data purge, a different `--compress`, an `--exclude-data`
+change), run once with `--min-size-ratio 0`; the next dump is then the baseline. Sizes
+are compared as stored, so switching `--compress` can trigger the guard once. `clone`
+uses the same dump step and is guarded too. `t-pgsql doctor` prints the active ratio,
+warns when the newest dump is below the threshold and reports `.suspect` files.
 
 ### Data Masking
 
@@ -1013,7 +1046,7 @@ notify: "telegram:TOKEN:CHAT"               # repeatable
 verbose: true
 ```
 
-Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_password`, `password_file`/`from_password_file`/`to_password_file`, `output`, `keep`, `from_keep`, `from_stale`, `archive_output`, `archive_keep`, `compress`, `compress_where`, `bwlimit`, `retries`, `exclude_table`/`exclude_data`/`exclude_schema`, `only_table`/`only_schema`, `notify` (repeatable), and booleans `verbose`/`force`/`sudo`. Dashes work in place of underscores (e.g. `from-keep`). `~` is expanded only for path-type keys — never for passwords or connection strings.
+Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_password`, `password_file`/`from_password_file`/`to_password_file`, `output`, `keep`, `from_keep`, `min_size_ratio`, `from_stale`, `archive_output`, `archive_keep`, `compress`, `compress_where`, `bwlimit`, `retries`, `exclude_table`/`exclude_data`/`exclude_schema`, `only_table`/`only_schema`, `notify` (repeatable), and booleans `verbose`/`force`/`sudo`. Dashes work in place of underscores (e.g. `from-keep`). `~` is expanded only for path-type keys — never for passwords or connection strings.
 
 ---
 
@@ -1075,6 +1108,7 @@ Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_pa
 | `--archive-output <dir>` | When a dump ages out of `--keep`, move it here instead of deleting (a second, e.g. cheaper/less redundant, tier) | - | No | `/backups/archive` |
 | `--archive-keep <N>` | Number of dumps to keep in `--archive-output` | `-1` (all) | No | `23`, `0` (delete immediately), `-1` (all) |
 | `--from-keep <N>` | Number of dumps to keep on source | `1` | No | `3`, `0` (delete), `-1` (all) |
+| `--min-size-ratio <percent>` | Shrink guard: fail when the new dump is smaller than this percent of the previous dump of the same name; see [Shrink guard](#shrink-guard) | `50` | No | `0` (off), `30`, `100` |
 | `--from-stale <time>` | With `--from-keep 0`: purge this job's leftover dumps older than `<time>` from the source staging dir before dumping (failed runs never reach the normal cleanup) | `72h` | No | `48h`, `2d`, `0` (off) |
 | `--dump-name <name>` | Custom dump filename (without timestamp) | Database name | No | `myapp-backup` |
 | `--skip-if-recent <time>` | Skip if dump exists within timeframe | - | No | `24h`, `12h`, `1d`, `today` |

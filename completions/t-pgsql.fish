@@ -60,6 +60,7 @@ complete -c t-pgsql -l output -d "Output directory" -ra "(__fish_complete_direct
 complete -c t-pgsql -l dump-name -d "Custom dump filename"
 complete -c t-pgsql -l keep -d "Keep N local dumps"
 complete -c t-pgsql -l from-keep -d "Keep N on source"
+complete -c t-pgsql -l min-size-ratio -d "Fail if new dump is smaller than this percent of the previous" -xa "0 25 50 75 100"
 complete -c t-pgsql -l from-stale -d "Purge stale remote dumps older than"
 complete -c t-pgsql -l archive-output -d "Move aged-out dumps here" -ra "(__fish_complete_directories)"
 complete -c t-pgsql -l archive-keep -d "Keep N dumps in archive"

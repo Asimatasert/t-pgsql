@@ -14,7 +14,7 @@ _t_pgsql() {
         --exclude-table --exclude-schema --exclude-data
         --only-table --only-schema
         --compress --compress-level --pg-compress-level --compress-where
-        --output --dump-name --keep --from-keep --from-stale --skip-if-recent
+        --output --dump-name --keep --from-keep --min-size-ratio --from-stale --skip-if-recent
         --archive-output --archive-keep
         --from-file --file --yaml
         --retention --retention-daily --retention-weekly --retention-monthly --retention-yearly
