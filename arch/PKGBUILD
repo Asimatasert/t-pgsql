@@ -1,6 +1,6 @@
 # Maintainer: Asim Atasert <asimatasert@outlook.com>
 pkgname=t-pgsql
-pkgver=3.12.1
+pkgver=3.14.0
 pkgrel=1
 pkgdesc="PostgreSQL database sync, backup and clone tool with notifications"
 arch=('any')
@@ -18,7 +18,7 @@ optdepends=(
     'python: for bot JSON parsing'
 )
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('8fbd3424f8f6ddb00c1341c4b3aaa014c2994c462a38266eb85361d0688a5b0e')
+sha256sums=('347a80416756e345910276b348312e4840084fd3303a0d257db1633a23f8bf5e')
 
 package() {
     cd "${srcdir}/${pkgname}-${pkgver}"

@@ -7,8 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Docker image: `PG_MAJOR` now defaults to the latest stable PostgreSQL major in PGDG (19);
+  override it with `--build-arg PG_MAJOR=<n>` to match an older target server.
+- `--ping` with `--skip-if-recent`: a skipped run still sends the success ping (a recent dump
+  is a healthy state), and its body now has the extra line `skipped (recent dump)`.
+
+### Fixed
+- **Telegram bot** reports a job skipped by the run lock (exit status 75) as "Already running" instead of a failed or completed backup.
+
+## [3.14.0] - 2026-11-26
+
 ### Added
-- **Shrink guard `--min-size-ratio <percent>`** (planned for 3.13.0; also `min_size_ratio`
+- **Heartbeat ping (dead-man's switch)** for `dump`, `clone`, `restore`, `upgrade` and
+  `fetch`: `--ping <url>` sends `<url>/start`, then `<url>` on success or `<url>/fail`
+  on any failure; `--ping-start` / `--ping-fail` set explicit URLs (Uptime Kuma style).
+  Also available as `ping`, `ping_start`, `ping_fail` in `--config` files, job YAML and
+  `defaults:`. URLs are passed to curl on stdin and masked in logs and `jobs show`;
+  a failed ping only warns. `T_PGSQL_PING_DISABLE=1` turns pings off.
+- **Run history and `status` command**: every `dump`, `clone`, `restore`, `upgrade` and
+  `fetch` run appends a line to `history.tsv` in the state directory
+  (`T_PGSQL_STATE_DIR`, default `${XDG_STATE_HOME:-$HOME/.local/state}/t-pgsql`).
+  `t-pgsql status [--yaml FILE] [--output DIR] [--name NAME] [--limit N] [--json]` shows
+  the last run per job; `status --max-age DURATION` exits 3 when a listed job has no
+  fresh successful run, for cron monitoring.
+- **Run lock**: `dump`, `fetch`, `restore`, `clone` and `upgrade` take a lock per output
+  directory + dump name / per target database, so overlapping runs cannot collide.
+  `--lock-wait <seconds>` waits for a held lock, `--no-lock` disables it (`lock_wait`,
+  `no_lock` in config and job YAML); stale locks are taken over (`T_PGSQL_LOCK_MAX_AGE`).
+- `explain status`, `explain ping`, `explain lock`; man page, completions, README and
+  `jobs.yaml.example` cover the new commands and options.
+
+### Changed
+- A run skipped because another run holds the lock exits **75** (EX_TEMPFAIL) instead of
+  failing; it sends no failure notification and no ping, and is recorded in the history as
+  `locked`. In `batch` such a job is `Skipped (locked)` and does not count as failed.
+- A batch where every job was skipped by the lock reports "All N of M jobs were skipped
+  (locked); nothing ran" and sends a warning notification, never a success notification.
+- `batch --lock-wait N` and `batch --no-lock` are forwarded to every job the batch starts.
+- `batch` rejects `--ping`, `--ping-start` and `--ping-fail` (exit 1); put `ping:` on the
+  job in the jobs file instead.
+- `status --max-age` accepts a bare number (seconds) and upper-case units (`1D`); only
+  `ok` and `--skip-if-recent` skipped runs count as fresh, `failed`, `suspect` and
+  `locked` runs do not. An unknown `status` option exits 2.
+- `jobs show` also masks `--notify` values in legacy `args:`.
+
+### Fixed
+- With `--ping` the run history line is now written (the ping setup no longer replaces
+  the exit handler).
+- History messages no longer contain passwords, URLs or `user@host` words; messages are
+  cut by bytes, so the file stays valid UTF-8.
+- `status` on bash older than 4 prints `status needs bash 4 or newer` and exits 2 instead
+  of reporting "No runs recorded yet."; `status --yaml` lists job names with dots or quotes.
+- Ping URLs: `/start` and `/fail` go before a `#fragment`; `HTTPS://` is accepted; a bad
+  URL is not an error under `--dry-run` or `T_PGSQL_PING_DISABLE=1`; a dump without
+  `--from` no longer sends a start ping; legacy `args:` jobs no longer expose the ping URL
+  on the child command line.
+- Run lock: a lost take-over race no longer runs unlocked, pid reuse and host identity
+  checks are stricter, and the take-over mutex is only stolen from a dead owner.
+
+## [3.13.0] - 2026-11-26
+
+### Added
+- **Shrink guard `--min-size-ratio <percent>`** (also `min_size_ratio`
   in job YAML and `--config`): a new dump smaller than this percent (0-100, default 50,
   0 disables) of the previous dump of the same name no longer rotates anything. The new
   file is kept as `<name>.suspect`, keep-N, retention, archive and source-side cleanup are
@@ -18,9 +79,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `.suspect` files; `explain dump` / `explain retention` describe the guard.
 
 ### Changed
+- Files created by the tool (dumps, archives, logs, directories) are private by default
+  (umask 077). Set `T_PGSQL_UMASK=027` (one to four octal digits) to share through a group.
+- `-q/--quiet` no longer silences failure notifications; early failures (missing `--from`,
+  bad connection string, `--health-check-fail`) now notify when a channel is configured.
+- `--dry-run` sends no notifications and writes nothing (no summary, no `--save`, no
+  `jobs remove`, no output directory).
+- `restore` without `--file` picks the newest dump of the right database when the output
+  directory holds several; it errors and lists the bases when none matches.
+- `fetch` requires the connecting SSH user to own the remote staging directory.
+- A stream target without any password source fails instead of reusing the previous target's.
+- `install.sh` verifies `SHA256SUMS` and fails closed (`--allow-unverified` to opt out).
+- Translated READMEs and the internal audit report were removed; the project is English only.
 - Dump and clone notifications now use the job name instead of the raw database name
   in their titles, so alerts identify the job unambiguously when several jobs share a
   database name.
+
+### Security
+- `upgrade`: random verified here-doc terminator for the globals dump and a digits-only
+  `server_version_num`, so a hostile source server cannot run code on the target host or locally.
+- Telegram bot: optional sender allowlist (`TELEGRAM_ALLOWED_USERS`, `telegram_allowed_users`),
+  validated yaml and job names, private scratch and offset files, no replay after a lost offset.
+- Database passwords are kept off `ssh` argv in stream and masking runs; the bot token is not
+  on the argv of re-executed jobs; notification secrets are masked in logs.
+- The remote staging directory is verified before use; remote retention patterns are anchored
+  on the dump timestamp; `fetch --from-file` is quoted and restricted to a staged file name.
+- Connection strings reject option-like and unsafe values; the source==target guard handles
+  loopback aliases and SSH ports; stream `--force` probes the source before dropping the target.
+- `--exclude-data` fails closed; a new dump is verified before rotation (bad dumps are kept
+  as `.invalid`); notification curl calls have timeouts and `--fail`.
+
+### Fixed
+- The Telegram "re-run" button no longer breaks failure alerts when `callback_data` is too long.
+- Unknown job keys in jobs.yaml are reported; YAML quoting and trailing comments parse correctly.
+- `NO_COLOR` and non-terminal output are honoured; failed parallel jobs show their output.
 
 ## [3.12.1] - 2026-07-31
 

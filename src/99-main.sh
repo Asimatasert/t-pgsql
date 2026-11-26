@@ -20,6 +20,7 @@ main() {
     install_cleanup_trap
     parse_args "$@"
     [ -n "$_umask_warn" ] && log_warn "$_umask_warn"
+    ping_reject_for_batch || exit 1
 
     # Notification specs handed over by a parent job run (run_job sets T_PGSQL_NOTIFY_SPECS
     # for its re-exec'd child). This is an INTERNAL variable, not a user option: it holds
@@ -32,6 +33,13 @@ main() {
         done <<< "$T_PGSQL_NOTIFY_SPECS"
     fi
     unset T_PGSQL_NOTIFY_SPECS
+
+    # Heartbeat URLs handed over by a parent job run (they may hold a secret token, so they
+    # travel in the environment, not on argv). Command line / config values win.
+    [ -z "$PING_URL" ] && PING_URL="${T_PGSQL_PING_URL:-}"
+    [ -z "$PING_START_URL" ] && PING_START_URL="${T_PGSQL_PING_START_URL:-}"
+    [ -z "$PING_FAIL_URL" ] && PING_FAIL_URL="${T_PGSQL_PING_FAIL_URL:-}"
+    unset T_PGSQL_PING_URL T_PGSQL_PING_START_URL T_PGSQL_PING_FAIL_URL
 
     # Use a specific PostgreSQL client version if requested (affects all LOCAL
     # pg_dump/pg_restore/psql/createdb/pg_dumpall calls; not SSH-remote ones).
@@ -119,6 +127,11 @@ main() {
         fi
     fi
 
+    # Heartbeat URLs must be http(s); checked for the work commands and --save only.
+    case "${SAVE_JOB:+save} $COMMAND" in
+        save*|*" dump"|*" restore"|*" clone"|*" upgrade"|*" fetch") ping_validate || exit 1 ;;
+    esac
+
     # Handle --save: save current command as a job
     if [ -n "$SAVE_JOB" ]; then
         save_job "$SAVE_JOB" "$COMMAND"
@@ -138,6 +151,13 @@ main() {
         fi
     fi
 
+    # Run lock: a run that targets what another run is writing is skipped (exit 75). The
+    # history is armed first so a skipped run leaves a "locked" line (no ping, no notice).
+    history_begin   # arms the run-history line (work commands only; see 74-status.sh)
+    lock_acquire_command || exit $?
+
+    ping_begin
+
     case "$COMMAND" in
         dump)    cmd_dump;    notify_unreported_failure $? dump ;;
         restore) cmd_restore; notify_unreported_failure $? restore ;;
@@ -150,6 +170,7 @@ main() {
         meta)    cmd_meta ;;
         clean)   cmd_clean ;;
         doctor)  cmd_doctor ;;
+        status)  cmd_status ;;
         explain) cmd_explain ;;
         jobs)
             case "$JOBS_ACTION" in

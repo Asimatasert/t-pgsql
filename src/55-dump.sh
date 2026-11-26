@@ -185,6 +185,7 @@ check_dump_shrink() {
 quarantine_suspect_dump() {
     local f="$1"
     if [ -e "$f" ] && mv -f "$f" "${f}.suspect" 2>/dev/null; then
+        HIST_ARTIFACT="${f}.suspect"
         log_error "The new dump was kept as ${f}.suspect; older dumps were not rotated or deleted"
     else
         log_error "Older dumps were not rotated or deleted"

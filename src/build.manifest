@@ -4,8 +4,10 @@
 15-security.sh
 20-notifications.sh
 25-metadata.sh
+27-heartbeat.sh
 30-help.sh
 35-connection.sh
+37-lock.sh
 40-password.sh
 45-health.sh
 50-config.sh
@@ -19,6 +21,7 @@
 71-explain.sh
 72-list-meta-clean.sh
 73-doctor.sh
+74-status.sh
 75-yaml.sh
 76-jobs.sh
 78-batch.sh

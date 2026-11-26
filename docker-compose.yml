@@ -1,5 +1,5 @@
 # Example: run the Telegram bot as a long-lived service.
-# Adjust PG_MAJOR to your target server version, mount your jobs file, dumps
+# PG_MAJOR defaults to the latest major; set it to your target server version, mount your jobs file, dumps
 # directory, password files and SSH key (read-only), then:
 #
 #   docker compose up -d --build
@@ -11,8 +11,8 @@ services:
     build:
       context: .
       args:
-        PG_MAJOR: "18"
-    image: t-pgsql:18
+        PG_MAJOR: "19"
+    image: t-pgsql:19
     restart: unless-stopped
     command: ["bot", "--yaml", "/data/jobs.yaml"]
     volumes:

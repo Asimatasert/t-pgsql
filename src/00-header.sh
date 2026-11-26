@@ -18,10 +18,12 @@
 # errexit those failure branches would abort the script before running, making
 # all error-handling dead code. Failures are handled explicitly instead.
 
+# shellcheck disable=SC2155  # errexit is off; declare-and-assign return status is never used
+
 # ==============================================================================
 # VERSION & PATHS
 # ==============================================================================
-VERSION="3.12.1"
+VERSION="3.14.0"
 SCRIPT_NAME="t-pgsql"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

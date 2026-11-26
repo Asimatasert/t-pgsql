@@ -68,11 +68,16 @@ save_job() {
         args="$args --notify $(pq "$n")"
     done
     [ "$NOTIFY_ON_ERROR" = true ] && args="$args --notify-on-error"
+    [ -n "$PING_URL" ] && args="$args --ping $(pq "$PING_URL")"
+    [ -n "$PING_START_URL" ] && args="$args --ping-start $(pq "$PING_START_URL")"
+    [ -n "$PING_FAIL_URL" ] && args="$args --ping-fail $(pq "$PING_FAIL_URL")"
 
     # Batch job filters
     [ -n "$ONLY_JOBS" ] && args="$args --only $(pq "$ONLY_JOBS")"
     [ -n "$EXCLUDE_JOBS" ] && args="$args --exclude $(pq "$EXCLUDE_JOBS")"
 
+    [ "$LOCK_WAIT" != 0 ] && args="$args --lock-wait $(pq "$LOCK_WAIT")"
+    [ "$NO_LOCK" = true ] && args="$args --no-lock"
     [ "$SUDO" = true ] && args="$args --sudo"
     [ "$FORCE" = true ] && args="$args --force"
     [ "$VERBOSE" = true ] && args="$args --verbose"
@@ -192,7 +197,7 @@ show_job() {
     echo -e "${CYAN}Arguments:${NC}"
 
     # Parse and display args nicely (handle quoted values)
-    echo "$job_args" | sed "s/' --/'\n--/g" | while read -r arg; do
+    echo "$(redact_notify_args "$job_args")" | sed "s/' --/'\n--/g" | while read -r arg; do
         [ -n "$arg" ] && echo -e "  ${GREEN}${arg}${NC}"
     done
     echo ""
@@ -249,7 +254,7 @@ _JOB_KNOWN_KEYS=" command args from to password from_password to_password from_p
  archive_output archive_keep from_stale skip_if_recent exclude_table exclude_data exclude_schema
  only_table only_schema compress compress_level pg_compress_level compress_where stream_buffer bwlimit
  retries health_check health_check_after no_health_check health_check_fail retention retention_daily
- retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level "
+ retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level ping ping_start ping_fail lock_wait no_lock "
 
 # Warn (once per key) about job keys the tool does not know, naming the closest valid key
 # when it is just a hyphen/underscore or case difference. Warning only, never an error.
@@ -309,6 +314,14 @@ run_job() {
     if [ "$DRY_RUN" = true ] && [[ "$job_args" != *"--dry-run"* ]]; then
         job_args="$job_args --dry-run"
     fi
+    # Same for the lock options given to batch on the command line (a later option wins in
+    # the child, so these override the job's own lock_wait / no_lock keys).
+    if [ "$LOCK_WAIT_SET" = true ]; then
+        job_args="$job_args --lock-wait $(pq "$LOCK_WAIT")"
+    fi
+    if [ "$NO_LOCK" = true ] && [[ "$job_args" != *"--no-lock"* ]]; then
+        job_args="$job_args --no-lock"
+    fi
 
     # Read inline passwords to hand to the child via the ENVIRONMENT (not argv, so they stay
     # off the child's process argv / ps). Empty values are treated as unset by get_password.
@@ -316,6 +329,15 @@ run_job() {
     _pw_both=$(get_job_value "$job_name" "password")
     _pw_from=$(get_job_field "$job_name" "from" "password"); [ -z "$_pw_from" ] && _pw_from=$(get_job_value "$job_name" "from_password")
     _pw_to=$(get_job_field "$job_name" "to" "password");     [ -z "$_pw_to" ]   && _pw_to=$(get_job_value "$job_name" "to_password")
+
+    # A legacy "args:" job (what --save writes) carries --ping/--ping-start/--ping-fail in its
+    # argument string; the URLs are a secret, so they move to the environment hand-over below
+    # (like the "ping:" keys) instead of staying on the child's command line.
+    ping_extract_args "$job_args"
+    job_args="$_PA_ARGS"
+    local _ping_url="${_PA_URL:-$(get_job_value "$job_name" "ping")}"
+    local _ping_start="${_PA_START:-$(get_job_value "$job_name" "ping_start")}"
+    local _ping_fail="${_PA_FAIL:-$(get_job_value "$job_name" "ping_fail")}"
 
     log_info "Running job: $job_name"
     log_debug "Command: $job_cmd $(redact_notify_args "$(redact_args "$job_args")")"
@@ -334,6 +356,9 @@ run_job() {
     # Fall back to any INHERITED T_PGSQL_*_PASSWORD when the job has none, so a passwordless
     # job does not get an empty assignment that would shadow the documented ambient env var.
     T_PGSQL_NOTIFY_SPECS="$_notify_specs" \
+    T_PGSQL_PING_URL="$_ping_url" \
+    T_PGSQL_PING_START_URL="$_ping_start" \
+    T_PGSQL_PING_FAIL_URL="$_ping_fail" \
     T_PGSQL_PASSWORD="${_pw_both:-$T_PGSQL_PASSWORD}" \
     T_PGSQL_FROM_PASSWORD="${_pw_from:-$T_PGSQL_FROM_PASSWORD}" \
     T_PGSQL_TO_PASSWORD="${_pw_to:-$T_PGSQL_TO_PASSWORD}" \

@@ -15,6 +15,7 @@ log_error() {
     # Errors go to stderr: only colour them when stderr itself is a terminal.
     local _red="$RED" _nc="$NC"
     [ -t 2 ] || { _red=""; _nc=""; }
+    HIST_LAST_ERROR="$1"   # reason recorded in the run history (history.tsv)
     echo -e "${_red}[ERROR]${_nc} $1" >&2
     log_to_file "ERROR" "$1"
 }

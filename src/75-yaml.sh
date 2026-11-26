@@ -493,6 +493,10 @@ parse_job_to_args() {
     [ -n "$(get_job_value "$job" "bwlimit")" ] && args+=" --bwlimit $(pq "$(get_job_value "$job" "bwlimit")")"
     [ -n "$(get_job_value "$job" "retries")" ] && args+=" --retries $(pq "$(get_job_value "$job" "retries")")"
 
+    # Run lock options
+    [ -n "$(get_job_value "$job" "lock_wait")" ] && args+=" --lock-wait $(pq "$(get_job_value "$job" "lock_wait")")"
+    [ "$(get_job_value "$job" "no_lock")" = "true" ] && args+=" --no-lock"
+
     # Health check options
     [ "$(get_job_value "$job" "health_check")" = "true" ] && args+=" --health-check"
     [ "$(get_job_value "$job" "health_check_after")" = "true" ] && args+=" --health-check-after"

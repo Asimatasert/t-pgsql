@@ -132,11 +132,24 @@ run_tmp_cleanup() {
         IFS=$'\t' read -r port dest path <<< "$e"
         ssh_exec "$port" "$dest" "rm -f $(pq "$path")" >/dev/null 2>&1 </dev/null
     done
+    # Run lock (src/37-lock.sh): released last, on every exit path; only if we own it.
+    lock_release
 }
 # INT/TERM must clean up AND stop the script: a handler that only cleaned up let the run
 # continue (compress, metadata, notifications) with its credential files already deleted.
 # \`exit\` fires the EXIT trap, which performs the cleanup exactly once.
-install_cleanup_trap() { trap 'run_tmp_cleanup' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; }
+#
+# ONE exit hook for the whole program (a second `trap ... EXIT` would silently replace it):
+# history line, then temp cleanup + lock release, then the final heartbeat ping. A failing
+# step never stops the next one and the exit status of the run is preserved.
+_run_exit_trap() {
+    local rc=$?
+    history_on_exit "$rc" 2>/dev/null || true
+    run_tmp_cleanup || true
+    ping_finish "$rc" 2>/dev/null || true
+    return "$rc"
+}
+install_cleanup_trap() { trap '_run_exit_trap' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; }
 
 _PGPASS_TMP=""
 setup_local_pgpass() {

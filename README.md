@@ -24,6 +24,9 @@ See also: [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [
 - **Job Filtering**: Run specific jobs (`--only-jobs`) or skip jobs (`--exclude-jobs`)
 - **Telegram Bot**: Trigger and monitor backups from a chat (`bot` command)
 - **Notifications**: Telegram, Slack, Webhook, Email with summary support
+- **Heartbeat Ping**: Dead-man's-switch ping to healthchecks.io / Uptime Kuma style monitors (`--ping`)
+- **Run History & Status**: `status` shows the last run of every job; `status --max-age` is a cron-friendly freshness check
+- **Run Lock**: Two runs never work on the same dump or target at once (`--lock-wait`, `--no-lock`)
 
 ### Data Management
 - **Data Masking**: Anonymize sensitive data after restore (`--mask`)
@@ -122,6 +125,7 @@ man t-pgsql
 A `Dockerfile` is included. The PostgreSQL client major version is a build arg —
 set it to your **target** server's version so cross-version dumps use the right
 tools (e.g. dumping a PG16 server for restore into PG18 → build with `PG_MAJOR=18`).
+Without the build arg, the image defaults to the latest PostgreSQL major.
 
 ```bash
 # Build with the desired client version
@@ -513,6 +517,18 @@ Runs local, read-only health checks and prints `✓ / ! / ✗` findings: require
 
 ---
 
+### status
+
+Shows the last run of each job from the run history that `dump`, `clone`, `restore`, `upgrade` and `fetch` write. Read-only: it creates nothing. Needs bash 4+ (on an older bash it prints a message and exits `2`). See [Run history and `status`](#run-history-and-status).
+
+```bash
+./t-pgsql status --yaml jobs.yaml                       # table: one row per job
+./t-pgsql status --name nightly --limit 10              # last 10 runs of one name
+./t-pgsql status --yaml jobs.yaml --max-age 26h --json  # exit 3 if a job has no fresh success
+```
+
+---
+
 ### explain
 
 Explains what a command is for and when to use it, with key options and examples — a built-in, offline reference.
@@ -520,7 +536,7 @@ Explains what a command is for and when to use it, with key options and examples
 ```bash
 ./t-pgsql explain                 # list all topics
 ./t-pgsql explain clone           # focused help for a command
-./t-pgsql explain masking         # also: stream, retention, doctor, ...
+./t-pgsql explain masking         # also: stream, retention, doctor, status, ping, lock, ...
 ```
 
 ---
@@ -741,6 +757,13 @@ jobs:
 | `exclude_table` | Tables to exclude completely |
 | `exclude_data` | Tables to exclude data only (supports `schema.*` wildcard) |
 | `exclude_schema` | Schemas to exclude |
+| `ping` | Heartbeat monitor URL: start `<url>/start`, success `<url>`, failure `<url>/fail` |
+| `ping_start` | Explicit heartbeat start URL (wins over `<ping>/start`) |
+| `ping_fail` | Explicit heartbeat failure URL (wins over `<ping>/fail`) |
+| `lock_wait` | Seconds to wait for a held run lock before skipping (default `0`) |
+| `no_lock` | `true` takes no run lock |
+
+`ping`, `ping_start`, `ping_fail`, `lock_wait` and `no_lock` may also be set under `defaults:`; a job value wins. `batch` itself takes no `--ping*` options (they are rejected with exit `1`); each job pings on its own run.
 
 ---
 
@@ -810,6 +833,76 @@ change), run once with `--min-size-ratio 0`; the next dump is then the baseline.
 are compared as stored, so switching `--compress` can trigger the guard once. `clone`
 uses the same dump step and is guarded too. `t-pgsql doctor` prints the active ratio,
 warns when the newest dump is below the threshold and reports `.suspect` files.
+
+### Heartbeat ping (dead-man's switch)
+
+A failure notification only helps when the run actually started. If the host is down, cron never fires or the job hangs, nobody is told. A heartbeat monitor (healthchecks.io, Uptime Kuma push monitors, ...) inverts this: it alerts when the expected ping does **not** arrive.
+
+`dump`, `clone`, `restore`, `upgrade` and `fetch` send an HTTP POST to the monitor: `<url>/start` when work begins (after validation and after the lock was taken), then exactly one of `<url>` (exit `0`) or `<url>/fail` (any other exit, including Ctrl-C and SIGTERM). The final ping is sent after the lock is released.
+
+```bash
+# healthchecks.io style: one base URL, /start and /fail are derived
+./t-pgsql dump --from "postgres@localhost/app" --output /backups \
+  --ping https://hc.example.com/ping/UUID
+
+# Uptime Kuma push monitor: explicit URLs
+./t-pgsql dump --from "postgres@localhost/app" \
+  --ping 'https://kuma.example.com/api/push/TOKEN?status=up' \
+  --ping-fail 'https://kuma.example.com/api/push/TOKEN?status=down'
+```
+
+```yaml
+# jobs.yaml - each job pings on its own run
+defaults:
+  ping_fail: https://hc.example.com/ping/UUID/fail
+jobs:
+  nightly:
+    command: dump
+    from: postgres@db.example.com/app
+    ping: https://hc.example.com/ping/UUID
+```
+
+- `/start` and `/fail` are inserted before a `?query` or `#fragment`. `--ping-start` / `--ping-fail` give explicit URLs and win over the derived ones. Without `--ping`, only the start and failure pings are sent (nothing on success).
+- Only `http://` and `https://` URLs; anything else is a startup error (exit `1`). `batch` does not accept `--ping*`: put `ping:` on the job instead.
+- Never sent with `--dry-run`, and **never for a run skipped by the lock (exit `75`)** — a job that is skipped for days shows up as "no ping" on the monitor, which is intended. A `--skip-if-recent` skip (exit `0`) is a healthy state: it sends start and success, and the success body gets an extra line `skipped (recent dump)` so the run is recognisable in the monitor history.
+- A ping that cannot be delivered only prints a warning; it never changes the exit status. Each ping is a `curl` POST with a 10 s limit and two retries, so an unresponsive monitor can delay a run by up to about 30 s per ping. The URL goes to `curl` on stdin, never on the command line, and is shown as `https://host/***` in logs and `jobs show`.
+- `-q/--quiet` does not disable pings; `T_PGSQL_PING_DISABLE=1` does. A SIGKILL or power loss cannot send a failure ping: the monitor's own "no ping" alert covers it.
+
+### Run history and `status`
+
+Every `dump`, `clone`, `restore`, `upgrade` and `fetch` run (not `--dry-run`) appends one line to `history.tsv` in the state directory (`${XDG_STATE_HOME:-$HOME/.local/state}/t-pgsql`, or `T_PGSQL_STATE_DIR`; mode `0700`, file `0600`): time, command, name, result (`ok`, `failed`, `suspect`, `skipped`, `locked`), exit code, duration, size and a short message. Error messages are one line, at most 200 bytes, with passwords, URLs and `user@host` words removed. The file is cut to the newest 1000 lines once it passes 2000. A SIGKILL, power loss or OOM kill leaves no line. A run under another `HOME` (for example through `sudo`) has its own state directory.
+
+```bash
+./t-pgsql status --yaml jobs.yaml              # one row per job
+./t-pgsql status --name nightly --limit 5      # last 5 runs, newest first
+./t-pgsql status --yaml jobs.yaml --json       # machine-readable
+```
+
+The table columns are `NAME LAST RUN RESULT DURATION SIZE DUMPS KEPT NOTE`. `--yaml FILE` lists exactly the jobs of that file (a job that never ran shows `never`); without it the names come from the history and from the dump files in `--output`. With nothing recorded it prints `No runs recorded yet.` (`[]` with `--json`) and exits `0`.
+
+**Stale-backup check for cron.** `--max-age DURATION` turns `status` into a check (integer plus optional `s`/`m`/`h`/`d`; a bare number is seconds): exit `3` when a listed name has no fresh successful run, has never run, or nothing is listed. Only `ok` and `skipped` (from `--skip-if-recent`) count as fresh; `failed`, `suspect` and `locked` runs do not, so a stuck holder cannot hide a backup that never completed.
+
+```bash
+# crontab: alert at 08:00 if any job in jobs.yaml has no good run in the last 26 hours
+0 8 * * * /path/to/t-pgsql status --yaml /path/to/jobs.yaml --max-age 26h --json >/dev/null || /path/to/alert.sh
+```
+
+`status` is read-only and creates nothing. Exit codes: `0` report printed, `2` usage error (also an unknown option or stray argument, and a bash older than 4, which prints `status needs bash 4 or newer`), `3` stale (only with `--max-age`).
+
+### Run lock
+
+Two overlapping runs (a slow dump still going when cron fires again, a manual run next to the nightly job) can corrupt rotation or fill the disk. `dump`, `fetch`, `restore`, `clone` and `upgrade` therefore take a lock first:
+
+- `dump` and `fetch` lock the output directory plus the dump name; `restore`, `clone` and `upgrade` lock every `--to` database (a non-streaming clone or upgrade also locks the dump name it writes). Not taken with `--dry-run`, and not by `batch` itself, `list`, `meta`, `clean`, `doctor` or `bot`.
+- If the lock is held, the run prints `Skipping: another run is already working on ...` and exits **`75`** (EX_TEMPFAIL). That is not a failure: no failure notification, no heartbeat ping, and the history records `locked`. A cron wrapper should treat `75` as success or retry later.
+- `--lock-wait N` waits up to N seconds (polling every second) before skipping; default `0`. `--no-lock` takes no lock.
+- Stale locks are taken over automatically: the owner process is gone, its process id was reused, or the lock is older than `T_PGSQL_LOCK_MAX_AGE` seconds (default `86400`). A lock written by another host is taken over only after that maximum age. After a SIGKILL the lock directory stays and the next run takes it over; the killed run's child (for example `pg_dump`) may still be running.
+- The lock is released on every exit path (success, failure, Ctrl-C, SIGTERM) and held for the whole run, including retention. If the state directory cannot be used, t-pgsql warns `Run lock disabled ... continuing without a lock` and carries on.
+- In `batch`, a job that exits `75` is reported as `Skipped (locked): <job>`; it does not stop the batch and does not change its exit status. When every job was skipped the summary says `All N of M jobs were skipped (locked ...); nothing ran` and `--notify-summary` sends a warning (`Batch skipped: all M jobs were skipped (locked)`), never a success notification. `batch --lock-wait N` and `batch --no-lock` are forwarded to every job. Parallel jobs with different targets run together; two with the same target run one after the other.
+
+```bash
+./t-pgsql dump --from "postgres@localhost/app" --output /backups --lock-wait 120
+```
 
 ### Data Masking
 
@@ -1046,7 +1139,7 @@ notify: "telegram:TOKEN:CHAT"               # repeatable
 verbose: true
 ```
 
-Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_password`, `password_file`/`from_password_file`/`to_password_file`, `output`, `keep`, `from_keep`, `min_size_ratio`, `from_stale`, `archive_output`, `archive_keep`, `compress`, `compress_where`, `bwlimit`, `retries`, `exclude_table`/`exclude_data`/`exclude_schema`, `only_table`/`only_schema`, `notify` (repeatable), and booleans `verbose`/`force`/`sudo`. Dashes work in place of underscores (e.g. `from-keep`). `~` is expanded only for path-type keys — never for passwords or connection strings.
+Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_password`, `password_file`/`from_password_file`/`to_password_file`, `output`, `keep`, `from_keep`, `min_size_ratio`, `from_stale`, `archive_output`, `archive_keep`, `compress`, `compress_where`, `bwlimit`, `retries`, `exclude_table`/`exclude_data`/`exclude_schema`, `only_table`/`only_schema`, `notify` (repeatable), `ping`, `ping_start`, `ping_fail`, `lock_wait`, and booleans `verbose`/`force`/`sudo`/`no_lock`. Dashes work in place of underscores (e.g. `from-keep`). `~` is expanded only for path-type keys — never for passwords or connection strings.
 
 ---
 
@@ -1170,6 +1263,36 @@ Apply to SSH/scp transfers (and the `--stream` pipe when `pv` is installed).
 | `--bwlimit <rate>` | Throttle transfer bandwidth. `10m` = 10 MB/s, `500k` = 500 KB/s, bare number = KB/s. scp uses its `-l`; streaming uses `pv -L` (requires `pv`). | unlimited | No | `10m` |
 | `--retries <N>` | Extra retry attempts for a failed scp transfer (exponential-ish backoff) | `0` | No | `3` |
 
+### Heartbeat Ping Parameters
+
+Sent by `dump`, `clone`, `restore`, `upgrade` and `fetch` (see [Heartbeat ping](#heartbeat-ping-dead-mans-switch)).
+
+| Parameter | Description | Default | Required | Example |
+|-----------|-------------|---------|----------|---------|
+| `--ping <url>` | Monitor base URL (`http://` or `https://`): `<url>/start` at the start, `<url>` on success, `<url>/fail` on failure. Config/jobs key `ping` | - | No | `https://hc.example.com/ping/UUID` |
+| `--ping-start <url>` | Explicit start URL (wins over `<url>/start`). Key `ping_start` | - | No | `https://hc.example.com/ping/UUID/start` |
+| `--ping-fail <url>` | Explicit failure URL (wins over `<url>/fail`). Key `ping_fail` | - | No | `https://hc.example.com/ping/UUID/fail` |
+
+### Run Lock Parameters
+
+| Parameter | Description | Default | Required | Example |
+|-----------|-------------|---------|----------|---------|
+| `--lock-wait <seconds>` | Wait up to N seconds for a held lock, then skip (exit `75`). Key `lock_wait` | `0` | No | `120` |
+| `--no-lock` | Take no run lock. Key `no_lock` | `false` | No | - |
+
+### Status Parameters
+
+Used by the `status` command.
+
+| Parameter | Description | Default | Required | Example |
+|-----------|-------------|---------|----------|---------|
+| `--yaml <file>` | List exactly the jobs of this jobs file | names from the history | No | `jobs.yaml` |
+| `--output <dir>` | Dump directory (dumps kept, `.suspect` / `.invalid` counts) | as for `dump` | No | `/backups` |
+| `--name <name>` | Only this job / dump name | all | No | `nightly` |
+| `--limit <N>` | Last N runs of `--name`, newest first (needs `--name`, not with `--max-age`) | - | No | `10` |
+| `--json` | JSON output | table | No | - |
+| `--max-age <duration>` | Exit `3` if a listed name has no fresh successful run within the duration. Integer with optional `s`/`m`/`h`/`d`; a bare number is seconds | - | No | `26h`, `90m`, `1d` |
+
 ### Batch Parameters
 
 | Parameter | Description | Default | Required | Example |
@@ -1223,6 +1346,9 @@ Apply to SSH/scp transfers (and the `--stream` pipe when `pv` is installed).
 | `T_PGSQL_FROM_PASSWORD` | Source connection password |
 | `T_PGSQL_TO_PASSWORD` | Target connection password |
 | `T_PGSQL_OUTPUT_DIR` | Default output directory for dumps (overridden by `--output`) |
+| `T_PGSQL_STATE_DIR` | State directory for `history.tsv` and `locks/` (default `${XDG_STATE_HOME:-$HOME/.local/state}/t-pgsql`, mode `0700`) |
+| `T_PGSQL_LOCK_MAX_AGE` | Seconds after which a run lock counts as stale and is taken over (default `86400`) |
+| `T_PGSQL_PING_DISABLE` | Set to `1` to turn off all heartbeat pings |
 | `PGCONNECT_TIMEOUT` | libpq connection timeout in seconds (default `10`) |
 | `TELEGRAM_BOT_TOKEN` | Resolves the bare `--notify telegram` channel and the `bot` token |
 | `TELEGRAM_CHAT_ID` | Chat id for the bare `--notify telegram` channel |
@@ -1302,16 +1428,19 @@ Apply to SSH/scp transfers (and the `--stream` pipe when `pv` is installed).
 
 ## Exit codes
 
-t-pgsql exits `0` on success and non-zero on failure (in practice `1`), so cron jobs and CI can rely on the status:
+t-pgsql exits `0` on success and non-zero on failure (in practice `1`), so cron jobs and CI can rely on the status. Two other codes have a fixed meaning: `3` (stale backup, from `status --max-age`) and `75` (skipped by the run lock, not a failure):
 
 | Situation | Exit status |
 |-----------|-------------|
 | Command completed | `0` |
-| Invalid option, missing value, unknown command or invalid numeric/time value | `1` |
+| Invalid option, missing value, unknown command or invalid numeric/time value (also an invalid `--ping` URL or `--lock-wait`, and `--ping*` given to `batch`) | `1` |
 | A dump, restore, clone, fetch or upgrade step failed | non-zero (`1`) |
-| `batch` with at least one failed job | `1` (also with `--continue-on-error`) |
+| `batch` with at least one failed job | `1` (also with `--continue-on-error`); jobs skipped by the lock do not count as failed |
 | `doctor` found a problem | `1` (warnings alone give `0`) |
 | `--help`, `--version`, `explain` (known topic) | `0` |
+| `status`: usage error (bad `--max-age` / `--limit`, `--limit` without `--name`, missing `--yaml` file, unknown option or stray argument, bash older than 4) | `2` |
+| `status --max-age`: a listed name has no fresh successful run, never ran, or nothing is listed | `3` |
+| Run skipped because another run holds the lock | `75` |
 
 ## Security
 

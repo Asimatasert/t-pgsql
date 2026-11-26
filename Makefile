@@ -6,7 +6,7 @@ MANDIR ?= $(PREFIX)/share/man/man1
 ZSHDIR ?= $(PREFIX)/share/zsh/site-functions
 BASHDIR ?= $(PREFIX)/share/bash-completion/completions
 FISHDIR ?= $(PREFIX)/share/fish/vendor_completions.d
-VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo "3.12.1")
+VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo "3.14.0")
 
 # Debian package version: strip a leading "v" (v3.9.0 -> 3.9.0) and ensure the
 # version starts with a digit (a bare commit hash gets a "0~" prefix), as

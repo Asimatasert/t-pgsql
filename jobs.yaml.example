@@ -129,6 +129,22 @@ jobs:
     from_stale: 48h
     min_size_ratio: 50      # fail (and keep older dumps) if a new dump is < 50% of the previous; 0 disables
 
+  # Monitored backup: heartbeat ping + run lock.
+  # ping/ping_start/ping_fail are commented out because enabling them makes the job
+  # send HTTP requests to the monitor; replace the example URLs with your own.
+  daily-monitored-backup:
+    command: dump
+    from:
+      profile: production
+      database: myapp
+    output: /backups/monitored
+    keep: 7
+    # ping: https://hc.example.com/ping/UUID           # healthchecks.io style: <url>/start, <url>, <url>/fail
+    # ping_start: https://hc.example.com/ping/UUID/start   # optional explicit start URL
+    # ping_fail: https://hc.example.com/ping/UUID/fail     # optional explicit failure URL
+    lock_wait: 60           # wait up to 60 s for a running dump of the same name, then skip (exit 75); default 0
+    # no_lock: true         # take no run lock (two runs may then overlap)
+
   # ============================================================================
   # CONNECTION STRING FORMAT (Simpler for one-off jobs)
   # ============================================================================
@@ -298,6 +314,18 @@ jobs:
 #
 # Show job details:
 #   t-pgsql jobs show prod-to-dev
+#
+# Last run of each job / stale-backup check (see: t-pgsql explain status):
+#   t-pgsql status --yaml jobs.yaml
+#   t-pgsql status --yaml jobs.yaml --max-age 26h --json >/dev/null || echo "backup stale"
+#
+# Shared monitor settings can go under a top-level "defaults:" section; a job value wins.
+# Example (not enabled here):
+#   defaults:
+#     ping_fail: https://hc.example.com/ping/UUID/fail
+#     lock_wait: 30
+# "batch" itself accepts no --ping options; each job pings on its own run.
+# A job skipped by the run lock exits 75 and is reported as "Skipped (locked)".
 #
 # ==============================================================================
 # NOTES
