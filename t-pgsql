@@ -114,6 +114,11 @@ NOTIFY=()
 NOTIFY_ON_ERROR=false
 NOTIFY_FAILURE_SENT=false     # true once a failure notification was attempted in this run
 
+# Heartbeat ping (dead-man's switch), see src/27-heartbeat.sh
+PING_URL=""                   # base URL: <url>/start, <url> on success, <url>/fail
+PING_START_URL=""             # explicit override for the start ping
+PING_FAIL_URL=""              # explicit override for the failure ping
+
 # Masking
 MASK=false
 MASK_RULES=""
@@ -256,6 +261,7 @@ log_error() {
     # Errors go to stderr: only colour them when stderr itself is a terminal.
     local _red="$RED" _nc="$NC"
     [ -t 2 ] || { _red=""; _nc=""; }
+    HIST_LAST_ERROR="$1"   # reason recorded in the run history (history.tsv)
     echo -e "${_red}[ERROR]${_nc} $1" >&2
     log_to_file "ERROR" "$1"
 }
@@ -437,11 +443,24 @@ run_tmp_cleanup() {
         IFS=$'\t' read -r port dest path <<< "$e"
         ssh_exec "$port" "$dest" "rm -f $(pq "$path")" >/dev/null 2>&1 </dev/null
     done
+    # Run lock (src/37-lock.sh): released last, on every exit path; only if we own it.
+    lock_release
 }
 # INT/TERM must clean up AND stop the script: a handler that only cleaned up let the run
 # continue (compress, metadata, notifications) with its credential files already deleted.
 # \`exit\` fires the EXIT trap, which performs the cleanup exactly once.
-install_cleanup_trap() { trap 'run_tmp_cleanup' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; }
+#
+# ONE exit hook for the whole program (a second `trap ... EXIT` would silently replace it):
+# history line, then temp cleanup + lock release, then the final heartbeat ping. A failing
+# step never stops the next one and the exit status of the run is preserved.
+_run_exit_trap() {
+    local rc=$?
+    history_on_exit "$rc" 2>/dev/null || true
+    run_tmp_cleanup || true
+    ping_finish "$rc" 2>/dev/null || true
+    return "$rc"
+}
+install_cleanup_trap() { trap '_run_exit_trap' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; }
 
 _PGPASS_TMP=""
 setup_local_pgpass() {
@@ -590,7 +609,7 @@ mask_notify_spec() {
 
 # Mask the value of every --notify option in an argument string (for debug logs).
 redact_notify_args() {
-    printf '%s' "$1" | sed -E "s/(--notify[[:space:]]+['\"]?[A-Za-z]+:)[^[:space:]'\"]*/\1***/g"
+    printf '%s' "$1" | sed -E "s/(--notify[[:space:]]+['\"]?[A-Za-z]+:)[^[:space:]'\"]*/\1***/g; s#(--ping(-start|-fail)?[[:space:]]+['\"]?[Hh][Tt][Tt][Pp]([Ss])?://)([^/?#\\[:space:]'\"]*@)?([^/?#\\[:space:]'\"]*)[^[:space:]'\"]*#\\1\\5/***#g"
 }
 
 send_notification() {
@@ -1194,6 +1213,7 @@ check_skip_recent() {
             local today_date=$(date +%Y%m%d)
             if [ "$file_date" = "$today_date" ]; then
                 log_info "Skipping: dump already exists today ($(basename "$latest"))"
+                HIST_SKIPPED="dump already exists today"
                 return 0
             fi
             return 1
@@ -1221,10 +1241,169 @@ check_skip_recent() {
     if [ $diff_sec -lt $skip_sec ]; then
         local age=$(format_elapsed $diff_sec)
         log_info "Skipping: recent dump exists ($age ago, threshold: $SKIP_IF_RECENT)"
+        HIST_SKIPPED="recent dump exists ($age ago, threshold: $SKIP_IF_RECENT)"
         return 0
     fi
 
     return 1
+}
+
+# ==============================================================================
+# HEARTBEAT PING (dead-man's switch)
+# ==============================================================================
+# A run of dump/clone/restore/upgrade/fetch pings an external monitor: <url>/start when it
+# begins, then <url> on success or <url>/fail on failure (healthchecks.io convention).
+# The monitor alerts when pings stop arriving, which covers a job that never started.
+# A ping never changes the exit code and never delays a run beyond curl's own timeouts.
+
+# Reduce a ping URL to scheme://host[:port]/*** for logs (drops user info, path and query).
+ping_mask_url() {
+    local u="$1" scheme rest
+    scheme="${u%%://*}"
+    rest="${u#*://}"
+    rest="${rest%%[/?#]*}"
+    rest="${rest##*@}"
+    printf '%s://%s/***' "$scheme" "$rest"
+}
+
+# Only plain http(s) URLs (scheme in any case) without whitespace are accepted.
+ping_url_ok() {
+    [[ "$1" =~ ^[Hh][Tt][Tt][Pp]([Ss])?://[^[:space:]/?#]+[^[:space:]]*$ ]]
+}
+
+# Validate every configured ping URL; prints an error (without the URL) and returns 1.
+# Nothing is validated (or rejected) on a dry run or with T_PGSQL_PING_DISABLE=1: no ping
+# is sent then, so a bad URL cannot matter.
+ping_validate() {
+    local pair name url
+    [ "$DRY_RUN" = true ] && return 0
+    [ "${T_PGSQL_PING_DISABLE:-}" = 1 ] && return 0
+    for pair in "--ping:$PING_URL" "--ping-start:$PING_START_URL" "--ping-fail:$PING_FAIL_URL"; do
+        name="${pair%%:*}"
+        url="${pair#*:}"
+        [ -z "$url" ] && continue
+        if ! ping_url_ok "$url"; then
+            log_error "Invalid ${name} value: expected an http:// or https:// URL"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# batch never pings (the jobs it starts do, through their own "ping:" keys): a ping option
+# on the batch command line would silently do nothing, so it is rejected. Returns 1 then.
+ping_reject_for_batch() {
+    [ -z "$PING_URL$PING_START_URL$PING_FAIL_URL" ] && return 0
+    if [ "$COMMAND" = batch ] || [ -n "$BATCH_JOB" ]; then
+        log_error "--ping, --ping-start and --ping-fail do not apply to batch: put 'ping:' (or ping_start / ping_fail) on the job in the jobs file"
+        return 1
+    fi
+    return 0
+}
+
+# Take --ping/--ping-start/--ping-fail (and their values) out of an argument string that is
+# about to be re-executed, so a secret URL never lands on the child's command line. Sets
+# _PA_URL, _PA_START, _PA_FAIL (the values found) and _PA_ARGS (the remaining string).
+ping_extract_args() {
+    local s="$1" re flag tok val
+    _PA_URL=""; _PA_START=""; _PA_FAIL=""
+    re="(^|[[:space:]])(--ping-start|--ping-fail|--ping)[[:space:]]+('[^']*'|\"[^\"]*\"|[^[:space:]'\"]+)"
+    while [[ "$s" =~ $re ]]; do
+        flag="${BASH_REMATCH[2]}"; tok="${BASH_REMATCH[3]}"
+        case "$tok" in
+            \'*) val="${tok:1:${#tok}-2}" ;;
+            \"*) val="${tok:1:${#tok}-2}"; val="${val//\\\"/\"}" ;;
+            *)   val="$(printf '%s' "$tok" | sed -E 's/\\(.)/\1/g')" ;;
+        esac
+        case "$flag" in
+            --ping)       _PA_URL="$val" ;;
+            --ping-start) _PA_START="$val" ;;
+            *)            _PA_FAIL="$val" ;;
+        esac
+        s="${s%%"${BASH_REMATCH[0]}"*} ${s#*"${BASH_REMATCH[0]}"}"
+    done
+    _PA_ARGS="$s"
+}
+
+# Build the URL for a ping kind (start|success|fail); empty when none applies.
+ping_target_url() {
+    local kind="$1" base tail path
+    case "$kind" in
+        start) [ -n "$PING_START_URL" ] && { printf '%s' "$PING_START_URL"; return 0; } ;;
+        fail)  [ -n "$PING_FAIL_URL" ]  && { printf '%s' "$PING_FAIL_URL"; return 0; } ;;
+    esac
+    [ -z "$PING_URL" ] && return 0
+    [ "$kind" = success ] && { printf '%s' "$PING_URL"; return 0; }
+    # <base>/start or <base>/fail: the suffix goes in front of a query or a #fragment
+    path="${PING_URL%%[?#]*}"
+    tail="${PING_URL#"$path"}"
+    while [[ "$path" == */ ]]; do path="${path%/}"; done
+    base="$path"
+    printf '%s/%s%s' "$base" "$kind" "$tail"
+}
+
+# Send one ping. The URL travels to curl through a config on stdin (never argv).
+# Usage: ping_send <url> [body]. Always returns 0.
+ping_send() {
+    local url="$1" body="${2:-}" rc
+    [ -z "$url" ] && return 0
+    if ! command -v curl >/dev/null 2>&1; then
+        log_warn "Heartbeat ping skipped: curl not found"
+        return 0
+    fi
+    printf 'url = "%s"\n' "$(_curl_cfg_quote "$url")" \
+        | curl --silent --show-error --fail --max-time 10 --connect-timeout 5 \
+               --retry 2 --retry-max-time 20 -o /dev/null -K - -X POST -d "$body" >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_warn "Heartbeat ping failed (curl exit ${rc}): $(ping_mask_url "$url")"
+    fi
+    return 0
+}
+
+# Body text: one line, no secrets.
+ping_body() {
+    local code="$1" label
+    label="${CURRENT_JOB_NAME:-${DUMP_NAME:-${FROM_DATABASE:-$TO_DATABASE}}}"
+    label="${label//[^A-Za-z0-9._-]/_}"
+    [ -z "$label" ] && label="-"
+    printf 't-pgsql %s %s exit=%s duration=%ss' "$COMMAND" "$label" "$code" "$(( SECONDS - _PING_T0 ))"
+}
+
+# Called from main() right after validation, before the work starts. Pings only for the
+# commands that do work, never on a dry run, and never when T_PGSQL_PING_DISABLE=1.
+_PING_ACTIVE=false
+_PING_DONE=false
+_PING_T0=0
+ping_begin() {
+    [ "${T_PGSQL_PING_DISABLE:-}" = 1 ] && return 0
+    [ "$DRY_RUN" = true ] && return 0
+    case "$COMMAND" in
+        dump|restore|clone|upgrade|fetch) ;;
+        *) return 0 ;;
+    esac
+    [ -z "$PING_URL$PING_START_URL$PING_FAIL_URL" ] && return 0
+    # A run that has no source cannot work: it fails right away with its usual error, so it
+    # must not announce itself with a start ping first (a typo would look like a failed backup).
+    case "$COMMAND" in
+        dump|fetch|clone|upgrade) [ -z "$FROM_CONNECTION" ] && return 0 ;;
+    esac
+    _PING_ACTIVE=true
+    _PING_T0=$SECONDS
+    # The final ping is sent by the single exit hook (_run_exit_trap, 15-security.sh), so
+    # every exit path (including INT/TERM, which exit through it) ends with one ping.
+    ping_send "$(ping_target_url start)" ""
+}
+
+# Send the final ping once. Usage: ping_finish <exit code>
+ping_finish() {
+    [ "$_PING_ACTIVE" = true ] && [ "$_PING_DONE" != true ] || return 0
+    _PING_DONE=true
+    if [ "$1" -eq 0 ]; then
+        ping_send "$(ping_target_url success)" "$(ping_body "$1")"
+    else
+        ping_send "$(ping_target_url fail)" "$(ping_body "$1")"
+    fi
 }
 
 # ==============================================================================
@@ -1257,7 +1436,11 @@ COMMANDS:
                   clean --from <conn> --keep <N>
                   clean --dump-name <name> --retention
     doctor      Check the environment and backup health (add --from/--to to test connectivity)
-    explain     Explain what a command is for: explain [dump|restore|clone|upgrade|...]
+    status      Show the last run of each job from the run history (read-only);
+                with --max-age it is a monitoring check (exit 3 when stale)
+                  status [--yaml <file>] [--output <dir>] [--name <name>] [--json]
+                         [--max-age <time>] [--limit <N>]
+    explain     Explain what a command is for: explain [dump|restore|clone|upgrade|status|ping|lock|...]
     version     Show version
 
 CONNECTION:
@@ -1357,6 +1540,37 @@ NOTIFY:
     --notify-on-error             Only notify on error
     -q, --quiet                   Minimal console output; success notifications are
                                   suppressed, failures are still notified
+
+HEARTBEAT PING (dead-man's switch; dump/clone/restore/upgrade/fetch only):
+    --ping <url>                  Monitor URL: <url>/start when the run starts,
+                                  <url> on success, <url>/fail on failure
+                                  (http:// or https:// only)
+    --ping-start <url>            Explicit start URL (wins over <url>/start)
+    --ping-fail <url>             Explicit failure URL (wins over <url>/fail)
+                                  Without --ping, only start and failure pings are sent.
+                                  Never sent with --dry-run, and never for a run skipped
+                                  by the lock. batch does not take these options: put
+                                  ping:/ping_start:/ping_fail: on the job in the jobs file.
+                                  A failed ping only warns; it never changes the exit code.
+    Env var: T_PGSQL_PING_DISABLE=1 turns all pings off.
+
+RUN LOCK (one run per output directory + dump name / per target database):
+    --lock-wait <seconds>         Wait up to N seconds for a held lock, then skip
+                                  (default: 0 = skip at once)
+    --no-lock                     Do not take the lock
+                                  A run skipped by the lock exits 75 (not a failure).
+                                  Stale locks (dead owner, too old) are taken over.
+    Env vars: T_PGSQL_LOCK_MAX_AGE (seconds, default 86400)
+
+STATUS (run history; also written by dump/clone/restore/upgrade/fetch):
+    --name <name>                 Only this job/dump name
+    --limit <N>                   Last N runs of --name, newest first (needs --name)
+    --json                        JSON output
+    --max-age <time>              Exit 3 if any listed name has no successful run
+                                  within <time> (e.g. 26h, 90m, 1d; bare number = seconds)
+    --yaml <file> lists exactly the jobs of that file; --output <dir> is the dump
+    directory. Env var: T_PGSQL_STATE_DIR (default: $XDG_STATE_HOME/t-pgsql or
+    ~/.local/state/t-pgsql; holds history.tsv and locks/).
 
 MASKING:
     --mask                        Enable data masking
@@ -1470,6 +1684,17 @@ EXAMPLES:
     t-pgsql fetch \
       --from ssh://ubuntu@192.0.2.20/prod \
       --from-file "prod_20250130*.dump"
+
+    # Heartbeat to a monitor, no overlapping runs, freshness check from cron
+    t-pgsql dump --from localhost/prod --ping https://hc.example.com/ping/UUID --lock-wait 60
+    t-pgsql status --yaml jobs.yaml --max-age 26h --json >/dev/null || echo "backup stale"
+
+EXIT STATUS:
+    0   success
+    1   error (invalid option or value, failed run)
+    2   usage error of status (bad --max-age/--limit, unknown option, missing file)
+    3   status --max-age: a listed name has no fresh successful run
+    75  run skipped because another run holds the lock (not a failure)
 
 More info: https://github.com/Asimatasert/t-pgsql
 EOF
@@ -1709,6 +1934,405 @@ parse_ssh_connection() {
     log_debug "$prefix: ssh $ssh_user@$ssh_host:$ssh_port -> $db_user@$db_host:$db_port/$db"
 }
 
+# ==============================================================================
+# RUN LOCK (no two runs write the same target at the same time)
+# ==============================================================================
+# One lock per target, taken with an atomic mkdir (no flock: it is missing on macOS):
+#   <state dir>/locks/<safe-name>-<checksum>.lock/meta
+# dump and fetch lock "<output dir> + dump base name"; clone, restore and upgrade lock the
+# target database (and a non-streaming clone/upgrade also the dump base it writes).
+# A held lock makes the run SKIP with exit status 75 (not a failure: no failure
+# notification). A broken lock directory never stops a backup (the run goes on unlocked).
+
+LOCK_WAIT=0                   # --lock-wait: seconds to wait for a held lock before skipping
+LOCK_WAIT_SET=false           # true once --lock-wait given on CLI (beats config)
+NO_LOCK=false                 # --no-lock: take no lock at all
+_LOCK_HELD=()                 # lock directories this process owns (released on exit)
+_LOCK_KEYS=()                 # keys of the current command
+_LOCK_HOST=""
+_LOCK_STALE_WHY=""
+_LOCK_HOLDER=""
+
+# Per-user state directory. T_PGSQL_STATE_DIR overrides the location (used by tests);
+# otherwise the bot's directory is reused. The same rules apply to both: created 0700,
+# never a symlink, owned by the current user.
+lock_state_dir() {
+    local d="${T_PGSQL_STATE_DIR:-}"
+    if [ -z "$d" ]; then
+        bot_state_dir
+        return $?
+    fi
+    [ -L "$d" ] && return 1
+    if [ ! -e "$d" ]; then
+        (umask 077; mkdir -p "$d") 2>/dev/null || return 1
+    fi
+    [ -d "$d" ] && [ ! -L "$d" ] && [ "$(bot_file_owner "$d")" = "$(id -u)" ] || return 1
+    chmod 700 "$d" 2>/dev/null
+    printf '%s\n' "$d"
+}
+
+# Safe file name for a lock key: unsafe characters replaced, truncated, plus a checksum of
+# the FULL key so two different keys never share a name (prod / prod_v2, truncation).
+_lock_safe_name() {
+    local key="$1" s sum
+    s="${key//[^A-Za-z0-9._-]/_}"
+    s="${s:0:80}"
+    sum="$(printf '%s' "$key" | cksum)"
+    sum="${sum%% *}"
+    printf '%s-%s' "$s" "$sum"
+}
+
+# Absolute, symlink-resolved form of a directory that may not exist yet (the deepest
+# existing ancestor is resolved), so spellings of one directory give one key.
+_lock_norm_dir() {
+    local d="$1" cur tail="" real
+    [ -z "$d" ] && d="."
+    case "$d" in /*) ;; *) d="$PWD/$d" ;; esac
+    while [ "${#d}" -gt 1 ] && [ "${d%/}" != "$d" ]; do d="${d%/}"; done
+    cur="$d"
+    while [ ! -d "$cur" ] && [ "$cur" != "/" ] && [ -n "$cur" ]; do
+        tail="/${cur##*/}$tail"
+        cur="${cur%/*}"
+        [ -z "$cur" ] && cur="/"
+    done
+    real="$(cd "$cur" 2>/dev/null && pwd -P)" || real="$cur"
+    [ "$real" = "/" ] && real=""
+    printf '%s%s' "$real" "$tail"
+}
+
+# mtime of a path in epoch seconds (GNU stat, then BSD stat).
+_lock_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+# Process start identity (tells a live owner from a reused pid); empty when unavailable.
+#   Linux:  "proc:<field 22 of /proc/<pid>/stat>"  (start time in clock ticks, exact)
+#   other:  "ps:<epoch>"  from "ps -o lstart=" parsed to epoch seconds (compared with a tolerance)
+_lock_pstart() {
+    local pid="$1" st out e
+    local -a ps_fields
+    if [ -r "/proc/$pid/stat" ]; then
+        st="$(cat "/proc/$pid/stat" 2>/dev/null)" || st=""
+        st="${st##*) }"                 # drop "pid (comm) ": the name may hold spaces and ")"
+        read -r -a ps_fields <<< "$st"
+        [[ "${ps_fields[19]:-}" =~ ^[0-9]+$ ]] && { printf 'proc:%s' "${ps_fields[19]}"; return 0; }
+    fi
+    out="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || out=""
+    out="$(trim "${out//$'\n'/ }")"
+    [ -z "$out" ] && return 0
+    if date --version >/dev/null 2>&1; then
+        e="$(LC_ALL=C date -d "$out" +%s 2>/dev/null)"
+    else
+        e="$(LC_ALL=C date -j -f '%a %b %e %H:%M:%S %Y' "$out" +%s 2>/dev/null)"
+    fi
+    [[ "$e" =~ ^[0-9]+$ ]] && printf 'ps:%s' "$e"
+    return 0
+}
+
+# Is $2 (current start identity of a pid) the same process as $1 (recorded at acquire)?
+# Anything that cannot be compared (empty, other kind, old format, unparseable) counts as the
+# SAME process: an unknown must never make a live owner's lock look stale.
+_lock_pstart_same() {
+    local rec="$1" cur="$2" d
+    [ -n "$rec" ] && [ -n "$cur" ] || return 0
+    case "$rec:$cur" in
+        proc:*:proc:*) [ "${rec#proc:}" = "${cur#proc:}" ]; return $? ;;
+        ps:*:ps:*)
+            [[ "${rec#ps:}" =~ ^[0-9]+$ ]] && [[ "${cur#ps:}" =~ ^[0-9]+$ ]] || return 0
+            d=$(( ${rec#ps:} - ${cur#ps:} )); [ "$d" -lt 0 ] && d=$(( -d ))
+            [ "$d" -le 5 ]; return $? ;;
+    esac
+    return 0
+}
+
+# Stable identity of this host: lower-cased short name, so a changing domain suffix
+# (foo.local / foo.lan) does not make a crashed run's lock look foreign.
+_lock_host_id() {
+    local h="${1-}"
+    if [ "$#" -eq 0 ]; then
+        h="$(hostname -s 2>/dev/null)"
+        [ -z "$h" ] && h="$(hostname 2>/dev/null)"
+    fi
+    h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
+    printf '%s' "${h%%.*}"
+}
+
+_lock_fmt_epoch() {
+    date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '%s' "$1"
+}
+
+_lock_max_age() {
+    local m="${T_PGSQL_LOCK_MAX_AGE:-86400}"
+    [[ "$m" =~ ^[1-9][0-9]*$ ]] || m=86400
+    printf '%s' "$m"
+}
+
+# Read <dir>/meta into m_pid m_host m_start m_pstart m_cmd m_job. Fails without meta.
+_lock_read_meta() {
+    local f="$1/meta" k v line
+    m_pid=""; m_host=""; m_start=""; m_pstart=""; m_cmd=""; m_job=""
+    [ -f "$f" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        k="${line%%=*}"; v="${line#*=}"
+        case "$k" in
+            pid) m_pid="$v" ;;
+            host) m_host="$v" ;;
+            start) m_start="$v" ;;
+            pstart) m_pstart="$v" ;;
+            cmd) m_cmd="$v" ;;
+            job) m_job="$v" ;;
+        esac
+    done < "$f"
+    [[ "$m_pid" =~ ^[0-9]+$ ]] || return 1
+    return 0
+}
+
+# Is the lock directory a leftover nobody owns? Sets _LOCK_STALE_WHY. Never true for a
+# live owner on this host (unless it is older than the hard maximum).
+_lock_is_stale() {
+    local dir="$1" now age mt cur
+    now="$(date +%s)"
+    if ! _lock_read_meta "$dir"; then
+        # No (valid) meta: the owner may be between mkdir and writing it. Give it a grace period.
+        mt="$(_lock_mtime "$dir")"
+        [[ "$mt" =~ ^[0-9]+$ ]] || return 1
+        if [ $((now - mt)) -gt 10 ]; then _LOCK_STALE_WHY="lock without owner information"; return 0; fi
+        return 1
+    fi
+    if [[ "$m_start" =~ ^[0-9]+$ ]]; then
+        age=$((now - m_start))
+        if [ "$age" -gt "$(_lock_max_age)" ]; then
+            _LOCK_STALE_WHY="owner pid $m_pid on ${m_host:-unknown host} older than $(_lock_max_age)s"
+            return 0
+        fi
+    fi
+    [ -n "$m_host" ] && [ "$(_lock_host_id "$m_host")" = "$_LOCK_HOST" ] || return 1   # another host: only the hard maximum applies
+    if ! kill -0 "$m_pid" 2>/dev/null; then
+        _LOCK_STALE_WHY="owner pid $m_pid is not running"
+        return 0
+    fi
+    if [ -n "$m_pstart" ]; then
+        cur="$(_lock_pstart "$m_pid")"
+        if ! _lock_pstart_same "$m_pstart" "$cur"; then
+            _LOCK_STALE_WHY="pid $m_pid was reused by another process"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Write the meta file atomically into a lock directory we just created.
+_lock_write_meta() {
+    local dir="$1" key="$2" tmp="$1/meta.$$"
+    {
+        printf 'pid=%s\n' "$$"
+        printf 'host=%s\n' "$_LOCK_HOST"
+        printf 'start=%s\n' "$(date +%s)"
+        printf 'pstart=%s\n' "$(_lock_pstart "$$")"
+        printf 'cmd=%s\n' "$COMMAND"
+        printf 'job=%s\n' "$(printf '%s' "${CURRENT_JOB_NAME:-}" | tr '\n' ' ')"
+        printf 'key=%s\n' "$(printf '%s' "$key" | tr '\n' ' ')"
+    } > "$tmp" 2>/dev/null && mv -f "$tmp" "$dir/meta" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# The take-over mutex "<lock>.take": a directory that records its owner's pid. Taken with
+# mkdir; a held mutex is stolen only when its owner pid is dead or it is older than 60 s
+# (the steal is a rename, which only one stealer can win).
+_lock_mx_acquire() {
+    local mx="$1" owner now mt dead=false
+    if mkdir "$mx" 2>/dev/null; then
+        printf '%s\n' "$$" > "$mx/owner" 2>/dev/null
+        return 0
+    fi
+    [ -d "$mx" ] || return 1
+    owner="$(cat "$mx/owner" 2>/dev/null)"
+    now="$(date +%s)"; mt="$(_lock_mtime "$mx")"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+        dead=true
+    elif [[ "$mt" =~ ^[0-9]+$ ]] && [ $((now - mt)) -gt 60 ]; then
+        dead=true
+    fi
+    [ "$dead" = true ] || return 1
+    mv "$mx" "$mx.dead.$$" 2>/dev/null || return 1
+    rm -rf "$mx.dead.$$" 2>/dev/null
+    mkdir "$mx" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$mx/owner" 2>/dev/null
+    return 0
+}
+
+# Release the mutex, only when this process owns it (it may have been stolen after 60 s).
+_lock_mx_release() {
+    [ "$(cat "$1/owner" 2>/dev/null)" = "$$" ] || return 0
+    rm -f "$1/owner" 2>/dev/null
+    rmdir "$1" 2>/dev/null
+    return 0
+}
+
+# Try once to take one lock. 0 = acquired, 1 = held by a live owner (_LOCK_HOLDER set),
+# 2 = the lock directory cannot be used (caller runs without it), 3 = a competitor created
+# the directory while a stale one was being taken over (caller tries again right away).
+_lock_try() {
+    local dir="$1" key="$2" mx old
+    if mkdir "$dir" 2>/dev/null; then
+        _lock_write_meta "$dir" "$key" || { rm -rf "$dir" 2>/dev/null; return 2; }
+        _LOCK_HELD+=("$dir")
+        return 0
+    fi
+    [ -d "$dir" ] || return 2                          # failed for a reason other than "exists"
+    if ! _lock_is_stale "$dir"; then
+        _lock_describe "$dir"; return 1
+    fi
+    # Take-over is serialised by the mutex, then the stale directory is renamed away
+    # (atomic) before the new lock is created; the staleness is re-checked under the mutex
+    # so a lock a faster process just created is never removed.
+    mx="$dir.take"
+    if ! _lock_mx_acquire "$mx"; then
+        _lock_describe "$dir"; return 1
+    fi
+    if [ -d "$dir" ]; then
+        if _lock_is_stale "$dir"; then
+            old="$dir.old.$$"
+            log_warn "Taking over stale lock (${_LOCK_STALE_WHY}; held by ${m_cmd:-unknown command}${m_job:+, job $m_job})"
+            if ! mv "$dir" "$old" 2>/dev/null; then
+                _lock_mx_release "$mx"
+                [ -d "$dir" ] && return 2
+                return 3
+            fi
+            rm -rf "$old" 2>/dev/null
+        else
+            _lock_mx_release "$mx"
+            _lock_describe "$dir"; return 1
+        fi
+    fi
+    if mkdir "$dir" 2>/dev/null; then
+        # created by this process just now: it is ours to write and, on failure, to remove
+        if _lock_write_meta "$dir" "$key"; then
+            _lock_mx_release "$mx"
+            _LOCK_HELD+=("$dir")
+            return 0
+        fi
+        rm -rf "$dir" 2>/dev/null
+        _lock_mx_release "$mx"
+        return 2
+    fi
+    # A plain acquirer's mkdir landed between the rename and ours: the directory is
+    # theirs. Leave it alone and look again (never run unlocked because of this).
+    _lock_mx_release "$mx"
+    return 3
+}
+
+# Fill _LOCK_HOLDER with a one-line description of the lock's owner.
+_lock_describe() {
+    local dir="$1" now
+    now="$(date +%s)"
+    if _lock_read_meta "$dir"; then
+        _LOCK_HOLDER="pid $m_pid on ${m_host:-unknown host}, command ${m_cmd:-unknown}"
+        [ -n "$m_job" ] && _LOCK_HOLDER+=", job $m_job"
+        if [[ "$m_start" =~ ^[0-9]+$ ]]; then
+            _LOCK_HOLDER+=", since $(_lock_fmt_epoch "$m_start") ($(format_elapsed $((now - m_start))) ago)"
+        fi
+    else
+        _LOCK_HOLDER="an owner that is still starting"
+    fi
+}
+
+# Release every lock this process owns. Only a lock whose meta names THIS pid is removed.
+lock_release() {
+    local dir old
+    [ "${#_LOCK_HELD[@]}" -gt 0 ] || return 0
+    for dir in "${_LOCK_HELD[@]}"; do
+        if _lock_read_meta "$dir" && [ "$m_pid" = "$$" ]; then
+            old="$dir.rel.$$"
+            if mv "$dir" "$old" 2>/dev/null; then rm -rf "$old" 2>/dev/null; fi
+        fi
+    done
+    _LOCK_HELD=()
+    return 0
+}
+
+# Build _LOCK_KEYS for the current command from the already-parsed options. Parsing
+# errors are left to the command itself (it reports them): no key, no lock.
+_lock_compute_keys() {
+    local dir base i
+    _LOCK_KEYS=()
+    case "$COMMAND" in
+        dump|fetch)
+            [ -n "$FROM_CONNECTION" ] || return 0
+            parse_connection "$FROM_CONNECTION" "FROM" >/dev/null 2>&1 || return 0
+            _LOCK_KEYS+=("dump|$(_lock_norm_dir "$OUTPUT_DIR")|${DUMP_NAME:-$FROM_DATABASE}")
+            ;;
+        restore|clone|upgrade)
+            [ "${#TO_CONNECTIONS[@]}" -gt 0 ] || return 0
+            if [ "$COMMAND" != restore ] && [ "$STREAM" != true ] && [ -n "$FROM_CONNECTION" ]; then
+                # A non-streaming clone/upgrade also writes a dump of the source here.
+                parse_connection "$FROM_CONNECTION" "FROM" >/dev/null 2>&1 \
+                    && _LOCK_KEYS+=("dump|$(_lock_norm_dir "$OUTPUT_DIR")|${DUMP_NAME:-$FROM_DATABASE}")
+            fi
+            for i in "${!TO_CONNECTIONS[@]}"; do
+                parse_connection "${TO_CONNECTIONS[$i]}" "TO" >/dev/null 2>&1 || continue
+                _LOCK_KEYS+=("db|$(_clone_endpoint_key TO)")
+            done
+            ;;
+    esac
+    return 0
+}
+
+# Take the locks the current command needs. Returns 0 to go on (locks held, or running
+# unlocked on purpose / because the lock directory is unusable) and 75 when another run
+# holds one of them (nothing is held then). Callers do: lock_acquire_command || exit $?
+lock_acquire_command() {
+    local sd locks key dir rc deadline now waited=false retries
+    [ "$NO_LOCK" = true ] && return 0
+    [ "$DRY_RUN" = true ] && return 0
+    case "$COMMAND" in dump|fetch|restore|clone|upgrade) ;; *) return 0 ;; esac
+    if ! [[ "$LOCK_WAIT" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        log_error "Invalid --lock-wait '${LOCK_WAIT}': expected a non-negative number of seconds"
+        return 1
+    fi
+    _lock_compute_keys
+    [ "${#_LOCK_KEYS[@]}" -gt 0 ] || return 0
+    _LOCK_HOST="$(_lock_host_id)"
+
+    sd="$(lock_state_dir)" || { log_warn "Run lock disabled: state directory is not usable; continuing without a lock"; return 0; }
+    locks="$sd/locks"
+    if [ -L "$locks" ] || { [ ! -d "$locks" ] && ! (umask 077; mkdir -p "$locks") 2>/dev/null; } || [ ! -d "$locks" ] || [ ! -w "$locks" ]; then
+        log_warn "Run lock disabled: cannot use $locks; continuing without a lock"
+        return 0
+    fi
+
+    deadline=$(( $(date +%s) + LOCK_WAIT ))
+    while IFS= read -r key; do
+        [ -z "$key" ] && continue
+        dir="$locks/$(_lock_safe_name "$key").lock"
+        retries=0
+        while :; do
+            _lock_try "$dir" "$key"; rc=$?
+            if [ "$rc" -eq 3 ]; then
+                # lost a race while taking over a stale lock: look again at once (bounded)
+                retries=$((retries + 1))
+                [ "$retries" -le 5 ] && continue
+                _lock_describe "$dir"; rc=1
+            fi
+            [ "$rc" -ne 1 ] && break
+            now="$(date +%s)"
+            if [ "$now" -ge "$deadline" ]; then
+                lock_release
+                log_warn "Skipping: another run is already working on ${key//|/ } (held by ${_LOCK_HOLDER}). Not an error; exit status 75."
+                [ "$LOCK_WAIT" -eq 0 ] && log_info "Use --lock-wait <seconds> to wait for it, or --no-lock to disable the lock"
+                return 75
+            fi
+            if [ "$waited" != true ]; then
+                log_info "Waiting up to ${LOCK_WAIT}s for ${key//|/ } (held by ${_LOCK_HOLDER})"
+                waited=true
+            fi
+            sleep 1
+        done
+        if [ "$rc" -eq 2 ]; then
+            log_warn "Run lock disabled for ${key//|/ }: lock directory cannot be created; continuing without a lock"
+        fi
+    done < <(printf '%s\n' "${_LOCK_KEYS[@]}" | LC_ALL=C sort -u)
+    return 0
+}
 # ==============================================================================
 # PASSWORD HANDLER
 # ==============================================================================
@@ -2001,6 +2625,11 @@ load_config() {
             verbose) [ "$value" = "true" ] && VERBOSE=true ;;
             force) [ "$value" = "true" ] && FORCE=true ;;
             sudo) [ "$value" = "true" ] && SUDO=true ;;
+            ping) [ -z "$PING_URL" ] && PING_URL="$value" ;;
+            ping_start|ping-start) [ -z "$PING_START_URL" ] && PING_START_URL="$value" ;;
+            ping_fail|ping-fail) [ -z "$PING_FAIL_URL" ] && PING_FAIL_URL="$value" ;;
+            lock_wait|lock-wait) [ "$LOCK_WAIT_SET" != true ] && LOCK_WAIT="$value" ;;
+            no_lock|no-lock) [ "$value" = "true" ] && NO_LOCK=true ;;
         esac
     done < "$config_file"
 
@@ -2194,6 +2823,7 @@ check_dump_shrink() {
 quarantine_suspect_dump() {
     local f="$1"
     if [ -e "$f" ] && mv -f "$f" "${f}.suspect" 2>/dev/null; then
+        HIST_ARTIFACT="${f}.suspect"
         log_error "The new dump was kept as ${f}.suspect; older dumps were not rotated or deleted"
     else
         log_error "Older dumps were not rotated or deleted"
@@ -3828,8 +4458,9 @@ _explain_overview() {
     echo -e "  ${CYAN}bot${NC}       Telegram bot to trigger/monitor backups from a chat"
     echo -e "  ${CYAN}list${NC} / ${CYAN}meta${NC} / ${CYAN}clean${NC}   Inspect dumps, show metadata, prune old dumps"
     echo -e "  ${CYAN}doctor${NC}    Check the environment and backup health"
+    echo -e "  ${CYAN}status${NC}    Last run of each job from the run history; stale-backup check"
     echo
-    echo -e "  Extra topics: ${CYAN}stream${NC}, ${CYAN}masking${NC}, ${CYAN}retention${NC}"
+    echo -e "  Extra topics: ${CYAN}ping${NC}, ${CYAN}lock${NC}, ${CYAN}stream${NC}, ${CYAN}masking${NC}, ${CYAN}retention${NC}"
     echo
     echo -e "Run ${BOLD}t-pgsql explain <topic>${NC} for details, e.g. ${BOLD}t-pgsql explain clone${NC}."
 }
@@ -4039,6 +4670,86 @@ _explain_doctor() {
     _ex_see "explain list"
 }
 
+_explain_status() {
+    _ex_title "status" "last run of each job, and a stale-backup check"
+    _ex_sec "What it does"
+    echo "  dump, clone, restore, upgrade and fetch append one line per run to a history"
+    echo "  file (<state dir>/history.tsv). 'status' reads it and prints, per name, the"
+    echo "  last run, result (ok, failed, suspect, skipped, locked, never), duration,"
+    echo "  size and how many dumps are kept. It is read-only and creates nothing."
+    echo "  Error messages in the history are shortened and stripped of passwords/URLs."
+    echo
+    _ex_sec "Monitoring check"
+    echo "  --max-age <time> turns it into a check: exit 3 if a listed name has no"
+    echo "  successful run within <time> (26h, 90m, 1d; a bare number is seconds), has"
+    echo "  never run, or nothing is listed. Only ok and skipped (--skip-if-recent) count"
+    echo "  as fresh; failed, suspect and locked runs do not. Exit 2 is a usage error."
+    echo
+    _ex_sec "Key options"
+    echo "  --yaml <file>          list exactly the jobs of this jobs file"
+    echo "  --output <dir>         dump directory (counts dumps, .suspect, .invalid)"
+    echo "  --name <name>          only this name; with --limit <N> the last N runs"
+    echo "  --json                 machine-readable output"
+    echo
+    _ex_sec "Examples"
+    echo "  t-pgsql status --yaml jobs.yaml"
+    echo "  t-pgsql status --yaml jobs.yaml --max-age 26h --json >/dev/null || alert"
+    echo "  t-pgsql status --name nightly --limit 10"
+    _ex_see "explain lock · explain ping · explain batch"
+}
+
+_explain_ping() {
+    _ex_title "--ping" "heartbeat to a monitoring service (dead-man's switch)"
+    _ex_sec "What it does"
+    echo "  Sends an HTTP POST to a monitor (healthchecks.io, Uptime Kuma push, ...):"
+    echo "  <url>/start when a run starts, <url> on success, <url>/fail on any failure."
+    echo "  If the monitor hears nothing, it alerts - which also covers a host that is"
+    echo "  down or a cron job that never started. Applies to dump, clone, restore,"
+    echo "  upgrade and fetch; never to --dry-run, batch, list, doctor or status."
+    echo
+    _ex_sec "Key options"
+    echo "  --ping <url>           base URL (http:// or https:// only)"
+    echo "  --ping-start <url>     explicit start URL (wins over <url>/start)"
+    echo "  --ping-fail <url>      explicit failure URL (wins over <url>/fail)"
+    echo "  Without --ping, only start and failure pings are sent."
+    echo
+    _ex_sec "Good to know"
+    echo "  • A run skipped by the lock (exit 75) sends no ping at all"
+    echo "  • A ping that cannot be delivered only warns; it never changes the exit code"
+    echo "  • batch takes no --ping; set ping: on the job in the jobs file instead"
+    echo "  • T_PGSQL_PING_DISABLE=1 turns all pings off"
+    echo
+    _ex_sec "Example"
+    echo "  t-pgsql dump --from \"postgres@localhost/appdb\" --ping https://hc.example.com/ping/UUID"
+    _ex_see "explain status · explain lock"
+}
+
+_explain_lock() {
+    _ex_title "run lock" "never run the same backup twice at once"
+    _ex_sec "What it does"
+    echo "  dump, fetch, restore, clone and upgrade take a lock before working: dump and"
+    echo "  fetch lock the output directory + dump name, restore/clone/upgrade lock each"
+    echo "  --to database. If another run holds it, this run prints a warning and exits"
+    echo "  with status 75 (skipped, not a failure: no failure notification, no ping)."
+    echo
+    _ex_sec "Key options"
+    echo "  --lock-wait <seconds>  wait up to N seconds for the lock before skipping (default 0)"
+    echo "  --no-lock              take no lock"
+    echo "  T_PGSQL_LOCK_MAX_AGE   locks older than this many seconds are stale (default 86400)"
+    echo "  T_PGSQL_STATE_DIR      where locks/ and history.tsv live"
+    echo
+    _ex_sec "Good to know"
+    echo "  • A crashed run's lock is taken over by the next run (dead owner, reused pid or too old)"
+    echo "  • Released on every exit path, including Ctrl-C and SIGTERM"
+    echo "  • In a batch a locked job is 'Skipped (locked)' and does not stop the batch"
+    echo "  • If the state directory is unusable, the run continues without a lock"
+    echo "  • Cron wrappers should treat exit 75 as success or retry later"
+    echo
+    _ex_sec "Example"
+    echo "  t-pgsql dump --from \"postgres@localhost/appdb\" --lock-wait 120"
+    _ex_see "explain status · explain ping · explain batch"
+}
+
 _explain_mask() {
     _ex_title "masking" "anonymize sensitive data after restore"
     _ex_sec "What it does"
@@ -4088,6 +4799,9 @@ cmd_explain() {
         bot|telegram)           _explain_bot ;;
         list|meta|clean)        _explain_maint ;;
         doctor)                 _explain_doctor ;;
+        status|history)         _explain_status ;;
+        ping|heartbeat)         _explain_ping ;;
+        lock|locking)           _explain_lock ;;
         mask|masking)           _explain_mask ;;
         retention|gfs)          _explain_retention ;;
         *)
@@ -4393,6 +5107,635 @@ cmd_doctor() {
         echo -e "${GREEN}\xE2\x9C\x93 all checks passed${NC}"
         return 0
     fi
+}
+# ==============================================================================
+# RUN HISTORY + STATUS COMMAND
+# ==============================================================================
+# Every dump/clone/restore/upgrade/fetch run appends ONE line to
+# <state dir>/history.tsv (tab separated):
+#   epoch  iso8601-UTC  command  name  status  exit_code  duration_s  size_bytes  message
+# "t-pgsql status" reads it back (read-only). Writing the history never fails or
+# changes the exit status of a run: every error is swallowed.
+
+# --- state of the history writer / status command (own block, no other module reads it)
+HIST_ACTIVE=false          # true once history_begin armed the exit hook for this run
+HIST_START_EPOCH=""
+HIST_LAST_ERROR=""         # last log_error text (set by log_error)
+HIST_SKIPPED=""            # reason text when --skip-if-recent skipped the run
+HIST_ARTIFACT=""           # quarantined (.suspect) dump of this run
+HISTORY_MAX_LINES=2000     # trim when the file exceeds this many lines ...
+HISTORY_KEEP_LINES=1000    # ... down to the newest this many
+STATUS_YAML_SET=false
+STATUS_NAME=""
+STATUS_JSON=false
+STATUS_MAX_AGE=""
+STATUS_LIMIT=""
+
+# Per-name summary tables (global associative arrays, filled by status_load_summary)
+STATUS_SUMMARY=""          # newest run per name, one US-separated record per line (status_summary_lines)
+STATUS_ROWS=()
+C_KEPT=0; C_SUS=0; C_INV=0
+J_BASE=""; J_DIR=""
+
+# ------------------------------------------------------------------------------
+# State directory
+# ------------------------------------------------------------------------------
+# Directory for writing (created 0700). T_PGSQL_STATE_DIR overrides the default
+# per-user directory (same safety rules as bot_state_dir: no symlink, own uid).
+history_state_dir_write() {
+    local d="${T_PGSQL_STATE_DIR:-}"
+    if [ -z "$d" ]; then
+        bot_state_dir
+        return $?
+    fi
+    [ -L "$d" ] && return 1
+    if [ ! -e "$d" ]; then
+        (umask 077; mkdir -p "$d") 2>/dev/null || return 1
+    fi
+    [ -d "$d" ] && [ ! -L "$d" ] && [ "$(bot_file_owner "$d")" = "$(id -u)" ] || return 1
+    printf '%s' "$d"
+}
+
+# Directory for reading: never created. Prints nothing and fails when absent/unsafe.
+history_state_dir_read() {
+    local d="${T_PGSQL_STATE_DIR:-}" base
+    if [ -z "$d" ]; then
+        base="${XDG_STATE_HOME:-}"
+        [ -z "$base" ] && [ -n "$HOME" ] && base="$HOME/.local/state"
+        [ -z "$base" ] && return 1
+        d="$base/t-pgsql"
+    fi
+    [ -d "$d" ] && [ ! -L "$d" ] && [ "$(bot_file_owner "$d")" = "$(id -u)" ] || return 1
+    printf '%s' "$d"
+}
+
+# ------------------------------------------------------------------------------
+# Writer
+# ------------------------------------------------------------------------------
+# Arm the exit hook for work commands. Dry runs and every other command write nothing.
+history_begin() {
+    case "$COMMAND" in
+        dump|clone|restore|upgrade|fetch) ;;
+        *) return 0 ;;
+    esac
+    [ "$DRY_RUN" = true ] && return 0
+    HIST_ACTIVE=true
+    HIST_START_EPOCH=$(date +%s)
+    # The line itself is written by the single exit hook (_run_exit_trap, 15-security.sh).
+}
+
+history_on_exit() {
+    local rc="${1:-0}"
+    [ "$HIST_ACTIVE" = true ] || return 0
+    HIST_ACTIVE=false
+    { history_write "$rc"; } 2>/dev/null || true
+    return 0
+}
+
+# Single-line, secret-free, length-limited text. Usage: history_clean TEXT MAX
+history_clean() {
+    local s="$1" max="${2:-200}" ascii="${3:-}"
+    s=$(strip_ansi "$s")
+    s=$(redact_cmd "$s")
+    s=$(redact_args "$s")
+    s=$(printf '%s' "$s" | sed -E 's#(://[^/:@[:space:]]*):[^@[:space:]]*@#\1:***@#g')
+    s="${s//[[:cntrl:]]/ }"
+    # Cut by BYTES in the C locale (a cron job often has no UTF-8 locale, and a character cut
+    # in half would leave invalid UTF-8 in the file and invalid JSON in "status --json").
+    # Text that has to be cut, and every message (ascii=ascii), loses its non-ASCII bytes
+    # (each becomes "?"); a short name keeps its characters.
+    local bytes
+    bytes=$(printf '%s' "$s" | LC_ALL=C wc -c | tr -d '[:space:]')
+    if [ "$ascii" = ascii ] || [ "${bytes:-0}" -gt "$max" ]; then
+        s=$(printf '%s' "$s" | LC_ALL=C tr -c ' -~' '?')
+    fi
+    printf '%s' "${s:0:$max}"
+}
+
+# Message text for the history file: no credential, user, host or URL may survive. Anything
+# after "password" (also PGPASSWORD=...) is dropped, URLs and every word that holds an "@"
+# (user:secret@host, user@host:port/db) become ***. The words around them stay readable.
+history_sanitize_msg() {
+    printf '%s' "$1" | sed -E \
+        -e 's/([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]).*/\1 ***/' \
+        -e 's#[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]]*#***#g' \
+        -e 's#[^[:space:]]*@[^[:space:]]*#***#g'
+}
+
+history_write() {
+    local rc="$1" now dur status msg="" size="" name file="" dir f line
+    [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
+    now=$(date +%s)
+    dur=$(( now - HIST_START_EPOCH ))
+    [ "$dur" -lt 0 ] && dur=0
+
+    if [ "$rc" -eq 75 ]; then
+        # Exit 75 is only ever the run lock: another run holds the target (not a failure).
+        status="locked"; msg="skipped: another run holds the lock"
+    elif [ "$rc" -eq 0 ]; then
+        if [ -n "$HIST_SKIPPED" ]; then
+            status="skipped"; msg="$HIST_SKIPPED"
+        else
+            status="ok"
+        fi
+    elif [ -n "$SHRINK_DETAIL" ]; then
+        status="suspect"; msg="Shrink guard: $SHRINK_DETAIL"
+    else
+        status="failed"; msg="$HIST_LAST_ERROR"
+        if [ -z "$msg" ]; then
+            case "$rc" in
+                130) msg="interrupted (SIGINT)" ;;
+                143) msg="terminated (SIGTERM)" ;;
+                *)   msg="exit code $rc" ;;
+            esac
+        fi
+    fi
+
+    # Run name: job name, else the dump base name, else the target database.
+    if [ -n "$CURRENT_JOB_NAME" ]; then
+        name="$CURRENT_JOB_NAME"
+    else
+        case "$COMMAND" in
+            dump|fetch) name="${DUMP_NAME:-$FROM_DATABASE}" ;;
+            *)          name="${TO_DATABASE:-$FROM_DATABASE}" ;;
+        esac
+        if [ -z "$name" ] && [ -n "$FILE" ]; then
+            name="${FILE##*/}"
+            name=$(printf '%s' "$name" | sed -E 's/_[0-9]{8}_[0-9]{6}(_[0-9]+)?\.(tar\.gz|dump(\.zst|\.xz|\.bz2)?)$//')
+        fi
+    fi
+    [ -z "$name" ] && name="(unnamed)"
+
+    # Size of the final artifact, when there is one.
+    if [ "$status" = "ok" ]; then
+        file="$META_ARTIFACT"
+        if [ -z "$file" ] && [ "$COMMAND" = "dump" ]; then
+            file=$(list_dumps_for_base "$OUTPUT_DIR" "${DUMP_NAME:-$FROM_DATABASE}" | head -1)
+        fi
+    elif [ "$status" = "suspect" ]; then
+        file="$HIST_ARTIFACT"
+    fi
+    if [ -n "$file" ] && [ -f "$file" ]; then
+        size=$(file_size_bytes "$file") || size=""
+    fi
+
+    name=$(history_clean "$name" 200)
+    msg=$(history_clean "$(history_sanitize_msg "$msg")" 200 ascii)
+    line=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+        "$now" "$(date -u -r "$now" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$now" '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$COMMAND" "$name" "$status" "$rc" "$dur" "$size" "$msg")
+
+    dir=$(history_state_dir_write) || return 0
+    f="$dir/history.tsv"
+    [ -L "$f" ] && return 0
+    if [ -e "$f" ] && ! bot_safe_file "$f"; then return 0; fi
+
+    # mkdir-based lock, short wait, fail-open: without the lock the line is still
+    # appended (a single short write) and only the trimming is skipped.
+    local lock="$dir/history.lock" got=false tries=0
+    while [ "$tries" -lt 20 ]; do
+        if mkdir "$lock" 2>/dev/null; then got=true; break; fi
+        if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+            rmdir "$lock" 2>/dev/null
+        fi
+        tries=$((tries + 1))
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+
+    ( umask 077; printf '%s\n' "$line" >> "$f" ) 2>/dev/null
+
+    if [ "$got" = true ]; then
+        local n tmp
+        n=$(wc -l < "$f" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt "$HISTORY_MAX_LINES" ]; then
+            tmp=$(umask 077; mktemp "$dir/history.tsv.XXXXXX" 2>/dev/null) || tmp=""
+            if [ -n "$tmp" ]; then
+                if tail -n "$HISTORY_KEEP_LINES" "$f" > "$tmp" 2>/dev/null; then
+                    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+                else
+                    rm -f "$tmp"
+                fi
+            fi
+        fi
+        rmdir "$lock" 2>/dev/null
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# Reader helpers
+# ------------------------------------------------------------------------------
+# Path of the readable history file (nothing printed when there is none).
+status_history_file() {
+    local d f
+    d=$(history_state_dir_read) || return 0
+    f="$d/history.tsv"
+    [ -f "$f" ] && [ ! -L "$f" ] && printf '%s' "$f"
+    return 0
+}
+
+# Valid history lines only (corrupt/short lines are skipped), normalized to US-separated
+# fields: epoch US iso US command US name US status US rc US duration US size US message.
+status_valid_lines() {
+    awk 'BEGIN { FS = "\t"; OFS = "\037" }
+    NF >= 8 && $1 ~ /^[0-9]+$/ && length($1) <= 15 && $4 != "" && $3 != "" &&
+    ($5 == "ok" || $5 == "failed" || $5 == "skipped" || $5 == "suspect" || $5 == "locked") &&
+    $6 ~ /^[0-9]+$/ && length($6) <= 15 &&
+    ($7 == "" || ($7 ~ /^[0-9]+$/ && length($7) <= 15)) && ($8 == "" || ($8 ~ /^[0-9]+$/ && length($8) <= 15)) {
+        # numbers are re-printed without leading zeros (007 is not a JSON number)
+        print sprintf("%.0f", $1), $2, $3, $4, $5, sprintf("%.0f", $6), \
+            ($7 == "" ? "" : sprintf("%.0f", $7)), ($8 == "" ? "" : sprintf("%.0f", $8)), $9
+    }' "$1"
+}
+
+# Newest run per name plus the newest success per name.
+# Output: name US epoch US command US status US rc US duration US size US message US okEpoch US goodEpoch
+status_summary_lines() {
+    status_valid_lines "$1" | awk 'BEGIN { FS = "\037"; OFS = "\037" }
+    {
+        n = $4; e = $1 + 0
+        if (!(n in seen) || e >= le[n]) {
+            seen[n] = 1; le[n] = e
+            c[n] = $3; s[n] = $5; r[n] = $6; d[n] = $7; z[n] = $8; m[n] = $9
+        }
+        if ($5 == "ok" && (!(n in oe) || e > oe[n])) oe[n] = e
+        if (($5 == "ok" || $5 == "skipped") && (!(n in ge) || e > ge[n])) ge[n] = e
+    }
+    END {
+        for (n in seen)
+            print n, sprintf("%.0f", le[n]), c[n], s[n], r[n], d[n], z[n], m[n], \
+                  (n in oe) ? sprintf("%.0f", oe[n]) : "", (n in ge) ? sprintf("%.0f", ge[n]) : ""
+    }'
+}
+
+status_load_summary() {
+    STATUS_SUMMARY=""
+    [ -n "$1" ] || return 0
+    STATUS_SUMMARY=$(status_summary_lines "$1")
+}
+
+# Record of one name from STATUS_SUMMARY (empty when the name never ran).
+status_lookup() {
+    [ -n "$STATUS_SUMMARY" ] || return 0
+    printf '%s\n' "$STATUS_SUMMARY" | LOOKUP_NAME="$1" awk -F $'\037' '$1 == ENVIRON["LOOKUP_NAME"] { print; exit }'
+}
+
+# "3h ago" style age. Usage: status_age SECONDS
+status_age() {
+    local s="$1"
+    [ "$s" -lt 0 ] && s=0
+    if [ "$s" -lt 60 ]; then printf '%ss ago' "$s"
+    elif [ "$s" -lt 3600 ]; then printf '%sm ago' $((s / 60))
+    elif [ "$s" -lt 86400 ]; then printf '%sh ago' $((s / 3600))
+    else printf '%sd ago' $((s / 86400))
+    fi
+}
+
+# Distinct base names of dump files found in the output directory (one per line).
+status_dir_bases() {
+    [ -d "$OUTPUT_DIR" ] || return 0
+    local re='^(.+)_[0-9]{8}_[0-9]{6}(_[0-9]+)?\.(tar\.gz|dump(\.zst|\.xz|\.bz2)?)(\.suspect|\.invalid)?$'
+    local f b
+    for f in "$OUTPUT_DIR"/*; do
+        [ -e "$f" ] || continue
+        b="${f##*/}"
+        if [[ "$b" =~ $re ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+        fi
+    done | LC_ALL=C sort -u
+}
+
+# Sets C_KEPT (dumps of exactly this base), C_SUS and C_INV (quarantined files).
+# Usage: status_counts BASE DIR
+status_counts() {
+    local base="$1" dir="$2" f rest
+    local re='^[0-9]{8}_[0-9]{6}(_[0-9]+)?\.(tar\.gz|dump(\.zst|\.xz|\.bz2)?)\.(suspect|invalid)$'
+    local -a kept=()
+    C_KEPT=0; C_SUS=0; C_INV=0
+    [ -d "$dir" ] || return 0
+    kept=()
+    while IFS= read -r f; do [ -n "$f" ] && kept+=("$f"); done < <(list_dumps_for_base "$dir" "$base")
+    C_KEPT=${#kept[@]}
+    for f in "$dir/$base"_*.suspect "$dir/$base"_*.invalid; do
+        [ -e "$f" ] || continue
+        rest="${f##*/}"
+        rest="${rest#"$base"_}"
+        [[ "$rest" =~ $re ]] || continue
+        case "$f" in
+            *.suspect) C_SUS=$((C_SUS + 1)) ;;
+            *)         C_INV=$((C_INV + 1)) ;;
+        esac
+    done
+}
+
+# Dump base name and output directory of a job (same rules as the bot cooldown check).
+status_job_base() {
+    local job="$1" b prof d
+    b=$(get_job_value "$job" "dump_name" 2>/dev/null) || true
+    if [ -z "$b" ]; then
+        prof=$(get_job_field "$job" "from" "profile" 2>/dev/null) || true
+        b=$(get_job_field "$job" "from" "database" 2>/dev/null) || true
+        if [ -z "$b" ] && [ -n "$prof" ]; then
+            b=$(get_profile_value "$prof" "database" 2>/dev/null) || true
+        fi
+    fi
+    [ -z "$b" ] && b="$job"
+    d=$(get_job_value "$job" "output" 2>/dev/null) || true
+    [ -z "$d" ] && d="$OUTPUT_DIR"
+    d="${d/#\~/$HOME}"
+    J_BASE="$b"; J_DIR="$d"
+}
+
+# Job names under "jobs:" in the YAML file.
+status_job_names() {
+    # Same section rules as the other job readers, but a key may also be quoted ("a b",
+    # 'a.b') or contain dots; the printed name is the key without its quotes.
+    awk '
+    /^jobs:/ { found = 1; next }
+    found && /^[^ #\t]/ { exit }
+    found && /^  [^ #\t]/ {
+        s = substr($0, 3); q = substr(s, 1, 1)
+        if (q == "\"" || q == "\047") {
+            s = substr(s, 2); i = index(s, q)
+            if (i == 0) next
+            n = substr(s, 1, i - 1); rest = substr(s, i + 1)
+            if (rest !~ /^[ \t]*:([ \t]|$)/) next
+        } else {
+            if (!match(s, /:([ \t]|$)/)) next
+            n = substr(s, 1, RSTART - 1)
+            sub(/[ \t]+$/, "", n)
+        }
+        if (n != "") print n
+    }' "$1"
+}
+
+# Build one summary row (US separated) into STATUS_ROWS.
+# Fields: name last_run age result command exit duration size kept suspect invalid
+#         last_success last_success_age message stale
+# Usage: status_add_row NAME BASE DIR NOTE_IF_NEVER
+status_add_row() {
+    local name="$1" base="$2" dir="$3" never_note="$4" now="$5"
+    local US=$'\037' rec n e c r rc d z m ok good age="" okage="" stale=false
+    rec=$(status_lookup "$name")
+    e=""
+    if [ -n "$rec" ]; then
+        IFS="$US" read -r n e c r rc d z m ok good <<< "$rec"
+    fi
+    if [ -n "$e" ]; then
+        age=$(( now - e )); [ "$age" -lt 0 ] && age=0
+        [ -n "$ok" ] && { okage=$(( now - ok )); [ "$okage" -lt 0 ] && okage=0; }
+    else
+        c=""; r="never"; rc=""; d=""; z=""; m="$never_note"; ok=""; good=""
+    fi
+    status_counts "$base" "$dir"
+    if [ -n "$STATUS_MAX_AGE_S" ]; then
+        if [ -z "$good" ] || [ $(( now - good )) -gt "$STATUS_MAX_AGE_S" ]; then
+            stale=true
+        fi
+    fi
+    name="${name//[[:cntrl:]]/ }"
+    m="${m//[[:cntrl:]]/ }"
+    STATUS_ROWS+=("${name}${US}${e}${US}${age}${US}${r}${US}${c}${US}${rc}${US}${d}${US}${z}${US}${C_KEPT}${US}${C_SUS}${US}${C_INV}${US}${ok}${US}${okage}${US}${m}${US}${stale}")
+}
+
+# JSON array from US-separated rows on stdin. Usage: status_json KEYS TYPES  (s string,
+# n number-or-null, b boolean); strings are escaped (quote, backslash, control chars).
+status_json() {
+    awk -F $'\037' -v keys="$1" -v types="$2" '
+    BEGIN {
+        nk = split(keys, K, ","); split(types, T, ",")
+        for (i = 1; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
+        esc["\b"] = "\\b"; esc["\f"] = "\\f"; esc["\n"] = "\\n"; esc["\r"] = "\\r"; esc["\t"] = "\\t"
+        first = 1
+        printf "["
+    }
+    function jstr(s,   out, i, ch, n) {
+        out = ""; n = length(s)
+        for (i = 1; i <= n; i++) {
+            ch = substr(s, i, 1)
+            if (ch == "\"") out = out "\\\""
+            else if (ch == "\\") out = out "\\\\"
+            else if (ch in esc) out = out esc[ch]
+            else out = out ch
+        }
+        return "\"" out "\""
+    }
+    {
+        if (!first) printf ","
+        first = 0
+        printf "\n  {"
+        for (i = 1; i <= nk; i++) {
+            v = $i
+            if (T[i] == "s") o = jstr(v)
+            else if (T[i] == "n") o = (v ~ /^[0-9]+$/) ? v : "null"
+            else o = (v == "true") ? "true" : "false"
+            printf "%s\"%s\": %s", (i > 1 ? ", " : ""), K[i], o
+        }
+        printf "}"
+    }
+    END { if (!first) printf "\n"; print "]" }'
+}
+
+# Pad TEXT to WIDTH (display text only; colour is applied by the caller).
+status_pad() { printf '%-*s' "$2" "$1"; }
+
+status_color_for() {
+    case "$1" in
+        ok)      printf '%s' "$GREEN" ;;
+        failed)  printf '%s' "$RED" ;;
+        suspect) printf '%s' "$YELLOW" ;;
+        skipped) printf '%s' "$CYAN" ;;
+        locked)  printf '%s' "$MAGENTA" ;;
+        *)       printf '%s' "$YELLOW" ;;
+    esac
+}
+
+status_print_table() {
+    local US=$'\037' row i
+    local -a H=("NAME" "LAST RUN" "RESULT" "DURATION" "SIZE" "DUMPS KEPT" "NOTE")
+    local -a W=(4 8 6 8 4 10 4)
+    local -a T0=() T1=() T2=() T3=() T4=() T5=() T6=()
+    local name e age r c rc d z kept sus inv ok okage m stale note t
+    for row in "${STATUS_ROWS[@]}"; do
+        IFS="$US" read -r name e age r c rc d z kept sus inv ok okage m stale <<< "$row"
+        if [ -n "$e" ]; then t=$(status_age "$age"); else t="-"; fi
+        note=""
+        case "$r" in
+            failed|suspect|locked)
+                if [ -n "$okage" ]; then note="last ok $(status_age "$okage")"; else note="no success on record"; fi
+                [ -n "$m" ] && note="$note; $m"
+                ;;
+            skipped) [ -n "$m" ] && note="$m" ;;
+            never)   [ -n "$m" ] && note="$m" ;;
+        esac
+        if [ "$sus" -gt 0 ]; then note="${note:+$note; }${sus} .suspect file(s)"; fi
+        if [ "$inv" -gt 0 ]; then note="${note:+$note; }${inv} .invalid file(s)"; fi
+        if [ "$stale" = true ]; then note="${note:+$note; }STALE (no success within ${STATUS_MAX_AGE})"; fi
+        T0+=("$name"); T1+=("$t"); T2+=("$r")
+        if [ -n "$d" ]; then T3+=("$(format_elapsed "$d")"); else T3+=("-"); fi
+        if [ -n "$z" ]; then T4+=("$(human_bytes "$z")"); else T4+=("-"); fi
+        T5+=("$kept"); T6+=("$note")
+    done
+    for i in "${!T0[@]}"; do
+        [ "${#T0[i]}" -gt "${W[0]}" ] && W[0]=${#T0[i]}
+        [ "${#T1[i]}" -gt "${W[1]}" ] && W[1]=${#T1[i]}
+        [ "${#T2[i]}" -gt "${W[2]}" ] && W[2]=${#T2[i]}
+        [ "${#T3[i]}" -gt "${W[3]}" ] && W[3]=${#T3[i]}
+        [ "${#T4[i]}" -gt "${W[4]}" ] && W[4]=${#T4[i]}
+    done
+    printf '%s  %s  %s  %s  %s  %s  %s\n' \
+        "$(status_pad "${H[0]}" "${W[0]}")" "$(status_pad "${H[1]}" "${W[1]}")" "$(status_pad "${H[2]}" "${W[2]}")" \
+        "$(status_pad "${H[3]}" "${W[3]}")" "$(status_pad "${H[4]}" "${W[4]}")" "${H[5]}" "${H[6]}"
+    for i in "${!T0[@]}"; do
+        printf '%s  %s  %b%s%b  %s  %s  %s  %s\n' \
+            "$(status_pad "${T0[i]}" "${W[0]}")" "$(status_pad "${T1[i]}" "${W[1]}")" \
+            "$(status_color_for "${T2[i]}")" "$(status_pad "${T2[i]}" "${W[2]}")" "$NC" \
+            "$(status_pad "${T3[i]}" "${W[3]}")" "$(status_pad "${T4[i]}" "${W[4]}")" \
+            "$(status_pad "${T5[i]}" 10)" "${T6[i]}"
+    done
+}
+
+# --limit N: the last N runs of one name, newest first.
+status_history_view() {
+    local file="$1" now="$2" US=$'\037' line i
+    local -a lines=() rows=()
+    if [ -n "$file" ]; then
+        while IFS= read -r line; do
+            lines+=("$line")
+        done < <(status_valid_lines "$file" | \
+            NAME_FILTER="$STATUS_NAME" awk 'BEGIN { FS = "\037" } $4 == ENVIRON["NAME_FILTER"]' | tail -n "$STATUS_LIMIT")
+    fi
+    for (( i = ${#lines[@]} - 1; i >= 0; i-- )); do
+        rows+=("${lines[i]}")
+    done
+    if [ "$STATUS_JSON" = true ]; then
+        if [ "${#rows[@]}" -eq 0 ]; then echo "[]"; return 0; fi
+        printf '%s\n' "${rows[@]}" | status_json "epoch,time,command,name,result,exit_code,duration_s,size_bytes,message" "n,s,s,s,s,n,n,n,s"
+        return 0
+    fi
+    if [ "${#rows[@]}" -eq 0 ]; then
+        echo "No runs recorded for: ${STATUS_NAME//[[:cntrl:]]/ }"
+        return 0
+    fi
+    local e iso c n s rc d z m
+    printf '%-20s  %-8s  %-8s  %-4s  %-9s  %-9s  %s\n' "WHEN (UTC)" "COMMAND" "RESULT" "EXIT" "DURATION" "SIZE" "MESSAGE"
+    for line in "${rows[@]}"; do
+        IFS="$US" read -r e iso c n s rc d z m <<< "$line"
+        local dd="-" zz="-"
+        [ -n "$d" ] && dd=$(format_elapsed "$d")
+        [ -n "$z" ] && zz=$(human_bytes "$z")
+        printf '%-20s  %-8s  %b%-8s%b  %-4s  %-9s  %-9s  %s\n' \
+            "${iso//[[:cntrl:]]/ }" "${c//[[:cntrl:]]/ }" "$(status_color_for "$s")" "$s" "$NC" "$rc" "$dd" "$zz" "${m//[[:cntrl:]]/ }"
+    done
+}
+
+# ------------------------------------------------------------------------------
+# status command
+# Exit status: 0 report printed (and, with --max-age, every name is fresh);
+#              2 usage error; 3 --max-age given and some name has no fresh success.
+# ------------------------------------------------------------------------------
+STATUS_MAX_AGE_S=""
+cmd_status() {
+    local num unit
+    # status reads the history with bash 4+ features; an older shell must not print a wrong
+    # "No runs recorded yet." (a monitoring check would trust it), so it refuses instead.
+    if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+        log_error "status needs bash 4 or newer (this is bash ${BASH_VERSION:-unknown})"
+        return 2
+    fi
+    STATUS_MAX_AGE_S=""
+    if [ -n "$STATUS_MAX_AGE" ]; then
+        # Same units as the bot's duration parser (h, m, d; case-insensitive) plus s; a bare
+        # number is seconds. The digits are normalised first so 08h is not read as octal.
+        if ! [[ "$STATUS_MAX_AGE" =~ ^[0-9]{1,9}[smhdSMHD]?$ ]]; then
+            log_error "Invalid --max-age '$STATUS_MAX_AGE' (use seconds or a number with a unit: 90, 90s, 30m, 26h, 2d)"
+            return 2
+        fi
+        num="${STATUS_MAX_AGE%[smhdSMHD]}"
+        unit="$(printf '%s' "${STATUS_MAX_AGE#"$num"}" | tr '[:upper:]' '[:lower:]')"
+        num=$((10#$num))
+        case "$unit" in
+            ""|s) STATUS_MAX_AGE_S=$num ;;
+            *)    STATUS_MAX_AGE_S=$(parse_time_to_seconds "${num}${unit}") ;;
+        esac
+    fi
+    if [ -n "$STATUS_LIMIT" ]; then
+        if ! [[ "$STATUS_LIMIT" =~ ^[1-9][0-9]{0,5}$ ]]; then
+            log_error "Invalid --limit '$STATUS_LIMIT' (expected a positive integer)"
+            return 2
+        fi
+        if [ -z "$STATUS_NAME" ]; then
+            log_error "--limit needs --name NAME (it shows the last runs of one name)"
+            return 2
+        fi
+        if [ -n "$STATUS_MAX_AGE" ]; then
+            log_error "--max-age cannot be combined with --limit"
+            return 2
+        fi
+    fi
+    if [ "$STATUS_YAML_SET" = true ] && [ ! -f "$JOBS_FILE" ]; then
+        log_error "Jobs file not found: $JOBS_FILE"
+        return 2
+    fi
+
+    local now file
+    now=$(date +%s)
+    file=$(status_history_file)
+
+    if [ -n "$STATUS_LIMIT" ]; then
+        status_history_view "$file" "$now"
+        return 0
+    fi
+
+    status_load_summary "$file"
+    STATUS_ROWS=()
+    local n job
+    if [ "$STATUS_YAML_SET" = true ]; then
+        while IFS= read -r job; do
+            [ -n "$job" ] || continue
+            [ -n "$STATUS_NAME" ] && [ "$job" != "$STATUS_NAME" ] && continue
+            status_job_base "$job"
+            status_add_row "$job" "$J_BASE" "$J_DIR" "" "$now"
+        done < <(status_job_names "$JOBS_FILE")
+    else
+        local -a sorted=()
+        while IFS= read -r n; do sorted+=("$n"); done < <({
+            [ -n "$STATUS_SUMMARY" ] && printf '%s\n' "$STATUS_SUMMARY" | awk -F $'\037' '{ print $1 }'
+            status_dir_bases
+            [ -n "$STATUS_NAME" ] && printf '%s\n' "$STATUS_NAME"
+        } | LC_ALL=C sort -u)
+        for n in "${sorted[@]}"; do
+            [ -n "$n" ] || continue
+            [ -n "$STATUS_NAME" ] && [ "$n" != "$STATUS_NAME" ] && continue
+            status_add_row "$n" "$n" "$OUTPUT_DIR" "no recorded run" "$now"
+        done
+    fi
+
+    local stale_count=0 row
+    for row in "${STATUS_ROWS[@]}"; do
+        [ "${row##*$'\037'}" = true ] && stale_count=$((stale_count + 1))
+    done
+    # --max-age with nothing to check must not pass silently in a monitoring check.
+    if [ -n "$STATUS_MAX_AGE_S" ] && [ "${#STATUS_ROWS[@]}" -eq 0 ]; then
+        stale_count=1
+    fi
+
+    if [ "$STATUS_JSON" = true ]; then
+        if [ "${#STATUS_ROWS[@]}" -eq 0 ]; then
+            echo "[]"
+        else
+            printf '%s\n' "${STATUS_ROWS[@]}" | status_json \
+                "name,last_run,age_s,result,command,exit_code,duration_s,size_bytes,dumps_kept,suspect_files,invalid_files,last_success,last_success_age_s,message,stale" \
+                "s,n,n,s,s,n,n,n,n,n,n,n,n,s,b"
+        fi
+    elif [ "${#STATUS_ROWS[@]}" -eq 0 ]; then
+        echo "No runs recorded yet."
+    else
+        status_print_table
+    fi
+
+    [ "$stale_count" -gt 0 ] && return 3
+    return 0
 }
 # ==============================================================================
 # BATCH SYSTEM
@@ -4889,6 +6232,10 @@ parse_job_to_args() {
     [ -n "$(get_job_value "$job" "bwlimit")" ] && args+=" --bwlimit $(pq "$(get_job_value "$job" "bwlimit")")"
     [ -n "$(get_job_value "$job" "retries")" ] && args+=" --retries $(pq "$(get_job_value "$job" "retries")")"
 
+    # Run lock options
+    [ -n "$(get_job_value "$job" "lock_wait")" ] && args+=" --lock-wait $(pq "$(get_job_value "$job" "lock_wait")")"
+    [ "$(get_job_value "$job" "no_lock")" = "true" ] && args+=" --no-lock"
+
     # Health check options
     [ "$(get_job_value "$job" "health_check")" = "true" ] && args+=" --health-check"
     [ "$(get_job_value "$job" "health_check_after")" = "true" ] && args+=" --health-check-after"
@@ -4996,11 +6343,16 @@ save_job() {
         args="$args --notify $(pq "$n")"
     done
     [ "$NOTIFY_ON_ERROR" = true ] && args="$args --notify-on-error"
+    [ -n "$PING_URL" ] && args="$args --ping $(pq "$PING_URL")"
+    [ -n "$PING_START_URL" ] && args="$args --ping-start $(pq "$PING_START_URL")"
+    [ -n "$PING_FAIL_URL" ] && args="$args --ping-fail $(pq "$PING_FAIL_URL")"
 
     # Batch job filters
     [ -n "$ONLY_JOBS" ] && args="$args --only $(pq "$ONLY_JOBS")"
     [ -n "$EXCLUDE_JOBS" ] && args="$args --exclude $(pq "$EXCLUDE_JOBS")"
 
+    [ "$LOCK_WAIT" != 0 ] && args="$args --lock-wait $(pq "$LOCK_WAIT")"
+    [ "$NO_LOCK" = true ] && args="$args --no-lock"
     [ "$SUDO" = true ] && args="$args --sudo"
     [ "$FORCE" = true ] && args="$args --force"
     [ "$VERBOSE" = true ] && args="$args --verbose"
@@ -5120,7 +6472,7 @@ show_job() {
     echo -e "${CYAN}Arguments:${NC}"
 
     # Parse and display args nicely (handle quoted values)
-    echo "$job_args" | sed "s/' --/'\n--/g" | while read -r arg; do
+    echo "$(redact_notify_args "$job_args")" | sed "s/' --/'\n--/g" | while read -r arg; do
         [ -n "$arg" ] && echo -e "  ${GREEN}${arg}${NC}"
     done
     echo ""
@@ -5177,7 +6529,7 @@ _JOB_KNOWN_KEYS=" command args from to password from_password to_password from_p
  archive_output archive_keep from_stale skip_if_recent exclude_table exclude_data exclude_schema
  only_table only_schema compress compress_level pg_compress_level compress_where stream_buffer bwlimit
  retries health_check health_check_after no_health_check health_check_fail retention retention_daily
- retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level "
+ retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level ping ping_start ping_fail lock_wait no_lock "
 
 # Warn (once per key) about job keys the tool does not know, naming the closest valid key
 # when it is just a hyphen/underscore or case difference. Warning only, never an error.
@@ -5237,6 +6589,14 @@ run_job() {
     if [ "$DRY_RUN" = true ] && [[ "$job_args" != *"--dry-run"* ]]; then
         job_args="$job_args --dry-run"
     fi
+    # Same for the lock options given to batch on the command line (a later option wins in
+    # the child, so these override the job's own lock_wait / no_lock keys).
+    if [ "$LOCK_WAIT_SET" = true ]; then
+        job_args="$job_args --lock-wait $(pq "$LOCK_WAIT")"
+    fi
+    if [ "$NO_LOCK" = true ] && [[ "$job_args" != *"--no-lock"* ]]; then
+        job_args="$job_args --no-lock"
+    fi
 
     # Read inline passwords to hand to the child via the ENVIRONMENT (not argv, so they stay
     # off the child's process argv / ps). Empty values are treated as unset by get_password.
@@ -5244,6 +6604,15 @@ run_job() {
     _pw_both=$(get_job_value "$job_name" "password")
     _pw_from=$(get_job_field "$job_name" "from" "password"); [ -z "$_pw_from" ] && _pw_from=$(get_job_value "$job_name" "from_password")
     _pw_to=$(get_job_field "$job_name" "to" "password");     [ -z "$_pw_to" ]   && _pw_to=$(get_job_value "$job_name" "to_password")
+
+    # A legacy "args:" job (what --save writes) carries --ping/--ping-start/--ping-fail in its
+    # argument string; the URLs are a secret, so they move to the environment hand-over below
+    # (like the "ping:" keys) instead of staying on the child's command line.
+    ping_extract_args "$job_args"
+    job_args="$_PA_ARGS"
+    local _ping_url="${_PA_URL:-$(get_job_value "$job_name" "ping")}"
+    local _ping_start="${_PA_START:-$(get_job_value "$job_name" "ping_start")}"
+    local _ping_fail="${_PA_FAIL:-$(get_job_value "$job_name" "ping_fail")}"
 
     log_info "Running job: $job_name"
     log_debug "Command: $job_cmd $(redact_notify_args "$(redact_args "$job_args")")"
@@ -5262,6 +6631,9 @@ run_job() {
     # Fall back to any INHERITED T_PGSQL_*_PASSWORD when the job has none, so a passwordless
     # job does not get an empty assignment that would shadow the documented ambient env var.
     T_PGSQL_NOTIFY_SPECS="$_notify_specs" \
+    T_PGSQL_PING_URL="$_ping_url" \
+    T_PGSQL_PING_START_URL="$_ping_start" \
+    T_PGSQL_PING_FAIL_URL="$_ping_fail" \
     T_PGSQL_PASSWORD="${_pw_both:-$T_PGSQL_PASSWORD}" \
     T_PGSQL_FROM_PASSWORD="${_pw_from:-$T_PGSQL_FROM_PASSWORD}" \
     T_PGSQL_TO_PASSWORD="${_pw_to:-$T_PGSQL_TO_PASSWORD}" \
@@ -5420,6 +6792,7 @@ cmd_batch() {
         local total=$(echo "$jobs" | wc -w | tr -d ' ')
         local current=0
         local failed=0
+        local skipped=0
         local finished=0
         if [ "$PARALLEL" -gt 1 ]; then
             # Parallel execution
@@ -5452,6 +6825,9 @@ cmd_batch() {
 
                             if [ "$exit_code" -eq 0 ]; then
                                 log_success "[${completed}/${total}] Completed: ${job_names[$i]}"
+                            elif [ "$exit_code" -eq 75 ]; then
+                                log_warn "[${completed}/${total}] Skipped (locked): ${job_names[$i]}"
+                                skipped=$((skipped + 1))
                             else
                                 log_error "[${completed}/${total}] Failed: ${job_names[$i]}"
                                 show_failed_job_output "$temp_dir/${job_names[$i]}.log" "${job_names[$i]}"
@@ -5490,6 +6866,9 @@ cmd_batch() {
 
                 if [ "$exit_code" -eq 0 ]; then
                     log_success "[${completed}/${total}] Completed: ${job_names[$i]}"
+                elif [ "$exit_code" -eq 75 ]; then
+                    log_warn "[${completed}/${total}] Skipped (locked): ${job_names[$i]}"
+                    skipped=$((skipped + 1))
                 else
                     log_error "[${completed}/${total}] Failed: ${job_names[$i]}"
                     show_failed_job_output "$temp_dir/${job_names[$i]}.log" "${job_names[$i]}"
@@ -5513,6 +6892,9 @@ cmd_batch() {
 
                 if run_job "$job"; then
                     log_success "[$current/$total] Completed: $job"
+                elif [ $? -eq 75 ]; then
+                    log_warn "[$current/$total] Skipped (locked): $job"
+                    skipped=$((skipped + 1))
                 else
                     log_error "[$current/$total] Failed: $job"
                     failed=$((failed + 1))
@@ -5526,7 +6908,11 @@ cmd_batch() {
         fi
 
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        if [ $failed -eq 0 ]; then
+        if [ $failed -eq 0 ] && [ $skipped -gt 0 ] && [ $((finished - skipped)) -le 0 ]; then
+            log_warn "All $skipped of $total jobs were skipped (locked: another run was already working on the same targets); nothing ran"
+        elif [ $failed -eq 0 ] && [ $skipped -gt 0 ]; then
+            log_warn "No job failed; $skipped of $total skipped (locked: another run was already working on the same target)"
+        elif [ $failed -eq 0 ]; then
             log_success "All $total jobs completed successfully"
         else
             log_warn "$failed of $total jobs failed"
@@ -5543,11 +6929,18 @@ cmd_batch() {
             if [ ${#NOTIFY[@]} -gt 0 ]; then
                 local status="success"
                 [ $failed -gt 0 ] && status="failed"
+                # Every job skipped by the run lock: nothing was backed up, so this is not a success
+                local _title="Batch completed: $total jobs"
+                if [ $failed -eq 0 ] && [ $skipped -gt 0 ] && [ $((finished - skipped)) -le 0 ]; then
+                    status="warning"
+                    _title="Batch skipped: all $total jobs were skipped (locked)"
+                fi
                 local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
-                local summary="Completed: $((finished - failed))/$total"$'\n'"Failed: $failed"
+                local summary="Completed: $((finished - failed - skipped))/$total"$'\n'"Failed: $failed"
+                [ "$skipped" -gt 0 ] && summary+=$'\n'"Skipped (locked): $skipped"
                 [ "$finished" -lt "$total" ] && summary+=$'\n'"Not run: $((total - finished))"
                 summary+=$'\n'"Duration: $elapsed"
-                send_notification "$status" "Batch completed: $total jobs" "$summary"
+                send_notification "$status" "$_title" "$summary"
             fi
             NOTIFY=("${_saved_notify[@]}")
         fi
@@ -6636,6 +8029,9 @@ parse_args() {
             --notify-on-error) NOTIFY_ON_ERROR=true; shift ;;
             --token) BOT_TOKEN="$2"; shift 2 || _need_val "$1" ;;
             --cooldown) BOT_COOLDOWN="$2"; shift 2 || _need_val "$1" ;;
+            --ping) PING_URL="$2"; shift 2 || _need_val "$1" ;;
+            --ping-start) PING_START_URL="$2"; shift 2 || _need_val "$1" ;;
+            --ping-fail) PING_FAIL_URL="$2"; shift 2 || _need_val "$1" ;;
 
             --mask) MASK=true; shift ;;
             --mask-rules) MASK_RULES="$2"; shift 2 || _need_val "$1" ;;
@@ -6649,6 +8045,8 @@ parse_args() {
             --pg-bindir) PG_BINDIR="$2"; shift 2 || _need_val "$1" ;;
             --bwlimit) BWLIMIT="$2"; shift 2 || _need_val "$1" ;;
             --retries) RETRIES="$2"; shift 2 || _need_val "$1" ;;
+            --lock-wait) LOCK_WAIT="$2"; LOCK_WAIT_SET=true; shift 2 || _need_val "$1" ;;
+            --no-lock) NO_LOCK=true; shift ;;
 
             --parallel) PARALLEL="$2"; PARALLEL_SET=true; shift 2 || _need_val "$1" ;;
             --continue-on-error) CONTINUE_ON_ERROR=true; CONTINUE_ON_ERROR_SET=true; shift ;;
@@ -6660,6 +8058,7 @@ parse_args() {
             --save) SAVE_JOB="$2"; shift 2 || _need_val "$1" ;;
             --batch) BATCH_JOB="$2"; shift 2 || _need_val "$1" ;;
             --yaml)
+                STATUS_YAML_SET=true
                 if [[ "$2" == *".yaml" ]]; then
                     # Already has .yaml extension
                     JOBS_FILE="$2"
@@ -6682,10 +8081,14 @@ parse_args() {
             -f|--force) FORCE=true; shift ;;
             --dry-run) DRY_RUN=true; shift ;;
             --no-meta) META_ENABLED=false; shift ;;
+            --name) STATUS_NAME="$2"; shift 2 || _need_val "$1" ;;
+            --limit) STATUS_LIMIT="$2"; shift 2 || _need_val "$1" ;;
+            --max-age) STATUS_MAX_AGE="$2"; shift 2 || _need_val "$1" ;;
+            --json) STATUS_JSON=true; shift ;;
             -h|--help) show_help; exit 0 ;;
             --version) show_version; exit 0 ;;
 
-            *) log_error "Unknown: $1"; exit 1 ;;
+            *) log_error "Unknown: $1"; [ "$COMMAND" = status ] && exit 2; exit 1 ;;
         esac
     done
 }
@@ -6712,6 +8115,7 @@ main() {
     install_cleanup_trap
     parse_args "$@"
     [ -n "$_umask_warn" ] && log_warn "$_umask_warn"
+    ping_reject_for_batch || exit 1
 
     # Notification specs handed over by a parent job run (run_job sets T_PGSQL_NOTIFY_SPECS
     # for its re-exec'd child). This is an INTERNAL variable, not a user option: it holds
@@ -6724,6 +8128,13 @@ main() {
         done <<< "$T_PGSQL_NOTIFY_SPECS"
     fi
     unset T_PGSQL_NOTIFY_SPECS
+
+    # Heartbeat URLs handed over by a parent job run (they may hold a secret token, so they
+    # travel in the environment, not on argv). Command line / config values win.
+    [ -z "$PING_URL" ] && PING_URL="${T_PGSQL_PING_URL:-}"
+    [ -z "$PING_START_URL" ] && PING_START_URL="${T_PGSQL_PING_START_URL:-}"
+    [ -z "$PING_FAIL_URL" ] && PING_FAIL_URL="${T_PGSQL_PING_FAIL_URL:-}"
+    unset T_PGSQL_PING_URL T_PGSQL_PING_START_URL T_PGSQL_PING_FAIL_URL
 
     # Use a specific PostgreSQL client version if requested (affects all LOCAL
     # pg_dump/pg_restore/psql/createdb/pg_dumpall calls; not SSH-remote ones).
@@ -6811,6 +8222,11 @@ main() {
         fi
     fi
 
+    # Heartbeat URLs must be http(s); checked for the work commands and --save only.
+    case "${SAVE_JOB:+save} $COMMAND" in
+        save*|*" dump"|*" restore"|*" clone"|*" upgrade"|*" fetch") ping_validate || exit 1 ;;
+    esac
+
     # Handle --save: save current command as a job
     if [ -n "$SAVE_JOB" ]; then
         save_job "$SAVE_JOB" "$COMMAND"
@@ -6830,6 +8246,13 @@ main() {
         fi
     fi
 
+    # Run lock: a run that targets what another run is writing is skipped (exit 75). The
+    # history is armed first so a skipped run leaves a "locked" line (no ping, no notice).
+    history_begin   # arms the run-history line (work commands only; see 74-status.sh)
+    lock_acquire_command || exit $?
+
+    ping_begin
+
     case "$COMMAND" in
         dump)    cmd_dump;    notify_unreported_failure $? dump ;;
         restore) cmd_restore; notify_unreported_failure $? restore ;;
@@ -6842,6 +8265,7 @@ main() {
         meta)    cmd_meta ;;
         clean)   cmd_clean ;;
         doctor)  cmd_doctor ;;
+        status)  cmd_status ;;
         explain) cmd_explain ;;
         jobs)
             case "$JOBS_ACTION" in

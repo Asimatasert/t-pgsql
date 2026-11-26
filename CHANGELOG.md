@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Heartbeat ping (dead-man's switch)** for `dump`, `clone`, `restore`, `upgrade` and
+  `fetch`: `--ping <url>` sends `<url>/start`, then `<url>` on success or `<url>/fail`
+  on any failure; `--ping-start` / `--ping-fail` set explicit URLs (Uptime Kuma style).
+  Also available as `ping`, `ping_start`, `ping_fail` in `--config` files, job YAML and
+  `defaults:`. URLs are passed to curl on stdin and masked in logs and `jobs show`;
+  a failed ping only warns. `T_PGSQL_PING_DISABLE=1` turns pings off.
+- **Run history and `status` command**: every `dump`, `clone`, `restore`, `upgrade` and
+  `fetch` run appends a line to `history.tsv` in the state directory
+  (`T_PGSQL_STATE_DIR`, default `${XDG_STATE_HOME:-$HOME/.local/state}/t-pgsql`).
+  `t-pgsql status [--yaml FILE] [--output DIR] [--name NAME] [--limit N] [--json]` shows
+  the last run per job; `status --max-age DURATION` exits 3 when a listed job has no
+  fresh successful run, for cron monitoring.
+- **Run lock**: `dump`, `fetch`, `restore`, `clone` and `upgrade` take a lock per output
+  directory + dump name / per target database, so overlapping runs cannot collide.
+  `--lock-wait <seconds>` waits for a held lock, `--no-lock` disables it (`lock_wait`,
+  `no_lock` in config and job YAML); stale locks are taken over (`T_PGSQL_LOCK_MAX_AGE`).
+- `explain status`, `explain ping`, `explain lock`; man page, completions, README and
+  `jobs.yaml.example` cover the new commands and options.
+
+### Changed
+- A run skipped because another run holds the lock exits **75** (EX_TEMPFAIL) instead of
+  failing; it sends no failure notification and no ping, and is recorded in the history as
+  `locked`. In `batch` such a job is `Skipped (locked)` and does not count as failed.
+- A batch where every job was skipped by the lock reports "All N of M jobs were skipped
+  (locked); nothing ran" and sends a warning notification, never a success notification.
+- `batch --lock-wait N` and `batch --no-lock` are forwarded to every job the batch starts.
+- `batch` rejects `--ping`, `--ping-start` and `--ping-fail` (exit 1); put `ping:` on the
+  job in the jobs file instead.
+- `status --max-age` accepts a bare number (seconds) and upper-case units (`1D`); only
+  `ok` and `--skip-if-recent` skipped runs count as fresh, `failed`, `suspect` and
+  `locked` runs do not. An unknown `status` option exits 2.
+- `jobs show` also masks `--notify` values in legacy `args:`.
+
+### Fixed
+- With `--ping` the run history line is now written (the ping setup no longer replaces
+  the exit handler).
+- History messages no longer contain passwords, URLs or `user@host` words; messages are
+  cut by bytes, so the file stays valid UTF-8.
+- `status` on bash older than 4 prints `status needs bash 4 or newer` and exits 2 instead
+  of reporting "No runs recorded yet."; `status --yaml` lists job names with dots or quotes.
+- Ping URLs: `/start` and `/fail` go before a `#fragment`; `HTTPS://` is accepted; a bad
+  URL is not an error under `--dry-run` or `T_PGSQL_PING_DISABLE=1`; a dump without
+  `--from` no longer sends a start ping; legacy `args:` jobs no longer expose the ping URL
+  on the child command line.
+- Run lock: a lost take-over race no longer runs unlocked, pid reuse and host identity
+  checks are stricter, and the take-over mutex is only stolen from a dead owner.
+
 ## [3.13.0] - 2026-11-26
 
 ### Added

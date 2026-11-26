@@ -4,7 +4,7 @@ _t_pgsql() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="dump restore clone upgrade fetch batch bot jobs list meta clean doctor explain version help"
+    local commands="dump restore clone upgrade fetch batch bot jobs list meta clean doctor status explain version help"
 
     local opts="
         --from --to
@@ -26,6 +26,8 @@ _t_pgsql() {
         --sudo --globals --pg-bindir --bwlimit --retries --parallel --continue-on-error
         --only-jobs --exclude-jobs --only --exclude
         --save --batch
+        --ping --ping-start --ping-fail --lock-wait --no-lock
+        --name --limit --max-age --json
         --log --log-level
         --verbose --quiet --yes --force --dry-run --no-meta
         --help --version
@@ -76,6 +78,14 @@ _t_pgsql() {
             _filedir -d
             return
             ;;
+        --max-age)
+            COMPREPLY=($(compgen -W "1h 6h 12h 26h 1d 2d" -- "$cur"))
+            return
+            ;;
+        --lock-wait)
+            COMPREPLY=($(compgen -W "0 30 60 300" -- "$cur"))
+            return
+            ;;
         --batch)
             # Resolve the jobs.yaml next to the installed t-pgsql script
             local script_path jobs_file jobs=""
@@ -98,7 +108,7 @@ _t_pgsql() {
 
     # Explain topics
     if [[ ${words[1]} == "explain" && $cword -eq 2 && $cur != -* ]]; then
-        COMPREPLY=($(compgen -W "dump restore clone stream upgrade fetch batch jobs bot list meta clean doctor masking retention" -- "$cur"))
+        COMPREPLY=($(compgen -W "dump restore clone stream upgrade fetch batch jobs bot list meta clean doctor status ping lock masking retention" -- "$cur"))
         return
     fi
 

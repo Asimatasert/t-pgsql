@@ -64,7 +64,7 @@ mask_notify_spec() {
 
 # Mask the value of every --notify option in an argument string (for debug logs).
 redact_notify_args() {
-    printf '%s' "$1" | sed -E "s/(--notify[[:space:]]+['\"]?[A-Za-z]+:)[^[:space:]'\"]*/\1***/g"
+    printf '%s' "$1" | sed -E "s/(--notify[[:space:]]+['\"]?[A-Za-z]+:)[^[:space:]'\"]*/\1***/g; s#(--ping(-start|-fail)?[[:space:]]+['\"]?[Hh][Tt][Tt][Pp]([Ss])?://)([^/?#\\[:space:]'\"]*@)?([^/?#\\[:space:]'\"]*)[^[:space:]'\"]*#\\1\\5/***#g"
 }
 
 send_notification() {

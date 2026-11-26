@@ -20,8 +20,9 @@ _explain_overview() {
     echo -e "  ${CYAN}bot${NC}       Telegram bot to trigger/monitor backups from a chat"
     echo -e "  ${CYAN}list${NC} / ${CYAN}meta${NC} / ${CYAN}clean${NC}   Inspect dumps, show metadata, prune old dumps"
     echo -e "  ${CYAN}doctor${NC}    Check the environment and backup health"
+    echo -e "  ${CYAN}status${NC}    Last run of each job from the run history; stale-backup check"
     echo
-    echo -e "  Extra topics: ${CYAN}stream${NC}, ${CYAN}masking${NC}, ${CYAN}retention${NC}"
+    echo -e "  Extra topics: ${CYAN}ping${NC}, ${CYAN}lock${NC}, ${CYAN}stream${NC}, ${CYAN}masking${NC}, ${CYAN}retention${NC}"
     echo
     echo -e "Run ${BOLD}t-pgsql explain <topic>${NC} for details, e.g. ${BOLD}t-pgsql explain clone${NC}."
 }
@@ -231,6 +232,86 @@ _explain_doctor() {
     _ex_see "explain list"
 }
 
+_explain_status() {
+    _ex_title "status" "last run of each job, and a stale-backup check"
+    _ex_sec "What it does"
+    echo "  dump, clone, restore, upgrade and fetch append one line per run to a history"
+    echo "  file (<state dir>/history.tsv). 'status' reads it and prints, per name, the"
+    echo "  last run, result (ok, failed, suspect, skipped, locked, never), duration,"
+    echo "  size and how many dumps are kept. It is read-only and creates nothing."
+    echo "  Error messages in the history are shortened and stripped of passwords/URLs."
+    echo
+    _ex_sec "Monitoring check"
+    echo "  --max-age <time> turns it into a check: exit 3 if a listed name has no"
+    echo "  successful run within <time> (26h, 90m, 1d; a bare number is seconds), has"
+    echo "  never run, or nothing is listed. Only ok and skipped (--skip-if-recent) count"
+    echo "  as fresh; failed, suspect and locked runs do not. Exit 2 is a usage error."
+    echo
+    _ex_sec "Key options"
+    echo "  --yaml <file>          list exactly the jobs of this jobs file"
+    echo "  --output <dir>         dump directory (counts dumps, .suspect, .invalid)"
+    echo "  --name <name>          only this name; with --limit <N> the last N runs"
+    echo "  --json                 machine-readable output"
+    echo
+    _ex_sec "Examples"
+    echo "  t-pgsql status --yaml jobs.yaml"
+    echo "  t-pgsql status --yaml jobs.yaml --max-age 26h --json >/dev/null || alert"
+    echo "  t-pgsql status --name nightly --limit 10"
+    _ex_see "explain lock · explain ping · explain batch"
+}
+
+_explain_ping() {
+    _ex_title "--ping" "heartbeat to a monitoring service (dead-man's switch)"
+    _ex_sec "What it does"
+    echo "  Sends an HTTP POST to a monitor (healthchecks.io, Uptime Kuma push, ...):"
+    echo "  <url>/start when a run starts, <url> on success, <url>/fail on any failure."
+    echo "  If the monitor hears nothing, it alerts - which also covers a host that is"
+    echo "  down or a cron job that never started. Applies to dump, clone, restore,"
+    echo "  upgrade and fetch; never to --dry-run, batch, list, doctor or status."
+    echo
+    _ex_sec "Key options"
+    echo "  --ping <url>           base URL (http:// or https:// only)"
+    echo "  --ping-start <url>     explicit start URL (wins over <url>/start)"
+    echo "  --ping-fail <url>      explicit failure URL (wins over <url>/fail)"
+    echo "  Without --ping, only start and failure pings are sent."
+    echo
+    _ex_sec "Good to know"
+    echo "  • A run skipped by the lock (exit 75) sends no ping at all"
+    echo "  • A ping that cannot be delivered only warns; it never changes the exit code"
+    echo "  • batch takes no --ping; set ping: on the job in the jobs file instead"
+    echo "  • T_PGSQL_PING_DISABLE=1 turns all pings off"
+    echo
+    _ex_sec "Example"
+    echo "  t-pgsql dump --from \"postgres@localhost/appdb\" --ping https://hc.example.com/ping/UUID"
+    _ex_see "explain status · explain lock"
+}
+
+_explain_lock() {
+    _ex_title "run lock" "never run the same backup twice at once"
+    _ex_sec "What it does"
+    echo "  dump, fetch, restore, clone and upgrade take a lock before working: dump and"
+    echo "  fetch lock the output directory + dump name, restore/clone/upgrade lock each"
+    echo "  --to database. If another run holds it, this run prints a warning and exits"
+    echo "  with status 75 (skipped, not a failure: no failure notification, no ping)."
+    echo
+    _ex_sec "Key options"
+    echo "  --lock-wait <seconds>  wait up to N seconds for the lock before skipping (default 0)"
+    echo "  --no-lock              take no lock"
+    echo "  T_PGSQL_LOCK_MAX_AGE   locks older than this many seconds are stale (default 86400)"
+    echo "  T_PGSQL_STATE_DIR      where locks/ and history.tsv live"
+    echo
+    _ex_sec "Good to know"
+    echo "  • A crashed run's lock is taken over by the next run (dead owner, reused pid or too old)"
+    echo "  • Released on every exit path, including Ctrl-C and SIGTERM"
+    echo "  • In a batch a locked job is 'Skipped (locked)' and does not stop the batch"
+    echo "  • If the state directory is unusable, the run continues without a lock"
+    echo "  • Cron wrappers should treat exit 75 as success or retry later"
+    echo
+    _ex_sec "Example"
+    echo "  t-pgsql dump --from \"postgres@localhost/appdb\" --lock-wait 120"
+    _ex_see "explain status · explain ping · explain batch"
+}
+
 _explain_mask() {
     _ex_title "masking" "anonymize sensitive data after restore"
     _ex_sec "What it does"
@@ -280,6 +361,9 @@ cmd_explain() {
         bot|telegram)           _explain_bot ;;
         list|meta|clean)        _explain_maint ;;
         doctor)                 _explain_doctor ;;
+        status|history)         _explain_status ;;
+        ping|heartbeat)         _explain_ping ;;
+        lock|locking)           _explain_lock ;;
         mask|masking)           _explain_mask ;;
         retention|gfs)          _explain_retention ;;
         *)

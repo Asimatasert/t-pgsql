@@ -24,6 +24,7 @@ _t-pgsql() {
                 'meta:Show metadata'
                 'clean:Clean old dumps'
                 'doctor:Check environment and backup health'
+                'status:Show last run of each job (--max-age checks freshness)'
                 'explain:Explain what a command is for'
                 'version:Show version'
                 'help:Show help'
@@ -46,7 +47,7 @@ _t-pgsql() {
             # explain topic completion (position right after "explain")
             if [[ $words[2] == explain && $CURRENT -eq 3 ]]; then
                 local -a explain_topics
-                explain_topics=(dump restore clone stream upgrade fetch batch jobs bot list meta clean doctor masking retention)
+                explain_topics=(dump restore clone stream upgrade fetch batch jobs bot list meta clean doctor status ping lock masking retention)
                 _describe -t explain-topics 'topic' explain_topics
                 return
             fi
@@ -113,6 +114,15 @@ _t-pgsql() {
                 '--exclude[Alias for --exclude-jobs]:jobs:' \
                 '--save[Save as job]:name:' \
                 '--batch[Run batch job]:job:' \
+                '--ping[Heartbeat monitor URL (start, success, fail)]:url:' \
+                '--ping-start[Explicit heartbeat start URL]:url:' \
+                '--ping-fail[Explicit heartbeat failure URL]:url:' \
+                '--lock-wait[Wait N seconds for a held run lock]:seconds:(0 30 60 300)' \
+                '--no-lock[Do not take the run lock]' \
+                '--name[status: only this name]:name:' \
+                '--limit[status: last N runs of --name]:count:' \
+                '--max-age[status: fail (exit 3) if no fresh success within this time]:time:(1h 6h 12h 26h 1d 2d)' \
+                '--json[status: JSON output]' \
                 '--file[Dump file]:file:_files' \
                 '--log[Log file]:file:_files' \
                 '--log-level[Log level]:level:(debug info warn error)' \

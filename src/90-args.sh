@@ -127,6 +127,9 @@ parse_args() {
             --notify-on-error) NOTIFY_ON_ERROR=true; shift ;;
             --token) BOT_TOKEN="$2"; shift 2 || _need_val "$1" ;;
             --cooldown) BOT_COOLDOWN="$2"; shift 2 || _need_val "$1" ;;
+            --ping) PING_URL="$2"; shift 2 || _need_val "$1" ;;
+            --ping-start) PING_START_URL="$2"; shift 2 || _need_val "$1" ;;
+            --ping-fail) PING_FAIL_URL="$2"; shift 2 || _need_val "$1" ;;
 
             --mask) MASK=true; shift ;;
             --mask-rules) MASK_RULES="$2"; shift 2 || _need_val "$1" ;;
@@ -140,6 +143,8 @@ parse_args() {
             --pg-bindir) PG_BINDIR="$2"; shift 2 || _need_val "$1" ;;
             --bwlimit) BWLIMIT="$2"; shift 2 || _need_val "$1" ;;
             --retries) RETRIES="$2"; shift 2 || _need_val "$1" ;;
+            --lock-wait) LOCK_WAIT="$2"; LOCK_WAIT_SET=true; shift 2 || _need_val "$1" ;;
+            --no-lock) NO_LOCK=true; shift ;;
 
             --parallel) PARALLEL="$2"; PARALLEL_SET=true; shift 2 || _need_val "$1" ;;
             --continue-on-error) CONTINUE_ON_ERROR=true; CONTINUE_ON_ERROR_SET=true; shift ;;
@@ -151,6 +156,7 @@ parse_args() {
             --save) SAVE_JOB="$2"; shift 2 || _need_val "$1" ;;
             --batch) BATCH_JOB="$2"; shift 2 || _need_val "$1" ;;
             --yaml)
+                STATUS_YAML_SET=true
                 if [[ "$2" == *".yaml" ]]; then
                     # Already has .yaml extension
                     JOBS_FILE="$2"
@@ -173,10 +179,14 @@ parse_args() {
             -f|--force) FORCE=true; shift ;;
             --dry-run) DRY_RUN=true; shift ;;
             --no-meta) META_ENABLED=false; shift ;;
+            --name) STATUS_NAME="$2"; shift 2 || _need_val "$1" ;;
+            --limit) STATUS_LIMIT="$2"; shift 2 || _need_val "$1" ;;
+            --max-age) STATUS_MAX_AGE="$2"; shift 2 || _need_val "$1" ;;
+            --json) STATUS_JSON=true; shift ;;
             -h|--help) show_help; exit 0 ;;
             --version) show_version; exit 0 ;;
 
-            *) log_error "Unknown: $1"; exit 1 ;;
+            *) log_error "Unknown: $1"; [ "$COMMAND" = status ] && exit 2; exit 1 ;;
         esac
     done
 }

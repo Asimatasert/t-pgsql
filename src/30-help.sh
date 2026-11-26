@@ -28,7 +28,11 @@ COMMANDS:
                   clean --from <conn> --keep <N>
                   clean --dump-name <name> --retention
     doctor      Check the environment and backup health (add --from/--to to test connectivity)
-    explain     Explain what a command is for: explain [dump|restore|clone|upgrade|...]
+    status      Show the last run of each job from the run history (read-only);
+                with --max-age it is a monitoring check (exit 3 when stale)
+                  status [--yaml <file>] [--output <dir>] [--name <name>] [--json]
+                         [--max-age <time>] [--limit <N>]
+    explain     Explain what a command is for: explain [dump|restore|clone|upgrade|status|ping|lock|...]
     version     Show version
 
 CONNECTION:
@@ -128,6 +132,37 @@ NOTIFY:
     --notify-on-error             Only notify on error
     -q, --quiet                   Minimal console output; success notifications are
                                   suppressed, failures are still notified
+
+HEARTBEAT PING (dead-man's switch; dump/clone/restore/upgrade/fetch only):
+    --ping <url>                  Monitor URL: <url>/start when the run starts,
+                                  <url> on success, <url>/fail on failure
+                                  (http:// or https:// only)
+    --ping-start <url>            Explicit start URL (wins over <url>/start)
+    --ping-fail <url>             Explicit failure URL (wins over <url>/fail)
+                                  Without --ping, only start and failure pings are sent.
+                                  Never sent with --dry-run, and never for a run skipped
+                                  by the lock. batch does not take these options: put
+                                  ping:/ping_start:/ping_fail: on the job in the jobs file.
+                                  A failed ping only warns; it never changes the exit code.
+    Env var: T_PGSQL_PING_DISABLE=1 turns all pings off.
+
+RUN LOCK (one run per output directory + dump name / per target database):
+    --lock-wait <seconds>         Wait up to N seconds for a held lock, then skip
+                                  (default: 0 = skip at once)
+    --no-lock                     Do not take the lock
+                                  A run skipped by the lock exits 75 (not a failure).
+                                  Stale locks (dead owner, too old) are taken over.
+    Env vars: T_PGSQL_LOCK_MAX_AGE (seconds, default 86400)
+
+STATUS (run history; also written by dump/clone/restore/upgrade/fetch):
+    --name <name>                 Only this job/dump name
+    --limit <N>                   Last N runs of --name, newest first (needs --name)
+    --json                        JSON output
+    --max-age <time>              Exit 3 if any listed name has no successful run
+                                  within <time> (e.g. 26h, 90m, 1d; bare number = seconds)
+    --yaml <file> lists exactly the jobs of that file; --output <dir> is the dump
+    directory. Env var: T_PGSQL_STATE_DIR (default: $XDG_STATE_HOME/t-pgsql or
+    ~/.local/state/t-pgsql; holds history.tsv and locks/).
 
 MASKING:
     --mask                        Enable data masking
@@ -241,6 +276,17 @@ EXAMPLES:
     t-pgsql fetch \
       --from ssh://ubuntu@192.0.2.20/prod \
       --from-file "prod_20250130*.dump"
+
+    # Heartbeat to a monitor, no overlapping runs, freshness check from cron
+    t-pgsql dump --from localhost/prod --ping https://hc.example.com/ping/UUID --lock-wait 60
+    t-pgsql status --yaml jobs.yaml --max-age 26h --json >/dev/null || echo "backup stale"
+
+EXIT STATUS:
+    0   success
+    1   error (invalid option or value, failed run)
+    2   usage error of status (bad --max-age/--limit, unknown option, missing file)
+    3   status --max-age: a listed name has no fresh successful run
+    75  run skipped because another run holds the lock (not a failure)
 
 More info: https://github.com/Asimatasert/t-pgsql
 EOF
