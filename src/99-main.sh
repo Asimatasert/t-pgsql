@@ -150,6 +150,7 @@ main() {
         fi
     fi
 
+    history_begin   # arms the run-history line (work commands only; see 74-status.sh)
     ping_begin
 
     case "$COMMAND" in
@@ -164,6 +165,7 @@ main() {
         meta)    cmd_meta ;;
         clean)   cmd_clean ;;
         doctor)  cmd_doctor ;;
+        status)  cmd_status ;;
         explain) cmd_explain ;;
         jobs)
             case "$JOBS_ACTION" in

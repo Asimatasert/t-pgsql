@@ -290,6 +290,7 @@ check_skip_recent() {
             local today_date=$(date +%Y%m%d)
             if [ "$file_date" = "$today_date" ]; then
                 log_info "Skipping: dump already exists today ($(basename "$latest"))"
+                HIST_SKIPPED="dump already exists today"
                 return 0
             fi
             return 1
@@ -317,6 +318,7 @@ check_skip_recent() {
     if [ $diff_sec -lt $skip_sec ]; then
         local age=$(format_elapsed $diff_sec)
         log_info "Skipping: recent dump exists ($age ago, threshold: $SKIP_IF_RECENT)"
+        HIST_SKIPPED="recent dump exists ($age ago, threshold: $SKIP_IF_RECENT)"
         return 0
     fi
 

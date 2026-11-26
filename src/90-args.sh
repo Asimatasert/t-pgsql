@@ -154,6 +154,7 @@ parse_args() {
             --save) SAVE_JOB="$2"; shift 2 || _need_val "$1" ;;
             --batch) BATCH_JOB="$2"; shift 2 || _need_val "$1" ;;
             --yaml)
+                STATUS_YAML_SET=true
                 if [[ "$2" == *".yaml" ]]; then
                     # Already has .yaml extension
                     JOBS_FILE="$2"
@@ -176,6 +177,10 @@ parse_args() {
             -f|--force) FORCE=true; shift ;;
             --dry-run) DRY_RUN=true; shift ;;
             --no-meta) META_ENABLED=false; shift ;;
+            --name) STATUS_NAME="$2"; shift 2 || _need_val "$1" ;;
+            --limit) STATUS_LIMIT="$2"; shift 2 || _need_val "$1" ;;
+            --max-age) STATUS_MAX_AGE="$2"; shift 2 || _need_val "$1" ;;
+            --json) STATUS_JSON=true; shift ;;
             -h|--help) show_help; exit 0 ;;
             --version) show_version; exit 0 ;;
 
