@@ -71,9 +71,7 @@ history_begin() {
     [ "$DRY_RUN" = true ] && return 0
     HIST_ACTIVE=true
     HIST_START_EPOCH=$(date +%s)
-    # Same cleanup as install_cleanup_trap, preceded by the history line. $? is the exit
-    # status of the run; the trap itself never changes it.
-    trap 'history_on_exit $?; run_tmp_cleanup' EXIT
+    # The line itself is written by the single exit hook (_run_exit_trap, 15-security.sh).
 }
 
 history_on_exit() {

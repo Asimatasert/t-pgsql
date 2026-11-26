@@ -95,9 +95,8 @@ ping_begin() {
     [ -z "$PING_URL$PING_START_URL$PING_FAIL_URL" ] && return 0
     _PING_ACTIVE=true
     _PING_T0=$SECONDS
-    # Replaces the cleanup-only EXIT trap so every exit path (including INT/TERM, which
-    # exit through it) ends with exactly one success or fail ping.
-    trap '_ping_exit_trap' EXIT
+    # The final ping is sent by the single exit hook (_run_exit_trap, 15-security.sh), so
+    # every exit path (including INT/TERM, which exit through it) ends with one ping.
     ping_send "$(ping_target_url start)" ""
 }
 
@@ -112,9 +111,3 @@ ping_finish() {
     fi
 }
 
-_ping_exit_trap() {
-    local rc=$?
-    run_tmp_cleanup
-    ping_finish "$rc"
-    return "$rc"
-}

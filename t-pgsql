@@ -449,7 +449,18 @@ run_tmp_cleanup() {
 # INT/TERM must clean up AND stop the script: a handler that only cleaned up let the run
 # continue (compress, metadata, notifications) with its credential files already deleted.
 # \`exit\` fires the EXIT trap, which performs the cleanup exactly once.
-install_cleanup_trap() { trap 'run_tmp_cleanup' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; }
+#
+# ONE exit hook for the whole program (a second `trap ... EXIT` would silently replace it):
+# history line, then temp cleanup + lock release, then the final heartbeat ping. A failing
+# step never stops the next one and the exit status of the run is preserved.
+_run_exit_trap() {
+    local rc=$?
+    history_on_exit "$rc" 2>/dev/null || true
+    run_tmp_cleanup || true
+    ping_finish "$rc" 2>/dev/null || true
+    return "$rc"
+}
+install_cleanup_trap() { trap '_run_exit_trap' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; }
 
 _PGPASS_TMP=""
 setup_local_pgpass() {
@@ -1334,9 +1345,8 @@ ping_begin() {
     [ -z "$PING_URL$PING_START_URL$PING_FAIL_URL" ] && return 0
     _PING_ACTIVE=true
     _PING_T0=$SECONDS
-    # Replaces the cleanup-only EXIT trap so every exit path (including INT/TERM, which
-    # exit through it) ends with exactly one success or fail ping.
-    trap '_ping_exit_trap' EXIT
+    # The final ping is sent by the single exit hook (_run_exit_trap, 15-security.sh), so
+    # every exit path (including INT/TERM, which exit through it) ends with one ping.
     ping_send "$(ping_target_url start)" ""
 }
 
@@ -1351,12 +1361,6 @@ ping_finish() {
     fi
 }
 
-_ping_exit_trap() {
-    local rc=$?
-    run_tmp_cleanup
-    ping_finish "$rc"
-    return "$rc"
-}
 # ==============================================================================
 # HELP
 # ==============================================================================
@@ -4913,9 +4917,7 @@ history_begin() {
     [ "$DRY_RUN" = true ] && return 0
     HIST_ACTIVE=true
     HIST_START_EPOCH=$(date +%s)
-    # Same cleanup as install_cleanup_trap, preceded by the history line. $? is the exit
-    # status of the run; the trap itself never changes it.
-    trap 'history_on_exit $?; run_tmp_cleanup' EXIT
+    # The line itself is written by the single exit hook (_run_exit_trap, 15-security.sh).
 }
 
 history_on_exit() {
