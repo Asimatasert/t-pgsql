@@ -322,6 +322,15 @@ run_job() {
     _pw_from=$(get_job_field "$job_name" "from" "password"); [ -z "$_pw_from" ] && _pw_from=$(get_job_value "$job_name" "from_password")
     _pw_to=$(get_job_field "$job_name" "to" "password");     [ -z "$_pw_to" ]   && _pw_to=$(get_job_value "$job_name" "to_password")
 
+    # A legacy "args:" job (what --save writes) carries --ping/--ping-start/--ping-fail in its
+    # argument string; the URLs are a secret, so they move to the environment hand-over below
+    # (like the "ping:" keys) instead of staying on the child's command line.
+    ping_extract_args "$job_args"
+    job_args="$_PA_ARGS"
+    local _ping_url="${_PA_URL:-$(get_job_value "$job_name" "ping")}"
+    local _ping_start="${_PA_START:-$(get_job_value "$job_name" "ping_start")}"
+    local _ping_fail="${_PA_FAIL:-$(get_job_value "$job_name" "ping_fail")}"
+
     log_info "Running job: $job_name"
     log_debug "Command: $job_cmd $(redact_notify_args "$(redact_args "$job_args")")"
 
@@ -339,9 +348,9 @@ run_job() {
     # Fall back to any INHERITED T_PGSQL_*_PASSWORD when the job has none, so a passwordless
     # job does not get an empty assignment that would shadow the documented ambient env var.
     T_PGSQL_NOTIFY_SPECS="$_notify_specs" \
-    T_PGSQL_PING_URL="$(get_job_value "$job_name" "ping")" \
-    T_PGSQL_PING_START_URL="$(get_job_value "$job_name" "ping_start")" \
-    T_PGSQL_PING_FAIL_URL="$(get_job_value "$job_name" "ping_fail")" \
+    T_PGSQL_PING_URL="$_ping_url" \
+    T_PGSQL_PING_START_URL="$_ping_start" \
+    T_PGSQL_PING_FAIL_URL="$_ping_fail" \
     T_PGSQL_PASSWORD="${_pw_both:-$T_PGSQL_PASSWORD}" \
     T_PGSQL_FROM_PASSWORD="${_pw_from:-$T_PGSQL_FROM_PASSWORD}" \
     T_PGSQL_TO_PASSWORD="${_pw_to:-$T_PGSQL_TO_PASSWORD}" \

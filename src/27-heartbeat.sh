@@ -16,14 +16,18 @@ ping_mask_url() {
     printf '%s://%s/***' "$scheme" "$rest"
 }
 
-# Only plain http(s) URLs without whitespace are accepted.
+# Only plain http(s) URLs (scheme in any case) without whitespace are accepted.
 ping_url_ok() {
-    [[ "$1" =~ ^https?://[^[:space:]/?#]+[^[:space:]]*$ ]]
+    [[ "$1" =~ ^[Hh][Tt][Tt][Pp]([Ss])?://[^[:space:]/?#]+[^[:space:]]*$ ]]
 }
 
 # Validate every configured ping URL; prints an error (without the URL) and returns 1.
+# Nothing is validated (or rejected) on a dry run or with T_PGSQL_PING_DISABLE=1: no ping
+# is sent then, so a bad URL cannot matter.
 ping_validate() {
     local pair name url
+    [ "$DRY_RUN" = true ] && return 0
+    [ "${T_PGSQL_PING_DISABLE:-}" = 1 ] && return 0
     for pair in "--ping:$PING_URL" "--ping-start:$PING_START_URL" "--ping-fail:$PING_FAIL_URL"; do
         name="${pair%%:*}"
         url="${pair#*:}"
@@ -36,20 +40,56 @@ ping_validate() {
     return 0
 }
 
+# batch never pings (the jobs it starts do, through their own "ping:" keys): a ping option
+# on the batch command line would silently do nothing, so it is rejected. Returns 1 then.
+ping_reject_for_batch() {
+    [ -z "$PING_URL$PING_START_URL$PING_FAIL_URL" ] && return 0
+    if [ "$COMMAND" = batch ] || [ -n "$BATCH_JOB" ]; then
+        log_error "--ping, --ping-start and --ping-fail do not apply to batch: put 'ping:' (or ping_start / ping_fail) on the job in the jobs file"
+        return 1
+    fi
+    return 0
+}
+
+# Take --ping/--ping-start/--ping-fail (and their values) out of an argument string that is
+# about to be re-executed, so a secret URL never lands on the child's command line. Sets
+# _PA_URL, _PA_START, _PA_FAIL (the values found) and _PA_ARGS (the remaining string).
+ping_extract_args() {
+    local s="$1" re flag tok val
+    _PA_URL=""; _PA_START=""; _PA_FAIL=""
+    re="(^|[[:space:]])(--ping-start|--ping-fail|--ping)[[:space:]]+('[^']*'|\"[^\"]*\"|[^[:space:]'\"]+)"
+    while [[ "$s" =~ $re ]]; do
+        flag="${BASH_REMATCH[2]}"; tok="${BASH_REMATCH[3]}"
+        case "$tok" in
+            \'*) val="${tok:1:${#tok}-2}" ;;
+            \"*) val="${tok:1:${#tok}-2}"; val="${val//\\\"/\"}" ;;
+            *)   val="$(printf '%s' "$tok" | sed -E 's/\\(.)/\1/g')" ;;
+        esac
+        case "$flag" in
+            --ping)       _PA_URL="$val" ;;
+            --ping-start) _PA_START="$val" ;;
+            *)            _PA_FAIL="$val" ;;
+        esac
+        s="${s%%"${BASH_REMATCH[0]}"*} ${s#*"${BASH_REMATCH[0]}"}"
+    done
+    _PA_ARGS="$s"
+}
+
 # Build the URL for a ping kind (start|success|fail); empty when none applies.
 ping_target_url() {
-    local kind="$1" base query="" path
+    local kind="$1" base tail path
     case "$kind" in
         start) [ -n "$PING_START_URL" ] && { printf '%s' "$PING_START_URL"; return 0; } ;;
         fail)  [ -n "$PING_FAIL_URL" ]  && { printf '%s' "$PING_FAIL_URL"; return 0; } ;;
     esac
     [ -z "$PING_URL" ] && return 0
     [ "$kind" = success ] && { printf '%s' "$PING_URL"; return 0; }
-    path="${PING_URL%%\?*}"
-    [[ "$PING_URL" == *\?* ]] && query="?${PING_URL#*\?}"
+    # <base>/start or <base>/fail: the suffix goes in front of a query or a #fragment
+    path="${PING_URL%%[?#]*}"
+    tail="${PING_URL#"$path"}"
     while [[ "$path" == */ ]]; do path="${path%/}"; done
     base="$path"
-    printf '%s/%s%s' "$base" "$kind" "$query"
+    printf '%s/%s%s' "$base" "$kind" "$tail"
 }
 
 # Send one ping. The URL travels to curl through a config on stdin (never argv).
@@ -93,6 +133,11 @@ ping_begin() {
         *) return 0 ;;
     esac
     [ -z "$PING_URL$PING_START_URL$PING_FAIL_URL" ] && return 0
+    # A run that has no source cannot work: it fails right away with its usual error, so it
+    # must not announce itself with a start ping first (a typo would look like a failed backup).
+    case "$COMMAND" in
+        dump|fetch|clone|upgrade) [ -z "$FROM_CONNECTION" ] && return 0 ;;
+    esac
     _PING_ACTIVE=true
     _PING_T0=$SECONDS
     # The final ping is sent by the single exit hook (_run_exit_trap, 15-security.sh), so

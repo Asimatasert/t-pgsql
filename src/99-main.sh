@@ -20,6 +20,7 @@ main() {
     install_cleanup_trap
     parse_args "$@"
     [ -n "$_umask_warn" ] && log_warn "$_umask_warn"
+    ping_reject_for_batch || exit 1
 
     # Notification specs handed over by a parent job run (run_job sets T_PGSQL_NOTIFY_SPECS
     # for its re-exec'd child). This is an INTERNAL variable, not a user option: it holds
