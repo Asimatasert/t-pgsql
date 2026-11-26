@@ -64,7 +64,7 @@ dargs() { printf '%s\n' dump --from postgres@localhost/appdb --output "$OUT" --c
 bg() {
     local name="$1" sl="$2"; shift 2
     local -a a; mapfile -t a < <(dargs)
-    ( cd "$TMP" && exec env DUMP_SLEEP="$sl" START_MARK="$TMP/mark.$name" "$BASH" ${BASHX:+-x} "$BIN" "${a[@]}" "$@" >"$TMP/$name.out" 2>&1 </dev/null ) &
+    ( cd "$TMP" && exec env DUMP_SLEEP="$sl" START_MARK="$TMP/mark.$name" ${STR:+strace -f -ttt -e trace=mkdir,rmdir,rename,renameat,renameat2,unlink,unlinkat,execve,exit_group -o "$TMP/st.$name"} "$BASH" "$BIN" "${a[@]}" "$@" >"$TMP/$name.out" 2>&1 </dev/null ) &
     BGPID=$!; PIDS+=("$BGPID")
 }
 # fg NAME [extra args...]: run a dump to completion (status in rc, output in out)
@@ -266,11 +266,12 @@ out=$(cd "$TMP" && DUMP_SLEEP=8 "$BASH" "$BIN" batch all --yaml "$TMP/jobs.yaml"
 raced=0
 for n in 1 2 3 4 5 6 7 8 9 10 11 12; do
     reset
-    BASHX=-x; bg x 2; XP=$BGPID; bg y 2; YP=$BGPID; BASHX=
+    STR=$(command -v strace); bg x 2; XP=$BGPID; bg y 2; YP=$BGPID; STR=
     waitpid "$XP"; waitpid "$YP"; wait "$XP" "$YP" 2>/dev/null
     if [ "$(grep -c '^start' "$REC/pg_dump.log" 2>/dev/null)" -ne 1 ]; then
         raced=1
-        nok "simultaneous start $n: both runs held the lock | log: $(tr '\n' ';' < "$REC/pg_dump.log" | cut -c1-900) | trace x: $(sed -n '/+ _lock_try/,/+ ping_begin/p' "$TMP/x.out" | grep -vE 'log_debug|^\+\+ (date|printf)|local ' | cut -c1-120 | head -45 | tr '\n' ';') | trace y: $(sed -n '/+ _lock_try/,/+ ping_begin/p' "$TMP/y.out" | grep -vE 'log_debug|^\+\+ (date|printf)|local ' | cut -c1-120 | head -45 | tr '\n' ';')"
+        nok "simultaneous start $n: both runs held the lock | log: $(tr '\n' ';' < "$REC/pg_dump.log" | cut -c1-700)"
+        for f in x y; do echo "# strace $f"; grep -E 'lock|state|execve|exit_group' "$TMP/st.$f" 2>/dev/null | grep -vE 'ENOENT.*(/usr|/bin|/lib)' | sed -E 's|/tmp/tmp\.[A-Za-z0-9]+|T|g' | cut -c1-200 | head -150; done
         break
     fi
 done
