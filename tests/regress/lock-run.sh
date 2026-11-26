@@ -64,7 +64,7 @@ dargs() { printf '%s\n' dump --from postgres@localhost/appdb --output "$OUT" --c
 bg() {
     local name="$1" sl="$2"; shift 2
     local -a a; mapfile -t a < <(dargs)
-    ( cd "$TMP" && exec env DUMP_SLEEP="$sl" START_MARK="$TMP/mark.$name" "$BASH" "$BIN" "${a[@]}" "$@" >"$TMP/$name.out" 2>&1 </dev/null ) &
+    ( cd "$TMP" && exec env DUMP_SLEEP="$sl" START_MARK="$TMP/mark.$name" "$BASH" ${BASHX:+-x} "$BIN" "${a[@]}" "$@" >"$TMP/$name.out" 2>&1 </dev/null ) &
     BGPID=$!; PIDS+=("$BGPID")
 }
 # fg NAME [extra args...]: run a dump to completion (status in rc, output in out)
@@ -266,11 +266,11 @@ out=$(cd "$TMP" && DUMP_SLEEP=8 "$BASH" "$BIN" batch all --yaml "$TMP/jobs.yaml"
 raced=0
 for n in 1 2 3 4 5 6 7 8 9 10 11 12; do
     reset
-    bg x 2; XP=$BGPID; bg y 2; YP=$BGPID
+    BASHX=-x; bg x 2; XP=$BGPID; bg y 2; YP=$BGPID; BASHX=
     waitpid "$XP"; waitpid "$YP"; wait "$XP" "$YP" 2>/dev/null
     if [ "$(grep -c '^start' "$REC/pg_dump.log" 2>/dev/null)" -ne 1 ]; then
         raced=1
-        nok "simultaneous start $n: both runs held the lock | log: $(tr '\n' ';' < "$REC/pg_dump.log" | cut -c1-900) | x: $(tr '\n' ' ' < "$TMP/x.out" | cut -c1-600) | y: $(tr '\n' ' ' < "$TMP/y.out" | cut -c1-600)"
+        nok "simultaneous start $n: both runs held the lock | log: $(tr '\n' ';' < "$REC/pg_dump.log" | cut -c1-900) | xtrace x: $(grep -E '_lock_try|lock_acquire|lock_release|_lock_is_stale|mkdir .*lock|Taking|Skipping|Run lock' "$TMP/x.out" | cut -c1-110 | head -25 | tr '\n' ';') | xtrace y: $(grep -E '_lock_try|lock_acquire|lock_release|_lock_is_stale|mkdir .*lock|Taking|Skipping|Run lock' "$TMP/y.out" | cut -c1-110 | head -25 | tr '\n' ';')"
         break
     fi
 done
