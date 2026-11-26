@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `--ping` with `--skip-if-recent`: a skipped run still sends the success ping (a recent dump
   is a healthy state), and its body now has the extra line `skipped (recent dump)`.
 
+### Fixed
+- **Telegram bot** reports a job skipped by the run lock (exit status 75) as "Already running" instead of a failed or completed backup.
+
 ## [3.14.0] - 2026-11-26
 
 ### Added
