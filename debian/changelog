@@ -1,3 +1,9 @@
+t-pgsql (3.13.0-1) unstable; urgency=medium
+
+  * Release 3.13.0. See CHANGELOG.md for details.
+
+ -- Asim Atasert <asimatasert@outlook.com>  Thu, 26 Nov 2026 13:40:50 +0300
+
 t-pgsql (3.12.1-1) unstable; urgency=high
 
   * Fix: --dry-run was silently ignored under `batch` — each job is re-exec'd
