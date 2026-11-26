@@ -2143,13 +2143,21 @@ _lock_write_meta() {
     } > "$tmp" 2>/dev/null && mv -f "$tmp" "$dir/meta" 2>/dev/null || { rm -f "$tmp"; return 1; }
 }
 
+# Exclusive mkdir. A plain mkdir is not enough: some mkdir implementations (the Rust
+# coreutils on newer Ubuntu) report success when two processes create the same directory at
+# the same instant, so both would think they own it. The directory is therefore claimed
+# with an owner file created with noclobber (O_EXCL), which only one process can win.
+_lock_mkdir() {
+    mkdir "$1" 2>/dev/null || return 1
+    ( set -C; printf '%s\n' "$$" > "$1/owner" ) 2>/dev/null
+}
+
 # The take-over mutex "<lock>.take": a directory that records its owner's pid. Taken with
-# mkdir; a held mutex is stolen only when its owner pid is dead or it is older than 60 s
-# (the steal is a rename, which only one stealer can win).
+# _lock_mkdir; a held mutex is stolen only when its owner pid is dead or it is older than
+# 60 s (the steal is a rename, which only one stealer can win).
 _lock_mx_acquire() {
     local mx="$1" owner now mt dead=false
-    if mkdir "$mx" 2>/dev/null; then
-        printf '%s\n' "$$" > "$mx/owner" 2>/dev/null
+    if _lock_mkdir "$mx"; then
         return 0
     fi
     [ -d "$mx" ] || return 1
@@ -2163,8 +2171,7 @@ _lock_mx_acquire() {
     [ "$dead" = true ] || return 1
     mv "$mx" "$mx.dead.$$" 2>/dev/null || return 1
     rm -rf "$mx.dead.$$" 2>/dev/null
-    mkdir "$mx" 2>/dev/null || return 1
-    printf '%s\n' "$$" > "$mx/owner" 2>/dev/null
+    _lock_mkdir "$mx" || return 1
     return 0
 }
 
@@ -2181,7 +2188,7 @@ _lock_mx_release() {
 # the directory while a stale one was being taken over (caller tries again right away).
 _lock_try() {
     local dir="$1" key="$2" mx old
-    if mkdir "$dir" 2>/dev/null; then
+    if _lock_mkdir "$dir"; then
         _lock_write_meta "$dir" "$key" || { rm -rf "$dir" 2>/dev/null; return 2; }
         _LOCK_HELD+=("$dir")
         return 0
@@ -2212,7 +2219,7 @@ _lock_try() {
             _lock_describe "$dir"; return 1
         fi
     fi
-    if mkdir "$dir" 2>/dev/null; then
+    if _lock_mkdir "$dir"; then
         # created by this process just now: it is ours to write and, on failure, to remove
         if _lock_write_meta "$dir" "$key"; then
             _lock_mx_release "$mx"
