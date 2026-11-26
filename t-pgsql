@@ -4930,12 +4930,21 @@ history_on_exit() {
 
 # Single-line, secret-free, length-limited text. Usage: history_clean TEXT MAX
 history_clean() {
-    local s="$1" max="${2:-200}"
+    local s="$1" max="${2:-200}" ascii="${3:-}"
     s=$(strip_ansi "$s")
     s=$(redact_cmd "$s")
     s=$(redact_args "$s")
     s=$(printf '%s' "$s" | sed -E 's#(://[^/:@[:space:]]*):[^@[:space:]]*@#\1:***@#g')
     s="${s//[[:cntrl:]]/ }"
+    # Cut by BYTES in the C locale (a cron job often has no UTF-8 locale, and a character cut
+    # in half would leave invalid UTF-8 in the file and invalid JSON in "status --json").
+    # Text that has to be cut, and every message (ascii=ascii), loses its non-ASCII bytes
+    # (each becomes "?"); a short name keeps its characters.
+    local bytes
+    bytes=$(printf '%s' "$s" | LC_ALL=C wc -c | tr -d '[:space:]')
+    if [ "$ascii" = ascii ] || [ "${bytes:-0}" -gt "$max" ]; then
+        s=$(printf '%s' "$s" | LC_ALL=C tr -c ' -~' '?')
+    fi
     printf '%s' "${s:0:$max}"
 }
 
@@ -5007,7 +5016,7 @@ history_write() {
     fi
 
     name=$(history_clean "$name" 200)
-    msg=$(history_clean "$(history_sanitize_msg "$msg")" 200)
+    msg=$(history_clean "$(history_sanitize_msg "$msg")" 200 ascii)
     line=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
         "$now" "$(date -u -r "$now" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$now" '+%Y-%m-%dT%H:%M:%SZ')" \
         "$COMMAND" "$name" "$status" "$rc" "$dur" "$size" "$msg")
@@ -5065,10 +5074,13 @@ status_history_file() {
 # fields: epoch US iso US command US name US status US rc US duration US size US message.
 status_valid_lines() {
     awk 'BEGIN { FS = "\t"; OFS = "\037" }
-    NF >= 8 && $1 ~ /^[0-9]+$/ && $4 != "" && $3 != "" &&
+    NF >= 8 && $1 ~ /^[0-9]+$/ && length($1) <= 15 && $4 != "" && $3 != "" &&
     ($5 == "ok" || $5 == "failed" || $5 == "skipped" || $5 == "suspect" || $5 == "locked") &&
-    $6 ~ /^[0-9]+$/ && ($7 == "" || $7 ~ /^[0-9]+$/) && ($8 == "" || $8 ~ /^[0-9]+$/) {
-        print $1, $2, $3, $4, $5, $6, $7, $8, $9
+    $6 ~ /^[0-9]+$/ && length($6) <= 15 &&
+    ($7 == "" || ($7 ~ /^[0-9]+$/ && length($7) <= 15)) && ($8 == "" || ($8 ~ /^[0-9]+$/ && length($8) <= 15)) {
+        # numbers are re-printed without leading zeros (007 is not a JSON number)
+        print sprintf("%.0f", $1), $2, $3, $4, $5, sprintf("%.0f", $6), \
+            ($7 == "" ? "" : sprintf("%.0f", $7)), ($8 == "" ? "" : sprintf("%.0f", $8)), $9
     }' "$1"
 }
 
@@ -5172,7 +5184,25 @@ status_job_base() {
 
 # Job names under "jobs:" in the YAML file.
 status_job_names() {
-    awk '/^jobs:/{found=1;next} found && /^  [a-zA-Z0-9_-]+:/{name=$1; gsub(/:$/,"",name); print name} found && /^[a-zA-Z]/ && !/^  /{exit}' "$1"
+    # Same section rules as the other job readers, but a key may also be quoted ("a b",
+    # 'a.b') or contain dots; the printed name is the key without its quotes.
+    awk '
+    /^jobs:/ { found = 1; next }
+    found && /^[^ #\t]/ { exit }
+    found && /^  [^ #\t]/ {
+        s = substr($0, 3); q = substr(s, 1, 1)
+        if (q == "\"" || q == "\047") {
+            s = substr(s, 2); i = index(s, q)
+            if (i == 0) next
+            n = substr(s, 1, i - 1); rest = substr(s, i + 1)
+            if (rest !~ /^[ \t]*:([ \t]|$)/) next
+        } else {
+            if (!match(s, /:([ \t]|$)/)) next
+            n = substr(s, 1, RSTART - 1)
+            sub(/[ \t]+$/, "", n)
+        }
+        if (n != "") print n
+    }' "$1"
 }
 
 # Build one summary row (US separated) into STATUS_ROWS.
@@ -5351,17 +5381,18 @@ cmd_status() {
     fi
     STATUS_MAX_AGE_S=""
     if [ -n "$STATUS_MAX_AGE" ]; then
-        if ! [[ "$STATUS_MAX_AGE" =~ ^[0-9]{1,9}[smhd]$ ]]; then
-            log_error "Invalid --max-age '$STATUS_MAX_AGE' (use a number with a unit: 90s, 30m, 26h, 2d)"
+        # Same units as the bot's duration parser (h, m, d; case-insensitive) plus s; a bare
+        # number is seconds. The digits are normalised first so 08h is not read as octal.
+        if ! [[ "$STATUS_MAX_AGE" =~ ^[0-9]{1,9}[smhdSMHD]?$ ]]; then
+            log_error "Invalid --max-age '$STATUS_MAX_AGE' (use seconds or a number with a unit: 90, 90s, 30m, 26h, 2d)"
             return 2
         fi
-        num="${STATUS_MAX_AGE%[smhd]}"; unit="${STATUS_MAX_AGE: -1}"
+        num="${STATUS_MAX_AGE%[smhdSMHD]}"
+        unit="$(printf '%s' "${STATUS_MAX_AGE#"$num"}" | tr '[:upper:]' '[:lower:]')"
         num=$((10#$num))
         case "$unit" in
-            s) STATUS_MAX_AGE_S=$num ;;
-            m) STATUS_MAX_AGE_S=$((num * 60)) ;;
-            h) STATUS_MAX_AGE_S=$((num * 3600)) ;;
-            d) STATUS_MAX_AGE_S=$((num * 86400)) ;;
+            ""|s) STATUS_MAX_AGE_S=$num ;;
+            *)    STATUS_MAX_AGE_S=$(parse_time_to_seconds "${num}${unit}") ;;
         esac
     fi
     if [ -n "$STATUS_LIMIT" ]; then
@@ -7768,7 +7799,7 @@ parse_args() {
             -h|--help) show_help; exit 0 ;;
             --version) show_version; exit 0 ;;
 
-            *) log_error "Unknown: $1"; exit 1 ;;
+            *) log_error "Unknown: $1"; [ "$COMMAND" = status ] && exit 2; exit 1 ;;
         esac
     done
 }

@@ -179,7 +179,7 @@ st --output "$OUT" --name prod --max-age 26h
 st --name ghost --max-age 26h --output "$OUT"
 [ $src -eq 3 ] && ok "max-age: never-ran name -> 3" || nok "rc=$src"
 st --max-age 26x; [ $src -eq 2 ] && ok "bad --max-age -> 2" || nok "rc=$src"
-st --max-age 26; [ $src -eq 2 ] && ok "--max-age without unit -> 2" || nok "rc=$src"
+st --max-age 26; [ $src -ne 2 ] && ok "--max-age without unit is bare seconds (accepted)" || nok "rc=$src"
 
 # 13. --limit history view
 fresh

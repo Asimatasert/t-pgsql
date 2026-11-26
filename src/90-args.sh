@@ -186,7 +186,7 @@ parse_args() {
             -h|--help) show_help; exit 0 ;;
             --version) show_version; exit 0 ;;
 
-            *) log_error "Unknown: $1"; exit 1 ;;
+            *) log_error "Unknown: $1"; [ "$COMMAND" = status ] && exit 2; exit 1 ;;
         esac
     done
 }
