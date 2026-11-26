@@ -4,6 +4,7 @@
 meta_start() {
     META_START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     META_START_EPOCH=$(date +%s)
+    # shellcheck disable=SC2034  # global metadata field
     META_STATUS="running"
 }
 
@@ -130,6 +131,7 @@ meta_update_target() {
     tar -xzf "$tar_file" -C "$temp_dir" 2>/dev/null || { rm -rf "$temp_dir"; return 0; }
 
     # Find the dump file (ignore macOS AppleDouble ._ sidecars, which sort first).
+    # shellcheck disable=SC2010  # filter drops macOS ._ files; names are plain dump files
     local dump_name=$(ls "$temp_dir"/*.dump 2>/dev/null | grep -vE '/\._' | head -1 | xargs basename 2>/dev/null)
     [ -z "$dump_name" ] && { rm -rf "$temp_dir"; return 0; }
 

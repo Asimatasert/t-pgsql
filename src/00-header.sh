@@ -18,6 +18,8 @@
 # errexit those failure branches would abort the script before running, making
 # all error-handling dead code. Failures are handled explicitly instead.
 
+# shellcheck disable=SC2155  # errexit is off; declare-and-assign return status is never used
+
 # ==============================================================================
 # VERSION & PATHS
 # ==============================================================================

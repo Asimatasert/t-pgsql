@@ -125,6 +125,7 @@ cmd_clone() {
     local restore_elapsed=$(($(date +%s) - restore_start))
 
     # Update metadata with target info
+    # shellcheck disable=SC2046  # unquoted on purpose: empty elapsed must expand to nothing
     meta_update_target "$latest" $([ $r -eq 0 ] && echo "success" || echo "failed") $restore_elapsed
 
     # Cleanup

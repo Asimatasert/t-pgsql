@@ -326,6 +326,7 @@ notify_email() {
 
 # Build notification details for operations
 build_notify_details() {
+    # shellcheck disable=SC2034  # kept for call-site compatibility
     local operation="$1"
     local status="$2"
     local elapsed="$3"
