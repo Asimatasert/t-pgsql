@@ -270,7 +270,7 @@ for n in 1 2 3 4 5 6 7 8 9 10 11 12; do
     waitpid "$XP"; waitpid "$YP"; wait "$XP" "$YP" 2>/dev/null
     if [ "$(grep -c '^start' "$REC/pg_dump.log" 2>/dev/null)" -ne 1 ]; then
         raced=1
-        nok "simultaneous start $n: both runs held the lock | log: $(tr '\n' ';' < "$REC/pg_dump.log" | cut -c1-900) | trace x: $(sed -n '/+ lock_acquire_command/,/+ ping_begin/p' "$TMP/x.out" | grep -vE 'log_debug|^\+\+ (date|printf)|local ' | cut -c1-120 | head -60 | tr '\n' ';') | trace y: $(sed -n '/+ lock_acquire_command/,/+ ping_begin/p' "$TMP/y.out" | grep -vE 'log_debug|^\+\+ (date|printf)|local ' | cut -c1-120 | head -60 | tr '\n' ';')"
+        nok "simultaneous start $n: both runs held the lock | log: $(tr '\n' ';' < "$REC/pg_dump.log" | cut -c1-900) | trace x: $(sed -n '/+ _lock_try/,/+ ping_begin/p' "$TMP/x.out" | grep -vE 'log_debug|^\+\+ (date|printf)|local ' | cut -c1-120 | head -45 | tr '\n' ';') | trace y: $(sed -n '/+ _lock_try/,/+ ping_begin/p' "$TMP/y.out" | grep -vE 'log_debug|^\+\+ (date|printf)|local ' | cut -c1-120 | head -45 | tr '\n' ';')"
         break
     fi
 done
