@@ -86,6 +86,8 @@ FROM_KEEP_SET=false           # true once --from-keep given on CLI
 COMPRESS_SET=false            # true once --compress given on CLI
 KEEP=-1
 FROM_KEEP=1  # 0=delete, N=keep last N, -1=keep all (default: 1)
+MIN_SIZE_RATIO=50             # shrink guard: new dump must be at least this % of the previous one (0=off)
+MIN_SIZE_RATIO_SET=false      # true once --min-size-ratio given on CLI (beats config)
 SKIP_IF_RECENT=""  # Skip if dump exists within timeframe (e.g., 24h, 12h, today)
 
 # Archive tier: when set, dumps aged out by --keep are MOVED here instead of
@@ -2120,6 +2122,99 @@ quarantine_dump() {
     fi
 }
 
+# Byte size of a file, portable (GNU stat, BSD stat, then wc). Prints digits only.
+# Usage: file_size_bytes FILE
+file_size_bytes() {
+    local f="$1" s
+    s=$(stat -c %s "$f" 2>/dev/null)
+    [[ "$s" =~ ^[0-9]+$ ]] || s=$(stat -f %z "$f" 2>/dev/null)
+    [[ "$s" =~ ^[0-9]+$ ]] || s=$(wc -c < "$f" 2>/dev/null | tr -d '[:space:]')
+    [[ "$s" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$((10#$s))"
+}
+
+# Human readable byte count (POSIX awk). Usage: human_bytes N
+human_bytes() {
+    awk -v b="$1" 'BEGIN {
+        if (b >= 1073741824) printf "%.1f GB", b / 1073741824
+        else if (b >= 1048576) printf "%.1f MB", b / 1048576
+        else if (b >= 1024) printf "%.1f KB", b / 1024
+        else printf "%d B", b }'
+}
+
+# Newest dump of a base name other than NEWFILE. Quarantined files (.invalid,
+# .suspect) never match list_dumps_for_base. Usage: previous_dump_for_base DIR BASE NEWFILE
+previous_dump_for_base() {
+    local nb p; nb=$(basename "$3")
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        [ "$(basename "$p")" = "$nb" ] && continue
+        printf '%s\n' "$p"
+        return 0
+    done < <(list_dumps_for_base "$1" "$2")
+    return 0
+}
+
+# Shrink guard: fail when the new dump is smaller than MIN_SIZE_RATIO percent of
+# the newest previous dump of the same base name. No previous dump (or an empty
+# one) passes. On failure SHRINK_DETAIL holds a one-line description.
+# Usage: check_dump_shrink NEWFILE BASE
+check_dump_shrink() {
+    local new="$1" base="$2" ratio="${MIN_SIZE_RATIO:-50}" prev ns ps pct
+    SHRINK_DETAIL=""
+    [ "$ratio" -gt 0 ] 2>/dev/null || return 0
+    prev=$(previous_dump_for_base "$(dirname "$new")" "$base" "$new")
+    [ -n "$prev" ] || return 0
+    ns=$(file_size_bytes "$new") || { log_warn "Shrink guard skipped: cannot read the size of $(basename "$new")"; return 0; }
+    ps=$(file_size_bytes "$prev") || { log_warn "Shrink guard skipped: cannot read the size of $(basename "$prev")"; return 0; }
+    # 15 digits (~1 PB) keeps size*100 far inside 64-bit arithmetic.
+    if [ "${#ns}" -gt 15 ] || [ "${#ps}" -gt 15 ]; then
+        log_warn "Shrink guard skipped: dump sizes are out of range"
+        return 0
+    fi
+    [ "$ps" -gt 0 ] || return 0
+    [ $((ns * 100)) -ge $((ps * ratio)) ] && return 0
+    pct=$((ns * 100 / ps))
+    SHRINK_DETAIL="$(basename "$new") is $(human_bytes "$ns") ($ns bytes), $(basename "$prev") is $(human_bytes "$ps") ($ps bytes): ${pct}% of the previous dump, minimum ${ratio}%"
+    log_error "Shrink guard: the new dump is much smaller than the previous one"
+    log_error "  new:      $new ($(human_bytes "$ns"), $ns bytes)"
+    log_error "  previous: $prev ($(human_bytes "$ps"), $ps bytes)"
+    log_error "  ratio ${pct}% is below the --min-size-ratio threshold of ${ratio}%"
+    log_error "  If the shrink is expected, run once with --min-size-ratio 0; the next dump then becomes the baseline"
+    return 1
+}
+
+# Set a dump that failed the shrink guard aside (not deleted) so no dump pattern
+# matches it. Usage: quarantine_suspect_dump FILE
+quarantine_suspect_dump() {
+    local f="$1"
+    if [ -e "$f" ] && mv -f "$f" "${f}.suspect" 2>/dev/null; then
+        log_error "The new dump was kept as ${f}.suspect; older dumps were not rotated or deleted"
+    else
+        log_error "Older dumps were not rotated or deleted"
+    fi
+}
+
+# Apply the external compressor to a freshly written dump (zstd/xz/bzip2 only).
+# Sets COMPRESSED_DUMP_FILE to the resulting artifact (the input when nothing
+# was compressed). Usage: compress_new_dump FILE
+compress_new_dump() {
+    local f="$1"
+    COMPRESSED_DUMP_FILE="$f"
+    case "$COMPRESS" in
+        zstd|xz|bzip2) ;;
+        *) return 0 ;;
+    esac
+    if compress_file "$f"; then
+        case "$COMPRESS" in
+            zstd)  COMPRESSED_DUMP_FILE="${f}.zst" ;;
+            xz)    COMPRESSED_DUMP_FILE="${f}.xz" ;;
+            bzip2) COMPRESSED_DUMP_FILE="${f}.bz2" ;;
+        esac
+    fi
+    return 0
+}
+
 cmd_dump() {
     meta_start
     log_info "Starting dump..."
@@ -2259,7 +2354,7 @@ cmd_dump() {
     esac
 
     local result=0
-    local integrity_checked=""
+    local integrity_checked="" shrink_checked="" shrink_failed=false compressed_early=false
     local remote_compressed=false comp_ext=""
 
     if [ "$FROM_TYPE" = "ssh" ]; then
@@ -2366,10 +2461,25 @@ cmd_dump() {
             fi
 
             # Never delete older source dumps (or the source copy) unless the
-            # copy we just received is readable.
+            # copy we just received is readable and not suspiciously smaller
+            # than the previous dump. External compression happens first so the
+            # size comparison sees the final artifact.
             if [ $result -eq 0 ] && [ "$FROM_KEEP" -ge 0 ]; then
+                if [ "$remote_compressed" != true ]; then
+                    compress_new_dump "$dump_file"
+                    dump_file="$COMPRESSED_DUMP_FILE"
+                    compressed_early=true
+                fi
                 if verify_dump_integrity "$dump_file"; then
                     integrity_checked="$dump_file"
+                    if check_dump_shrink "$dump_file" "$dump_base_name"; then
+                        shrink_checked="$dump_file"
+                    else
+                        quarantine_suspect_dump "$dump_file"
+                        shrink_failed=true
+                        log_error "Keeping existing dumps on the source"
+                        result=1
+                    fi
                 else
                     quarantine_dump "$dump_file"
                     log_error "Keeping existing dumps on the source"
@@ -2412,14 +2522,9 @@ cmd_dump() {
         # dump_file must be advanced to the compressed artifact so meta_write
         # sees an existing file (and DUMP_FILE reflects what really exists).
         # Skipped when the file already arrived compressed from the source.
-        if [ "$remote_compressed" != true ] && [ "$COMPRESS" != "gzip" ] && [ "$COMPRESS" != "none" ]; then
-            if compress_file "$dump_file"; then
-                case "$COMPRESS" in
-                    zstd)  dump_file="${dump_file}.zst" ;;
-                    xz)    dump_file="${dump_file}.xz" ;;
-                    bzip2) dump_file="${dump_file}.bz2" ;;
-                esac
-            fi
+        if [ "$remote_compressed" != true ] && [ "$compressed_early" != true ]; then
+            compress_new_dump "$dump_file"
+            dump_file="$COMPRESSED_DUMP_FILE"
         fi
 
         # Make sure the new dump is usable BEFORE it is wrapped in metadata or
@@ -2429,6 +2534,14 @@ cmd_dump() {
             quarantine_dump "$dump_file"
             local _ve; _ve=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
             send_notification "failed" "Dump failed: ${dump_base_name}" "$(build_notify_details "DUMP" "Failed" "$_ve")"
+            return 1
+        fi
+
+        # Shrink guard: also before metadata and rotation, once per run.
+        if [ "$shrink_checked" != "$dump_file" ] && ! check_dump_shrink "$dump_file" "$dump_base_name"; then
+            quarantine_suspect_dump "$dump_file"
+            local _se; _se=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+            send_notification "failed" "Dump failed: ${dump_base_name}" "$(build_notify_details "DUMP" "Failed" "$_se")Shrink guard: ${SHRINK_DETAIL}. Re-run with --min-size-ratio 0 if the shrink is expected."
             return 1
         fi
 
@@ -2457,11 +2570,12 @@ cmd_dump() {
         # pg_dump opens its output file before connecting, so a failed run leaves a
         # partial/0-byte .dump behind. Remove it (and any half-written artifact) so a
         # failure does not leave a misleading archive in the output directory.
-        rm -f "$dump_file" "${dump_file}.zst" "${dump_file}.xz" "${dump_file}.bz2" 2>/dev/null
+        [ "$shrink_failed" = true ] || rm -f "$dump_file" "${dump_file}.zst" "${dump_file}.xz" "${dump_file}.bz2" 2>/dev/null
 
         # Send notification
         local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
         local details=$(build_notify_details "DUMP" "Failed" "$elapsed")
+        [ "$shrink_failed" = true ] && details="${details}Shrink guard: ${SHRINK_DETAIL}. Re-run with --min-size-ratio 0 if the shrink is expected."
         send_notification "failed" "Dump failed: ${dump_base_name}" "$details"
 
         return 1
@@ -6439,6 +6553,7 @@ parse_args() {
             --from-keep) FROM_KEEP="$2"; FROM_KEEP_SET=true; shift 2 || _need_val "$1" ;;
             --archive-output) ARCHIVE_OUTPUT="$2"; ARCHIVE_OUTPUT_SET=true; shift 2 || _need_val "$1" ;;
             --archive-keep) ARCHIVE_KEEP="$2"; ARCHIVE_KEEP_SET=true; shift 2 || _need_val "$1" ;;
+            --min-size-ratio) MIN_SIZE_RATIO="$2"; MIN_SIZE_RATIO_SET=true; shift 2 || _need_val "$1" ;;
             --from-stale) FROM_STALE="$2"; FROM_STALE_SET=true; shift 2 || _need_val "$1" ;;
             --dump-name) DUMP_NAME="$2"; shift 2 || _need_val "$1" ;;
             --skip-if-recent) SKIP_IF_RECENT="$2"; shift 2 || _need_val "$1" ;;
@@ -6596,6 +6711,12 @@ main() {
             exit 1
         fi
     done
+
+    # --min-size-ratio is a percentage: 0 (off) to 100.
+    if ! [[ "$MIN_SIZE_RATIO" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$MIN_SIZE_RATIO" -gt 100 ]; then
+        log_error "Invalid --min-size-ratio '${MIN_SIZE_RATIO}': expected an integer from 0 to 100 (0 disables the check)"
+        exit 1
+    fi
 
     # --cooldown (bot) is a time string; validate its format so it can't reach the
     # bot's $(( )) arithmetic as an injection payload.

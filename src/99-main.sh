@@ -71,6 +71,12 @@ main() {
         fi
     done
 
+    # --min-size-ratio is a percentage: 0 (off) to 100.
+    if ! [[ "$MIN_SIZE_RATIO" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$MIN_SIZE_RATIO" -gt 100 ]; then
+        log_error "Invalid --min-size-ratio '${MIN_SIZE_RATIO}': expected an integer from 0 to 100 (0 disables the check)"
+        exit 1
+    fi
+
     # --cooldown (bot) is a time string; validate its format so it can't reach the
     # bot's $(( )) arithmetic as an injection payload.
     if ! [[ "$BOT_COOLDOWN" =~ ^[0-9]+[hmd]?$ ]]; then

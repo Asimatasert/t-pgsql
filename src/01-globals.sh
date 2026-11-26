@@ -47,6 +47,8 @@ FROM_KEEP_SET=false           # true once --from-keep given on CLI
 COMPRESS_SET=false            # true once --compress given on CLI
 KEEP=-1
 FROM_KEEP=1  # 0=delete, N=keep last N, -1=keep all (default: 1)
+MIN_SIZE_RATIO=50             # shrink guard: new dump must be at least this % of the previous one (0=off)
+MIN_SIZE_RATIO_SET=false      # true once --min-size-ratio given on CLI (beats config)
 SKIP_IF_RECENT=""  # Skip if dump exists within timeframe (e.g., 24h, 12h, today)
 
 # Archive tier: when set, dumps aged out by --keep are MOVED here instead of

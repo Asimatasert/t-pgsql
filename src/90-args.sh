@@ -95,6 +95,7 @@ parse_args() {
             --from-keep) FROM_KEEP="$2"; FROM_KEEP_SET=true; shift 2 || _need_val "$1" ;;
             --archive-output) ARCHIVE_OUTPUT="$2"; ARCHIVE_OUTPUT_SET=true; shift 2 || _need_val "$1" ;;
             --archive-keep) ARCHIVE_KEEP="$2"; ARCHIVE_KEEP_SET=true; shift 2 || _need_val "$1" ;;
+            --min-size-ratio) MIN_SIZE_RATIO="$2"; MIN_SIZE_RATIO_SET=true; shift 2 || _need_val "$1" ;;
             --from-stale) FROM_STALE="$2"; FROM_STALE_SET=true; shift 2 || _need_val "$1" ;;
             --dump-name) DUMP_NAME="$2"; shift 2 || _need_val "$1" ;;
             --skip-if-recent) SKIP_IF_RECENT="$2"; shift 2 || _need_val "$1" ;;
