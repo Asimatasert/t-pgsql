@@ -76,6 +76,8 @@ save_job() {
     [ -n "$ONLY_JOBS" ] && args="$args --only $(pq "$ONLY_JOBS")"
     [ -n "$EXCLUDE_JOBS" ] && args="$args --exclude $(pq "$EXCLUDE_JOBS")"
 
+    [ "$LOCK_WAIT" != 0 ] && args="$args --lock-wait $(pq "$LOCK_WAIT")"
+    [ "$NO_LOCK" = true ] && args="$args --no-lock"
     [ "$SUDO" = true ] && args="$args --sudo"
     [ "$FORCE" = true ] && args="$args --force"
     [ "$VERBOSE" = true ] && args="$args --verbose"
@@ -252,7 +254,7 @@ _JOB_KNOWN_KEYS=" command args from to password from_password to_password from_p
  archive_output archive_keep from_stale skip_if_recent exclude_table exclude_data exclude_schema
  only_table only_schema compress compress_level pg_compress_level compress_where stream_buffer bwlimit
  retries health_check health_check_after no_health_check health_check_fail retention retention_daily
- retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level ping ping_start ping_fail "
+ retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level ping ping_start ping_fail lock_wait no_lock "
 
 # Warn (once per key) about job keys the tool does not know, naming the closest valid key
 # when it is just a hyphen/underscore or case difference. Warning only, never an error.
