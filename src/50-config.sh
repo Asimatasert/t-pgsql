@@ -48,6 +48,7 @@ load_config() {
             archive_output|archive-output) [ "$ARCHIVE_OUTPUT_SET" != true ] && ARCHIVE_OUTPUT="$value" ;;
             archive_keep|archive-keep) [ "$ARCHIVE_KEEP_SET" != true ] && ARCHIVE_KEEP="$value" ;;
             from_keep|from-keep) [ "$FROM_KEEP_SET" != true ] && FROM_KEEP="$value" ;;
+            min_size_ratio|min-size-ratio) [ "$MIN_SIZE_RATIO_SET" != true ] && MIN_SIZE_RATIO="$value" ;;
             from_stale|from-stale) [ "$FROM_STALE_SET" != true ] && FROM_STALE="$value" ;;
             compress) [ "$COMPRESS_SET" != true ] && COMPRESS="$value" ;;
             compress_where|compress-where) [ "$COMPRESS_WHERE_SET" != true ] && COMPRESS_WHERE="$value" ;;

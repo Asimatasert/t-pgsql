@@ -20,6 +20,7 @@ save_job() {
     [ -n "$OUTPUT_DIR" ] && args="$args --output $(pq "$OUTPUT_DIR")"
     [ "$KEEP" -ge 0 ] && args="$args --keep $KEEP"
     [ "$FROM_KEEP" -gt 0 ] && args="$args --from-keep $FROM_KEEP"
+    { [ "$MIN_SIZE_RATIO_SET" = true ] || [ "$MIN_SIZE_RATIO" != 50 ]; } && args="$args --min-size-ratio $MIN_SIZE_RATIO"
     [ -n "$EXCLUDE_TABLES" ] && args="$args --exclude-table $(pq "$EXCLUDE_TABLES")"
     [ -n "$EXCLUDE_SCHEMAS" ] && args="$args --exclude-schema $(pq "$EXCLUDE_SCHEMAS")"
     [ -n "$EXCLUDE_DATA" ] && args="$args --exclude-data $(pq "$EXCLUDE_DATA")"
@@ -244,7 +245,7 @@ remove_job() {
 # Keys a job may carry in jobs.yaml (everything parse_job_to_args / run_job reads, plus the
 # command itself). Anything else is silently ignored by the parser, so run_job warns.
 _JOB_KNOWN_KEYS=" command args from to password from_password to_password from_password_file to_password_file
- force verbose quiet dry_run no_meta sudo stream notify notify_on_error output dump_name keep from_keep
+ force verbose quiet dry_run no_meta sudo stream notify notify_on_error output dump_name keep from_keep min_size_ratio
  archive_output archive_keep from_stale skip_if_recent exclude_table exclude_data exclude_schema
  only_table only_schema compress compress_level pg_compress_level compress_where stream_buffer bwlimit
  retries health_check health_check_after no_health_check health_check_fail retention retention_daily

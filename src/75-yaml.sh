@@ -467,6 +467,7 @@ parse_job_to_args() {
     [ -n "$(get_job_value "$job" "dump_name")" ] && args+=" --dump-name $(pq "$(get_job_value "$job" "dump_name")")"
     [ -n "$(get_job_value "$job" "keep")" ] && args+=" --keep $(pq "$(get_job_value "$job" "keep")")"
     [ -n "$(get_job_value "$job" "from_keep")" ] && args+=" --from-keep $(pq "$(get_job_value "$job" "from_keep")")"
+    [ -n "$(get_job_value "$job" "min_size_ratio")" ] && args+=" --min-size-ratio $(pq "$(get_job_value "$job" "min_size_ratio")")"
     [ -n "$(get_job_value "$job" "archive_output")" ] && args+=" --archive-output $(pq "$(get_job_value "$job" "archive_output")")"
     [ -n "$(get_job_value "$job" "archive_keep")" ] && args+=" --archive-keep $(pq "$(get_job_value "$job" "archive_keep")")"
     [ -n "$(get_job_value "$job" "from_stale")" ] && args+=" --from-stale $(pq "$(get_job_value "$job" "from_stale")")"
