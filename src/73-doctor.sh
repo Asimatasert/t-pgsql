@@ -141,13 +141,16 @@ cmd_doctor() {
             _dok_note "disabled (--min-size-ratio 0)"
         else
             _dok_note "active ratio: a new dump must be at least ${MIN_SIZE_RATIO}% of the previous one"
-            local pnew pprev pns pps psus
+            local pnew pprev pns pps psus sf
             while IFS= read -r base; do
                 [ -z "$base" ] && continue
                 pnew=$(list_dumps_for_base "$OUTPUT_DIR" "$base" | sed -n 1p)
                 pprev=$(list_dumps_for_base "$OUTPUT_DIR" "$base" | sed -n 2p)
-                psus=$(ls -1 "$OUTPUT_DIR"/"$base"_*.suspect 2>/dev/null | grep -c -E "/${base//[^[:alnum:]_-]/.}_[0-9]{8}_[0-9]{6}")
-                [ "${psus:-0}" -gt 0 ] && _dok_warn "$base — ${psus} dump(s) set aside as .suspect by the shrink guard"
+                psus=0
+                for sf in "$OUTPUT_DIR"/"$base"_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]*.suspect; do
+                    [ -e "$sf" ] && psus=$((psus + 1))
+                done
+                [ "$psus" -gt 0 ] && _dok_warn "$base — ${psus} dump(s) set aside as .suspect by the shrink guard"
                 if [ -z "$pnew" ] || [ -z "$pprev" ]; then
                     _dok_ok "$base — only one dump, nothing to compare"
                     continue
