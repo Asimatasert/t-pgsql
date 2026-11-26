@@ -33,6 +33,13 @@ main() {
     fi
     unset T_PGSQL_NOTIFY_SPECS
 
+    # Heartbeat URLs handed over by a parent job run (they may hold a secret token, so they
+    # travel in the environment, not on argv). Command line / config values win.
+    [ -z "$PING_URL" ] && PING_URL="${T_PGSQL_PING_URL:-}"
+    [ -z "$PING_START_URL" ] && PING_START_URL="${T_PGSQL_PING_START_URL:-}"
+    [ -z "$PING_FAIL_URL" ] && PING_FAIL_URL="${T_PGSQL_PING_FAIL_URL:-}"
+    unset T_PGSQL_PING_URL T_PGSQL_PING_START_URL T_PGSQL_PING_FAIL_URL
+
     # Use a specific PostgreSQL client version if requested (affects all LOCAL
     # pg_dump/pg_restore/psql/createdb/pg_dumpall calls; not SSH-remote ones).
     [ -n "$PG_BINDIR" ] && export PATH="$PG_BINDIR:$PATH"
@@ -119,6 +126,11 @@ main() {
         fi
     fi
 
+    # Heartbeat URLs must be http(s); checked for the work commands and --save only.
+    case "${SAVE_JOB:+save} $COMMAND" in
+        save*|*" dump"|*" restore"|*" clone"|*" upgrade"|*" fetch") ping_validate || exit 1 ;;
+    esac
+
     # Handle --save: save current command as a job
     if [ -n "$SAVE_JOB" ]; then
         save_job "$SAVE_JOB" "$COMMAND"
@@ -137,6 +149,8 @@ main() {
             exit 1
         fi
     fi
+
+    ping_begin
 
     case "$COMMAND" in
         dump)    cmd_dump;    notify_unreported_failure $? dump ;;

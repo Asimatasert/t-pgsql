@@ -63,6 +63,9 @@ load_config() {
             verbose) [ "$value" = "true" ] && VERBOSE=true ;;
             force) [ "$value" = "true" ] && FORCE=true ;;
             sudo) [ "$value" = "true" ] && SUDO=true ;;
+            ping) [ -z "$PING_URL" ] && PING_URL="$value" ;;
+            ping_start|ping-start) [ -z "$PING_START_URL" ] && PING_START_URL="$value" ;;
+            ping_fail|ping-fail) [ -z "$PING_FAIL_URL" ] && PING_FAIL_URL="$value" ;;
         esac
     done < "$config_file"
 

@@ -68,6 +68,9 @@ save_job() {
         args="$args --notify $(pq "$n")"
     done
     [ "$NOTIFY_ON_ERROR" = true ] && args="$args --notify-on-error"
+    [ -n "$PING_URL" ] && args="$args --ping $(pq "$PING_URL")"
+    [ -n "$PING_START_URL" ] && args="$args --ping-start $(pq "$PING_START_URL")"
+    [ -n "$PING_FAIL_URL" ] && args="$args --ping-fail $(pq "$PING_FAIL_URL")"
 
     # Batch job filters
     [ -n "$ONLY_JOBS" ] && args="$args --only $(pq "$ONLY_JOBS")"
@@ -192,7 +195,7 @@ show_job() {
     echo -e "${CYAN}Arguments:${NC}"
 
     # Parse and display args nicely (handle quoted values)
-    echo "$job_args" | sed "s/' --/'\n--/g" | while read -r arg; do
+    echo "$(redact_notify_args "$job_args")" | sed "s/' --/'\n--/g" | while read -r arg; do
         [ -n "$arg" ] && echo -e "  ${GREEN}${arg}${NC}"
     done
     echo ""
@@ -249,7 +252,7 @@ _JOB_KNOWN_KEYS=" command args from to password from_password to_password from_p
  archive_output archive_keep from_stale skip_if_recent exclude_table exclude_data exclude_schema
  only_table only_schema compress compress_level pg_compress_level compress_where stream_buffer bwlimit
  retries health_check health_check_after no_health_check health_check_fail retention retention_daily
- retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level "
+ retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level ping ping_start ping_fail "
 
 # Warn (once per key) about job keys the tool does not know, naming the closest valid key
 # when it is just a hyphen/underscore or case difference. Warning only, never an error.
@@ -334,6 +337,9 @@ run_job() {
     # Fall back to any INHERITED T_PGSQL_*_PASSWORD when the job has none, so a passwordless
     # job does not get an empty assignment that would shadow the documented ambient env var.
     T_PGSQL_NOTIFY_SPECS="$_notify_specs" \
+    T_PGSQL_PING_URL="$(get_job_value "$job_name" "ping")" \
+    T_PGSQL_PING_START_URL="$(get_job_value "$job_name" "ping_start")" \
+    T_PGSQL_PING_FAIL_URL="$(get_job_value "$job_name" "ping_fail")" \
     T_PGSQL_PASSWORD="${_pw_both:-$T_PGSQL_PASSWORD}" \
     T_PGSQL_FROM_PASSWORD="${_pw_from:-$T_PGSQL_FROM_PASSWORD}" \
     T_PGSQL_TO_PASSWORD="${_pw_to:-$T_PGSQL_TO_PASSWORD}" \
