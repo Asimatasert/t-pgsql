@@ -150,6 +150,7 @@ cmd_batch() {
         local total=$(echo "$jobs" | wc -w | tr -d ' ')
         local current=0
         local failed=0
+        local skipped=0
         local finished=0
         if [ "$PARALLEL" -gt 1 ]; then
             # Parallel execution
@@ -182,6 +183,9 @@ cmd_batch() {
 
                             if [ "$exit_code" -eq 0 ]; then
                                 log_success "[${completed}/${total}] Completed: ${job_names[$i]}"
+                            elif [ "$exit_code" -eq 75 ]; then
+                                log_warn "[${completed}/${total}] Skipped (locked): ${job_names[$i]}"
+                                skipped=$((skipped + 1))
                             else
                                 log_error "[${completed}/${total}] Failed: ${job_names[$i]}"
                                 show_failed_job_output "$temp_dir/${job_names[$i]}.log" "${job_names[$i]}"
@@ -220,6 +224,9 @@ cmd_batch() {
 
                 if [ "$exit_code" -eq 0 ]; then
                     log_success "[${completed}/${total}] Completed: ${job_names[$i]}"
+                elif [ "$exit_code" -eq 75 ]; then
+                    log_warn "[${completed}/${total}] Skipped (locked): ${job_names[$i]}"
+                    skipped=$((skipped + 1))
                 else
                     log_error "[${completed}/${total}] Failed: ${job_names[$i]}"
                     show_failed_job_output "$temp_dir/${job_names[$i]}.log" "${job_names[$i]}"
@@ -243,6 +250,9 @@ cmd_batch() {
 
                 if run_job "$job"; then
                     log_success "[$current/$total] Completed: $job"
+                elif [ $? -eq 75 ]; then
+                    log_warn "[$current/$total] Skipped (locked): $job"
+                    skipped=$((skipped + 1))
                 else
                     log_error "[$current/$total] Failed: $job"
                     failed=$((failed + 1))
@@ -256,7 +266,9 @@ cmd_batch() {
         fi
 
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        if [ $failed -eq 0 ]; then
+        if [ $failed -eq 0 ] && [ $skipped -gt 0 ]; then
+            log_warn "No job failed; $skipped of $total skipped (locked: another run was already working on the same target)"
+        elif [ $failed -eq 0 ]; then
             log_success "All $total jobs completed successfully"
         else
             log_warn "$failed of $total jobs failed"
@@ -274,7 +286,8 @@ cmd_batch() {
                 local status="success"
                 [ $failed -gt 0 ] && status="failed"
                 local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
-                local summary="Completed: $((finished - failed))/$total"$'\n'"Failed: $failed"
+                local summary="Completed: $((finished - failed - skipped))/$total"$'\n'"Failed: $failed"
+                [ "$skipped" -gt 0 ] && summary+=$'\n'"Skipped (locked): $skipped"
                 [ "$finished" -lt "$total" ] && summary+=$'\n'"Not run: $((total - finished))"
                 summary+=$'\n'"Duration: $elapsed"
                 send_notification "$status" "Batch completed: $total jobs" "$summary"

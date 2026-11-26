@@ -140,6 +140,8 @@ parse_args() {
             --pg-bindir) PG_BINDIR="$2"; shift 2 || _need_val "$1" ;;
             --bwlimit) BWLIMIT="$2"; shift 2 || _need_val "$1" ;;
             --retries) RETRIES="$2"; shift 2 || _need_val "$1" ;;
+            --lock-wait) LOCK_WAIT="$2"; LOCK_WAIT_SET=true; shift 2 || _need_val "$1" ;;
+            --no-lock) NO_LOCK=true; shift ;;
 
             --parallel) PARALLEL="$2"; PARALLEL_SET=true; shift 2 || _need_val "$1" ;;
             --continue-on-error) CONTINUE_ON_ERROR=true; CONTINUE_ON_ERROR_SET=true; shift ;;

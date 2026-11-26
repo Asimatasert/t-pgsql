@@ -132,6 +132,8 @@ run_tmp_cleanup() {
         IFS=$'\t' read -r port dest path <<< "$e"
         ssh_exec "$port" "$dest" "rm -f $(pq "$path")" >/dev/null 2>&1 </dev/null
     done
+    # Run lock (src/37-lock.sh): released last, on every exit path; only if we own it.
+    lock_release
 }
 # INT/TERM must clean up AND stop the script: a handler that only cleaned up let the run
 # continue (compress, metadata, notifications) with its credential files already deleted.

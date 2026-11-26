@@ -138,6 +138,9 @@ main() {
         fi
     fi
 
+    # Run lock: a run that targets what another run is writing is skipped (exit 75).
+    lock_acquire_command || exit $?
+
     case "$COMMAND" in
         dump)    cmd_dump;    notify_unreported_failure $? dump ;;
         restore) cmd_restore; notify_unreported_failure $? restore ;;

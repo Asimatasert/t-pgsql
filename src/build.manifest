@@ -6,6 +6,7 @@
 25-metadata.sh
 30-help.sh
 35-connection.sh
+37-lock.sh
 40-password.sh
 45-health.sh
 50-config.sh

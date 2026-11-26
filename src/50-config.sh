@@ -63,6 +63,8 @@ load_config() {
             verbose) [ "$value" = "true" ] && VERBOSE=true ;;
             force) [ "$value" = "true" ] && FORCE=true ;;
             sudo) [ "$value" = "true" ] && SUDO=true ;;
+            lock_wait|lock-wait) [ "$LOCK_WAIT_SET" != true ] && LOCK_WAIT="$value" ;;
+            no_lock|no-lock) [ "$value" = "true" ] && NO_LOCK=true ;;
         esac
     done < "$config_file"
 
