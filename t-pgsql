@@ -1368,6 +1368,9 @@ ping_body() {
     label="${label//[^A-Za-z0-9._-]/_}"
     [ -z "$label" ] && label="-"
     printf 't-pgsql %s %s exit=%s duration=%ss' "$COMMAND" "$label" "$code" "$(( SECONDS - _PING_T0 ))"
+    # A --skip-if-recent skip is healthy (exit 0); mark it so the monitor history shows why.
+    [ "$code" -eq 0 ] && [ -n "$HIST_SKIPPED" ] && printf '\nskipped (recent dump)'
+    return 0
 }
 
 # Called from main() right after validation, before the work starts. Pings only for the

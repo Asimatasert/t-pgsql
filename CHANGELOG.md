@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Docker image: `PG_MAJOR` now defaults to the latest stable PostgreSQL major in PGDG (19);
+  override it with `--build-arg PG_MAJOR=<n>` to match an older target server.
+- `--ping` with `--skip-if-recent`: a skipped run still sends the success ping (a recent dump
+  is a healthy state), and its body now has the extra line `skipped (recent dump)`.
+
 ### Fixed
 - **Telegram bot** reports a job skipped by the run lock (exit status 75) as "Already running" instead of a failed or completed backup.
 
