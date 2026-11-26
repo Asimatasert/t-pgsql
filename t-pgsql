@@ -3848,8 +3848,18 @@ _explain_dump() {
     echo "  --compress <type>      zstd | gzip | xz | bzip2 | none"
     echo "  --keep <N>             keep only the newest N dumps locally"
     echo "  --retention            GFS rotation (daily/weekly/monthly/yearly)"
+    echo "  --min-size-ratio <%>   shrink guard (default 50, 0 = off)"
     echo "  --exclude-table/-data  filter what is dumped"
     echo "  --skip-if-recent <t>   skip if a dump already exists within the window"
+    echo
+    _ex_sec "Shrink guard"
+    echo "  A new dump smaller than --min-size-ratio percent of the previous dump of"
+    echo "  the same database (default 50) is treated as suspect: nothing is rotated"
+    echo "  or deleted, the new file is kept as <name>.suspect (no keep/retention/"
+    echo "  restore/list pattern matches it), the job fails and a notification is sent."
+    echo "  If the shrink is expected, run once with --min-size-ratio 0; the next dump"
+    echo "  then becomes the baseline. Rename or remove the .suspect file when done."
+    echo "  Switching --compress can trigger the guard once. 'doctor' shows the ratio."
     echo
     _ex_sec "Examples"
     echo "  t-pgsql dump --from \"postgres@localhost/appdb\" --compress zstd --keep 7"
@@ -4044,7 +4054,8 @@ _explain_retention() {
     _ex_sec "What it does"
     echo "  With --retention, t-pgsql keeps the newest dump per day/week/month/year up"
     echo "  to the configured counts and prunes the rest. The single newest dump is"
-    echo "  always kept, so retention can never leave a base with nothing."
+    echo "  always kept, so retention can never leave a base with nothing. A new dump"
+    echo "  that fails the shrink guard (--min-size-ratio) stops retention from running."
     echo
     _ex_sec "Key options"
     echo "  --retention                 enable GFS"
@@ -4294,6 +4305,36 @@ cmd_doctor() {
                     if [ -s "$newest" ]; then _dok_ok "$bn — present"; else _dok_fail "$bn — empty file"; fi ;;
             esac
         done <<< "$bases"
+    fi
+
+    # ---- Shrink guard (newest vs previous dump per base) ------------------
+    if [ -n "$bases" ]; then
+        _dok_head "Shrink guard (newest vs previous dump)"
+        if [ "$MIN_SIZE_RATIO" -eq 0 ]; then
+            _dok_note "disabled (--min-size-ratio 0)"
+        else
+            _dok_note "active ratio: a new dump must be at least ${MIN_SIZE_RATIO}% of the previous one"
+            local pnew pprev pns pps psus
+            while IFS= read -r base; do
+                [ -z "$base" ] && continue
+                pnew=$(list_dumps_for_base "$OUTPUT_DIR" "$base" | sed -n 1p)
+                pprev=$(list_dumps_for_base "$OUTPUT_DIR" "$base" | sed -n 2p)
+                psus=$(ls -1 "$OUTPUT_DIR"/"$base"_*.suspect 2>/dev/null | grep -c -E "/${base//[^[:alnum:]_-]/.}_[0-9]{8}_[0-9]{6}")
+                [ "${psus:-0}" -gt 0 ] && _dok_warn "$base — ${psus} dump(s) set aside as .suspect by the shrink guard"
+                if [ -z "$pnew" ] || [ -z "$pprev" ]; then
+                    _dok_ok "$base — only one dump, nothing to compare"
+                    continue
+                fi
+                pns=$(file_size_bytes "$pnew") && pps=$(file_size_bytes "$pprev") || { _dok_note "$base — could not read the dump sizes"; continue; }
+                if [ "${#pns}" -gt 15 ] || [ "${#pps}" -gt 15 ] || [ "$pps" -eq 0 ]; then
+                    _dok_ok "$base — nothing to compare"
+                elif [ $((pns * 100)) -lt $((pps * MIN_SIZE_RATIO)) ]; then
+                    _dok_warn "$base — newest dump is ${pns} bytes, only $((pns * 100 / pps))% of the previous ${pps} bytes (minimum ${MIN_SIZE_RATIO}%)"
+                else
+                    _dok_ok "$base — newest dump is $((pns * 100 / pps))% of the previous one"
+                fi
+            done <<< "$bases"
+        fi
     fi
 
     # ---- Jobs configuration ----------------------------------------------
