@@ -7648,7 +7648,14 @@ bot_run_backup() {
 
         # Send result notification
         local result_text
-        if [ $exit_code -eq 0 ]; then
+        # Exit 75 = skipped, another run holds the lock. `batch` itself exits 0 for a
+        # skipped job, so also recognise its "Skipped (locked)" log line.
+        if [ $exit_code -eq 75 ] || { [ $exit_code -eq 0 ] && grep -q 'Skipped (locked)' "$log_file" 2>/dev/null; }; then
+            result_text="⏳ *Already running*
+📄 Job: \`${job_name}\`
+Another run holds the lock; this request was skipped (not a failure).
+🕐 $(date '+%Y-%m-%d %H:%M:%S')"
+        elif [ $exit_code -eq 0 ]; then
             result_text="✅ *Backup complete*
 📄 Job: \`${job_name}\`
 ⏱ Duration: ${duration}
