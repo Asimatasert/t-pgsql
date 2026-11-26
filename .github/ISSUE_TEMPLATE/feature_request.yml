@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest an addition or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that t-pgsql makes hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like it to do? Small, composable additions fit best.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part?
+      options:
+        - dump / restore / clone
+        - upgrade / globals
+        - batch / jobs.yaml
+        - retention / cleanup
+        - masking
+        - notifications / Telegram bot
+        - doctor / explain
+        - Packaging / install
+        - Docs / man page / completions
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today, or other approaches you weighed.
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd be willing to help implement this

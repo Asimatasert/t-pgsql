@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability (private report)
+    url: https://github.com/Asimatasert/t-pgsql/security/advisories/new
+    about: Please do not open a public issue for security problems. Report them privately here.
+  - name: Question or idea (Discussions)
+    url: https://github.com/Asimatasert/t-pgsql/discussions
+    about: For usage questions, setup help, or open-ended ideas.

@@ -18,3 +18,4 @@ dumps
 *.dump.*
 *.tar.gz
 .secrets
+jobs.yaml

@@ -53,6 +53,17 @@ restore_only_benign_errors() {
     return 0
 }
 
+# Distinct dump base names in a directory (names without the _YYYYMMDD_HHMMSS
+# suffix and extension; a file that does not follow that pattern counts as its
+# own base).
+restore_dump_bases() {
+    ls -1 "$1"/*.tar.gz "$1"/*.dump.zst "$1"/*.dump.xz "$1"/*.dump.bz2 "$1"/*.dump 2>/dev/null \
+        | while IFS= read -r f; do basename "$f"; done \
+        | sed -E -e 's/_[0-9]{8}_[0-9]{6}(_[0-9]+)?\.(tar\.gz|dump\.zst|dump\.xz|dump\.bz2|dump)$//' \
+                 -e 's/\.(tar\.gz|dump\.zst|dump\.xz|dump\.bz2|dump)$//' \
+        | sort -u
+}
+
 cmd_restore() {
     log_info "Starting restore..."
 
@@ -67,6 +78,33 @@ cmd_restore() {
         fi
         FILE=$(ls -t "${norm_dir}/"*.tar.gz "${norm_dir}/"*.dump.zst "${norm_dir}/"*.dump.xz \
                      "${norm_dir}/"*.dump.bz2 "${norm_dir}/"*.dump 2>/dev/null | head -1)
+
+        # With dumps of several databases in the directory, "newest of any" can
+        # restore the wrong database. Prefer the newest dump of the dump name /
+        # source database / target database; stop if none of those exists.
+        if [ -n "$FILE" ]; then
+            local _bases _nb
+            _bases=$(restore_dump_bases "$norm_dir")
+            _nb=$(printf '%s\n' "$_bases" | grep -c .)
+            if [ "$_nb" -gt 1 ]; then
+                local _want=("$DUMP_NAME" "$FROM_DATABASE") _w _pick=""
+                if [ ${#TO_CONNECTIONS[@]} -gt 0 ] && parse_connection "${TO_CONNECTIONS[0]}" "TO" >/dev/null 2>&1; then
+                    _want+=("$TO_DATABASE")
+                fi
+                for _w in "${_want[@]}"; do
+                    [ -z "$_w" ] && continue
+                    _pick=$(list_dumps_for_base "$norm_dir" "$_w" | head -1)
+                    [ -n "$_pick" ] && break
+                done
+                if [ -z "$_pick" ]; then
+                    log_error "Dumps of several databases found in $norm_dir and none matches the dump name or target database:"
+                    printf '%s\n' "$_bases" | sed 's/^/  - /' >&2
+                    log_error "Pass --file <path> to choose one"
+                    return 1
+                fi
+                FILE="$_pick"
+            fi
+        fi
 
         if [ -z "$FILE" ]; then
             log_error "No dump file found. Use --file <path>"
@@ -299,7 +337,7 @@ restore_local() {
 restore_ssh() {
     local dump="$1"
     local remote_dump_dir="/tmp/t-pgsql"
-    ssh -p "$TO_SSH_PORT" "${SSH_OPTS[@]}" "${TO_SSH_USER}@${TO_SSH_HOST}" "mkdir -p $(pq "$remote_dump_dir") && chmod 700 $(pq "$remote_dump_dir")"
+    remote_stage_prepare "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$remote_dump_dir" || return 1
     local remote="${remote_dump_dir}/$(basename "$dump")"
 
     # Check if DB exists on remote (password via remote PGPASSFILE, not argv)

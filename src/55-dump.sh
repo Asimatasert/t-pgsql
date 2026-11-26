@@ -1,6 +1,216 @@
 # ==============================================================================
 # DUMP
 # ==============================================================================
+# Create the remote staging directory and verify it is safe to use: a real
+# directory (not a symlink), owned by the connecting user, with no group/other
+# permissions. The remote script only needs POSIX sh, id, ls and awk, so it
+# behaves the same on Linux and BSD/macOS hosts. A directory pre-created by
+# another account fails this check and the operation is aborted.
+# Usage: remote_stage_prepare PORT USER@HOST DIR
+remote_stage_prepare() {
+    local port="$1" dest="$2" dir="$3" script
+    local body='umask 077
+bad() { echo "remote staging directory $d is unsafe: $1" >&2; exit 1; }
+perms() { ls -ldn "$d" 2>/dev/null | awk '"'"'{print substr($1,1,1), substr($1,5,6), $3}'"'"'; }
+[ -L "$d" ] && bad "it is a symlink"
+mkdir -p "$d" 2>/dev/null
+[ -L "$d" ] && bad "it is a symlink"
+[ -d "$d" ] || bad "it cannot be created"
+set -- $(perms)
+[ "$1" = d ] || bad "it is not a directory"
+[ "$3" = "$(id -u)" ] || bad "it is not owned by the connecting user"
+chmod 700 "$d" 2>/dev/null
+set -- $(perms)
+[ "$1" = d ] && [ "$2" = "------" ] || bad "it grants group/other permissions"
+exit 0'
+    script="d=$(shq "$dir")
+$body"
+    if ! ssh_exec "$port" "$dest" "$script"; then
+        log_error "Remote staging directory $dir failed the safety check on ${dest#*@}; aborting"
+        return 1
+    fi
+    return 0
+}
+
+# Extended regex matching exactly one base name's staged dumps on a remote
+# host: base + _YYYYMMDD_HHMMSS (+ optional _N) + .dump (+ compression ext).
+# Mirrors list_dumps_for_base so "prod" never matches "prod_v2_...".
+# The result has no ^ or / anchor; callers add their own.
+remote_dump_match_re() {
+    # Escape each ERE metacharacter with a bracket expression instead of a
+    # backslash, so GNU grep 3.8+ never reports a "stray \" warning. "/" is an
+    # ordinary character and is left alone.
+    local s="$1" esc="" c i
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            '.'|'*'|'+'|'?'|'('|')'|'{'|'}'|'|'|'$'|'[') esc+="[$c]" ;;
+            ']')  esc+='[]]' ;;
+            '^')  esc+='\^' ;;
+            '\')  esc+='[\]' ;;
+            *)    esc+="$c" ;;
+        esac
+    done
+    printf '%s%s' "$esc" '_[0-9]{8}_[0-9]{6}(_[0-9]+)?\.dump(\.zst|\.xz|\.bz2)?$'
+}
+
+# Confirm a freshly created dump is usable before any rotation removes older
+# dumps. Invalid means: empty, missing the PGDMP magic bytes, or failing the
+# compression stream test. A plain .dump that the LOCAL pg_restore cannot list
+# is still valid: an older client cannot read archives written by a newer
+# pg_dump, which is normal for dumps taken on a remote host. A missing tool only
+# produces a warning.
+verify_dump_integrity() {
+    local f="$1" name; name=$(basename "$f")
+    if [ ! -s "$f" ]; then
+        log_error "Integrity check failed: $name is missing or empty"
+        return 1
+    fi
+    local dec="" tool=""
+    case "$f" in
+        *.tar.gz)
+            if command -v tar >/dev/null 2>&1 && ! tar -tzf "$f" >/dev/null 2>&1; then
+                log_error "Integrity check failed: $name is not a readable tar.gz archive"
+                return 1
+            fi
+            return 0 ;;
+        *.dump.zst) tool=zstd;  dec="zstd -dc" ;;
+        *.dump.xz)  tool=xz;    dec="xz -dc" ;;
+        *.dump.bz2) tool=bzip2; dec="bzip2 -dc" ;;
+        *.dump)     tool="" ;;
+        *) return 0 ;;
+    esac
+
+    local magic
+    if [ -n "$tool" ]; then
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            log_warn "Cannot verify $name: '$tool' not found; skipping readability check"
+            return 0
+        fi
+        if ! "$tool" -t "$f" >/dev/null 2>&1; then
+            log_error "Integrity check failed: $name failed the $tool stream test"
+            return 1
+        fi
+        # First 5 bytes through the decompressor only (cheap, stops early).
+        magic=$($dec "$f" 2>/dev/null | head -c 5)
+    else
+        magic=$(head -c 5 "$f" 2>/dev/null)
+    fi
+    if [ "$magic" != "PGDMP" ]; then
+        log_error "Integrity check failed: $name does not look like a PostgreSQL custom-format archive (missing PGDMP header)"
+        return 1
+    fi
+
+    if [ -z "$tool" ] && command -v pg_restore >/dev/null 2>&1 && ! pg_restore -l "$f" >/dev/null 2>&1; then
+        log_warn "$name could not be listed by the local pg_restore (probably a newer server version); treating it as valid"
+    fi
+    return 0
+}
+
+# Set the new dump aside so no dump pattern (keep-N, retention, restore, fetch,
+# list) matches it any more. It is not deleted. Usage: quarantine_dump FILE
+quarantine_dump() {
+    local f="$1"
+    if [ -e "$f" ] && mv -f "$f" "${f}.invalid" 2>/dev/null; then
+        log_error "The unusable dump was kept as ${f}.invalid; older dumps were not rotated"
+    else
+        log_error "Older dumps were not rotated"
+    fi
+}
+
+# Byte size of a file, portable (GNU stat, BSD stat, then wc). Prints digits only.
+# Usage: file_size_bytes FILE
+file_size_bytes() {
+    local f="$1" s
+    s=$(stat -c %s "$f" 2>/dev/null)
+    [[ "$s" =~ ^[0-9]+$ ]] || s=$(stat -f %z "$f" 2>/dev/null)
+    [[ "$s" =~ ^[0-9]+$ ]] || s=$(wc -c < "$f" 2>/dev/null | tr -d '[:space:]')
+    [[ "$s" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$((10#$s))"
+}
+
+# Human readable byte count (POSIX awk). Usage: human_bytes N
+human_bytes() {
+    awk -v b="$1" 'BEGIN {
+        if (b >= 1073741824) printf "%.1f GB", b / 1073741824
+        else if (b >= 1048576) printf "%.1f MB", b / 1048576
+        else if (b >= 1024) printf "%.1f KB", b / 1024
+        else printf "%d B", b }'
+}
+
+# Newest dump of a base name other than NEWFILE. Quarantined files (.invalid,
+# .suspect) never match list_dumps_for_base. Usage: previous_dump_for_base DIR BASE NEWFILE
+previous_dump_for_base() {
+    local nb p; nb=$(basename "$3")
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        [ "$(basename "$p")" = "$nb" ] && continue
+        printf '%s\n' "$p"
+        return 0
+    done < <(list_dumps_for_base "$1" "$2")
+    return 0
+}
+
+# Shrink guard: fail when the new dump is smaller than MIN_SIZE_RATIO percent of
+# the newest previous dump of the same base name. No previous dump (or an empty
+# one) passes. On failure SHRINK_DETAIL holds a one-line description.
+# Usage: check_dump_shrink NEWFILE BASE
+check_dump_shrink() {
+    local new="$1" base="$2" ratio="${MIN_SIZE_RATIO:-50}" prev ns ps pct
+    SHRINK_DETAIL=""
+    [ "$ratio" -gt 0 ] 2>/dev/null || return 0
+    prev=$(previous_dump_for_base "$(dirname "$new")" "$base" "$new")
+    [ -n "$prev" ] || return 0
+    ns=$(file_size_bytes "$new") || { log_warn "Shrink guard skipped: cannot read the size of $(basename "$new")"; return 0; }
+    ps=$(file_size_bytes "$prev") || { log_warn "Shrink guard skipped: cannot read the size of $(basename "$prev")"; return 0; }
+    # 15 digits (~1 PB) keeps size*100 far inside 64-bit arithmetic.
+    if [ "${#ns}" -gt 15 ] || [ "${#ps}" -gt 15 ]; then
+        log_warn "Shrink guard skipped: dump sizes are out of range"
+        return 0
+    fi
+    [ "$ps" -gt 0 ] || return 0
+    [ $((ns * 100)) -ge $((ps * ratio)) ] && return 0
+    pct=$((ns * 100 / ps))
+    SHRINK_DETAIL="$(basename "$new") is $(human_bytes "$ns") ($ns bytes), $(basename "$prev") is $(human_bytes "$ps") ($ps bytes): ${pct}% of the previous dump, minimum ${ratio}%"
+    log_error "Shrink guard: the new dump is much smaller than the previous one"
+    log_error "  new:      $new ($(human_bytes "$ns"), $ns bytes)"
+    log_error "  previous: $prev ($(human_bytes "$ps"), $ps bytes)"
+    log_error "  ratio ${pct}% is below the --min-size-ratio threshold of ${ratio}%"
+    log_error "  If the shrink is expected, run once with --min-size-ratio 0; the next dump then becomes the baseline"
+    return 1
+}
+
+# Set a dump that failed the shrink guard aside (not deleted) so no dump pattern
+# matches it. Usage: quarantine_suspect_dump FILE
+quarantine_suspect_dump() {
+    local f="$1"
+    if [ -e "$f" ] && mv -f "$f" "${f}.suspect" 2>/dev/null; then
+        log_error "The new dump was kept as ${f}.suspect; older dumps were not rotated or deleted"
+    else
+        log_error "Older dumps were not rotated or deleted"
+    fi
+}
+
+# Apply the external compressor to a freshly written dump (zstd/xz/bzip2 only).
+# Sets COMPRESSED_DUMP_FILE to the resulting artifact (the input when nothing
+# was compressed). Usage: compress_new_dump FILE
+compress_new_dump() {
+    local f="$1"
+    COMPRESSED_DUMP_FILE="$f"
+    case "$COMPRESS" in
+        zstd|xz|bzip2) ;;
+        *) return 0 ;;
+    esac
+    if compress_file "$f"; then
+        case "$COMPRESS" in
+            zstd)  COMPRESSED_DUMP_FILE="${f}.zst" ;;
+            xz)    COMPRESSED_DUMP_FILE="${f}.xz" ;;
+            bzip2) COMPRESSED_DUMP_FILE="${f}.bz2" ;;
+        esac
+    fi
+    return 0
+}
+
 cmd_dump() {
     meta_start
     log_info "Starting dump..."
@@ -21,7 +231,7 @@ cmd_dump() {
     # Run health check before operation
     run_health_checks true false
 
-    mkdir -p "$OUTPUT_DIR"
+    [ "$DRY_RUN" = true ] || mkdir -p "$OUTPUT_DIR"
 
     local ts=$(date '+%Y%m%d_%H%M%S')
     local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
@@ -76,20 +286,33 @@ cmd_dump() {
             if [[ "$t" == *".*" ]]; then
                 local schema_name="${t%.*}"
                 log_info "Expanding wildcard: $t"
-                local tables=""
-                local wc_sql="SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname='$(sqllit "$schema_name")'"
+                local tables="" wc_rc=0
+                # format(%I) quotes upper-case/dotted names so pg_dump's pattern
+                # parser sees each schema.table exactly.
+                local wc_sql="SELECT format('%I.%I', schemaname, tablename) FROM pg_tables WHERE schemaname='$(sqllit "$schema_name")'"
                 if [ "$FROM_TYPE" = "ssh" ]; then
                     local wc_pre; wc_pre="$(remote_pgpass_preamble "$FROM_DB_USER" "$FROM_DB_PASSWORD")"
                     tables=$(ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-                        "${wc_pre}psql -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -d $(pq "$FROM_DATABASE") -tAc $(pq "$wc_sql")")
+                        "${wc_pre}psql -U $(pq "$FROM_DB_USER") -h $(pq "$FROM_DB_HOST") -p $(pq "$FROM_DB_PORT") -d $(pq "$FROM_DATABASE") -tAc $(pq "$wc_sql")") || wc_rc=$?
                 else
                     setup_local_pgpass "$FROM_DB_USER" "$FROM_DB_PASSWORD"
-                    tables=$(psql -U "$FROM_DB_USER" -h "$FROM_DB_HOST" -p "$FROM_DB_PORT" -d "$FROM_DATABASE" -tAc "$wc_sql")
+                    tables=$(psql -U "$FROM_DB_USER" -h "$FROM_DB_HOST" -p "$FROM_DB_PORT" -d "$FROM_DATABASE" -tAc "$wc_sql") || wc_rc=$?
                     cleanup_local_pgpass
                 fi
-                for tbl in $tables; do
+                if [ "$wc_rc" -ne 0 ]; then
+                    # Fail closed: dumping without the exclusion would leak data the
+                    # user asked to keep out of the dump.
+                    log_error "Could not expand --exclude-data pattern '$t' (table lookup failed); aborting dump"
+                    rm -f "$dump_file"
+                    local _xe; _xe=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+                    send_notification "failed" "Dump failed: ${dump_base_name}" "$(build_notify_details "DUMP" "Failed" "$_xe")"
+                    return 1
+                fi
+                local tbl
+                while IFS= read -r tbl; do
+                    [ -z "$tbl" ] && continue
                     exclude_opts="$exclude_opts --exclude-table-data=$(pq "$tbl")"
-                done
+                done <<< "$tables"
             else
                 exclude_opts="$exclude_opts --exclude-table-data=$(pq "$t")"
             fi
@@ -127,12 +350,18 @@ cmd_dump() {
     esac
 
     local result=0
+    local integrity_checked="" shrink_checked="" shrink_failed=false compressed_early=false
     local remote_compressed=false comp_ext=""
 
     if [ "$FROM_TYPE" = "ssh" ]; then
         log_info "Dumping via SSH..."
         local remote_dump_dir="/tmp/t-pgsql"
-        ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "mkdir -p $(pq "$remote_dump_dir") && chmod 700 $(pq "$remote_dump_dir")"
+        if ! remote_stage_prepare "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$remote_dump_dir"; then
+            rm -f "$dump_file"
+            local _elapsed; _elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+            send_notification "failed" "Dump failed: ${DUMP_NAME:-$FROM_DATABASE}" "$(build_notify_details "DUMP" "Failed" "$_elapsed")"
+            return 1
+        fi
         local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
         local remote_file="${remote_dump_dir}/${dump_base_name}_${ts}.dump"
 
@@ -142,9 +371,10 @@ cmd_dump() {
         # manages its own retention, and -1 means keep everything on the source.
         local stale_min=$(( $(parse_time_to_seconds "$FROM_STALE") / 60 ))
         if [ "$FROM_KEEP" -eq 0 ] && [ "$stale_min" -gt 0 ]; then
-            local stale_out
-            stale_out=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-                "find $(pq "$remote_dump_dir") -maxdepth 1 -name $(pq "${dump_base_name}_*.dump*") -mmin +${stale_min} -print -delete 2>/dev/null")
+            local stale_out stale_re
+            stale_re="/$(remote_dump_match_re "$dump_base_name")"
+            stale_out=$(ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+                "find $(shq "$remote_dump_dir") -maxdepth 1 -type f -mmin +${stale_min} -print 2>/dev/null | grep -E $(shq "$stale_re") | while IFS= read -r f; do rm -f -- \"\$f\" && printf '%s\\n' \"\$f\"; done")
             if [ -n "$stale_out" ]; then
                 log_info "Purged $(echo "$stale_out" | wc -l | tr -d ' ') stale source dump(s) older than ${FROM_STALE}"
             fi
@@ -226,6 +456,33 @@ cmd_dump() {
                 fi
             fi
 
+            # Never delete older source dumps (or the source copy) unless the
+            # copy we just received is readable and not suspiciously smaller
+            # than the previous dump. External compression happens first so the
+            # size comparison sees the final artifact.
+            if [ $result -eq 0 ] && [ "$FROM_KEEP" -ge 0 ]; then
+                if [ "$remote_compressed" != true ]; then
+                    compress_new_dump "$dump_file"
+                    dump_file="$COMPRESSED_DUMP_FILE"
+                    compressed_early=true
+                fi
+                if verify_dump_integrity "$dump_file"; then
+                    integrity_checked="$dump_file"
+                    if check_dump_shrink "$dump_file" "$dump_base_name"; then
+                        shrink_checked="$dump_file"
+                    else
+                        quarantine_suspect_dump "$dump_file"
+                        shrink_failed=true
+                        log_error "Keeping existing dumps on the source"
+                        result=1
+                    fi
+                else
+                    quarantine_dump "$dump_file"
+                    log_error "Keeping existing dumps on the source"
+                    result=1
+                fi
+            fi
+
             # Cleanup based on FROM_KEEP — ONLY after a successful transfer, so a
             # failed copy never deletes the only remaining copy on the source.
             if [ $result -eq 0 ] && [ "$FROM_KEEP" -eq 0 ]; then
@@ -234,8 +491,9 @@ cmd_dump() {
             elif [ $result -eq 0 ] && [ "$FROM_KEEP" -gt 0 ]; then
                 log_info "Keeping last $FROM_KEEP dump(s) on source..."
                 local dump_base_name="${DUMP_NAME:-$FROM_DATABASE}"
-                local cleanup_cmd="cd $(pq "$remote_dump_dir") && ls -t $(pq "$dump_base_name")_*.dump* 2>/dev/null | tail -n +$((FROM_KEEP + 1)) | xargs -r rm -f"
-                ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
+                local keep_re; keep_re="^$(remote_dump_match_re "$dump_base_name")"
+                local cleanup_cmd="cd $(shq "$remote_dump_dir") && ls -t -- $(shq "$dump_base_name")_*.dump* 2>/dev/null | grep -E $(shq "$keep_re") | tail -n +$((FROM_KEEP + 1)) | while IFS= read -r f; do rm -f -- \"\$f\"; done"
+                ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "$cleanup_cmd"
             elif [ $result -eq 0 ]; then
                 log_info "Keeping source dump (--from-keep -1)"
             fi
@@ -260,14 +518,27 @@ cmd_dump() {
         # dump_file must be advanced to the compressed artifact so meta_write
         # sees an existing file (and DUMP_FILE reflects what really exists).
         # Skipped when the file already arrived compressed from the source.
-        if [ "$remote_compressed" != true ] && [ "$COMPRESS" != "gzip" ] && [ "$COMPRESS" != "none" ]; then
-            if compress_file "$dump_file"; then
-                case "$COMPRESS" in
-                    zstd)  dump_file="${dump_file}.zst" ;;
-                    xz)    dump_file="${dump_file}.xz" ;;
-                    bzip2) dump_file="${dump_file}.bz2" ;;
-                esac
-            fi
+        if [ "$remote_compressed" != true ] && [ "$compressed_early" != true ]; then
+            compress_new_dump "$dump_file"
+            dump_file="$COMPRESSED_DUMP_FILE"
+        fi
+
+        # Make sure the new dump is usable BEFORE it is wrapped in metadata or
+        # any rotation removes older dumps. Skipped when this very file was
+        # already verified before source-side rotation (once per run).
+        if [ "$integrity_checked" != "$dump_file" ] && ! verify_dump_integrity "$dump_file"; then
+            quarantine_dump "$dump_file"
+            local _ve; _ve=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+            send_notification "failed" "Dump failed: ${dump_base_name}" "$(build_notify_details "DUMP" "Failed" "$_ve")"
+            return 1
+        fi
+
+        # Shrink guard: also before metadata and rotation, once per run.
+        if [ "$shrink_checked" != "$dump_file" ] && ! check_dump_shrink "$dump_file" "$dump_base_name"; then
+            quarantine_suspect_dump "$dump_file"
+            local _se; _se=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+            send_notification "failed" "Dump failed: ${dump_base_name}" "$(build_notify_details "DUMP" "Failed" "$_se")Shrink guard: ${SHRINK_DETAIL}. Re-run with --min-size-ratio 0 if the shrink is expected."
+            return 1
         fi
 
         # Size of the final artifact that actually exists on disk
@@ -295,11 +566,12 @@ cmd_dump() {
         # pg_dump opens its output file before connecting, so a failed run leaves a
         # partial/0-byte .dump behind. Remove it (and any half-written artifact) so a
         # failure does not leave a misleading archive in the output directory.
-        rm -f "$dump_file" "${dump_file}.zst" "${dump_file}.xz" "${dump_file}.bz2" 2>/dev/null
+        [ "$shrink_failed" = true ] || rm -f "$dump_file" "${dump_file}.zst" "${dump_file}.xz" "${dump_file}.bz2" 2>/dev/null
 
         # Send notification
         local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
         local details=$(build_notify_details "DUMP" "Failed" "$elapsed")
+        [ "$shrink_failed" = true ] && details="${details}Shrink guard: ${SHRINK_DETAIL}. Re-run with --min-size-ratio 0 if the shrink is expected."
         send_notification "failed" "Dump failed: ${dump_base_name}" "$details"
 
         return 1

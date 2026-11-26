@@ -16,18 +16,15 @@ load_config() {
         # Skip comments and empty lines
         [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
 
-        # Trim surrounding whitespace, then strip at most one matching pair of
-        # surrounding quotes. Pure bash so it is portable (no GNU-only sed BRE
-        # alternation) and safe on values containing apostrophes (no xargs).
+        # Trim surrounding whitespace, then strip ONE matching pair of surrounding quotes
+        # (a lone trailing quote, as in a password that ends in one, is part of the value).
+        # Pure bash so it is portable (no GNU-only sed BRE alternation) and safe on values
+        # containing apostrophes (no xargs).
         key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
         value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
         case "$value" in
-            \"*) value="${value#\"}" ;;
-            \'*) value="${value#\'}" ;;
-        esac
-        case "$value" in
-            *\") value="${value%\"}" ;;
-            *\') value="${value%\'}" ;;
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
         esac
 
         # Expand a leading ~ to $HOME ONLY for path-type keys — never for passwords
@@ -51,6 +48,7 @@ load_config() {
             archive_output|archive-output) [ "$ARCHIVE_OUTPUT_SET" != true ] && ARCHIVE_OUTPUT="$value" ;;
             archive_keep|archive-keep) [ "$ARCHIVE_KEEP_SET" != true ] && ARCHIVE_KEEP="$value" ;;
             from_keep|from-keep) [ "$FROM_KEEP_SET" != true ] && FROM_KEEP="$value" ;;
+            min_size_ratio|min-size-ratio) [ "$MIN_SIZE_RATIO_SET" != true ] && MIN_SIZE_RATIO="$value" ;;
             from_stale|from-stale) [ "$FROM_STALE_SET" != true ] && FROM_STALE="$value" ;;
             compress) [ "$COMPRESS_SET" != true ] && COMPRESS="$value" ;;
             compress_where|compress-where) [ "$COMPRESS_WHERE_SET" != true ] && COMPRESS_WHERE="$value" ;;

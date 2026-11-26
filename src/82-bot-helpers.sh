@@ -1,10 +1,126 @@
+# Read "telegram_allowed_users" from the defaults: section of the yaml. Understands an inline
+# value (comma string or [a, b]) and a block list ("- 111" lines). Prints nothing when the key
+# is absent; otherwise prints PRESENT: followed by the raw ids (possibly empty).
+bot_yaml_allowed_raw() {
+    awk '
+    /^defaults:/ { d = 1; next }
+    /^[A-Za-z]/ { d = 0; if (k) k = 2 }
+    d && k != 1 && k != 2 && /^  telegram_allowed_users:/ {
+        k = 1; v = $0
+        sub(/^  telegram_allowed_users:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v)
+        val = v; next
+    }
+    k == 1 && /^[ \t]*-([ \t]|$)/ {
+        v = $0; sub(/^[ \t]*-[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v)
+        val = val "," v; next
+    }
+    k == 1 && /^[ \t]*(#.*)?$/ { next }
+    k == 1 { k = 2 }
+    END { if (k) print "PRESENT:" val }
+    ' "$1"
+}
+
+# Print the normalized sender allowlist as ",id1,id2,". Prints nothing when no allowlist is
+# configured. A configured list without any valid numeric id prints "," (matches nobody).
+# Source: TELEGRAM_ALLOWED_USERS (non-empty), else "telegram_allowed_users" under defaults:
+# in the YAML (key present, even when empty or in an unreadable form, counts as configured).
+bot_allowed_users() {
+    local raw="${TELEGRAM_ALLOWED_USERS:-}" present=""
+    [ -n "$raw" ] && present=1
+    if [ -z "$present" ] && [ -f "$JOBS_FILE" ]; then
+        raw=$(bot_yaml_allowed_raw "$JOBS_FILE" 2>/dev/null) || true
+        if [ -n "$raw" ]; then present=1; raw="${raw#PRESENT:}"; fi
+    fi
+    [ -z "$present" ] && return 0
+    raw=$(printf '%s' "$raw" | tr -d '[]"\047 \t')
+    local out="," id ids=()
+    IFS=, read -ra ids <<< "$raw"
+    for id in "${ids[@]}"; do
+        [[ "$id" =~ ^[0-9]+$ ]] && out+="${id},"
+    done
+    printf '%s\n' "$out"
+}
+
+# bot_user_allowed <allowlist> <user_id>: succeeds when no allowlist is set, or when the
+# sender id is a number present in it. A missing or non-numeric id never matches.
+bot_user_allowed() {
+    [ -z "$1" ] && return 0
+    [[ "$2" =~ ^[0-9]+$ ]] || return 1
+    [[ "$1" == *",$2,"* ]]
+}
+
+# Printable sender id for logs (digits only, otherwise "unknown").
+bot_user_label() {
+    [[ "$1" =~ ^[0-9]+$ ]] && echo "$1" || echo unknown
+}
+
+# Owner uid of a path (GNU stat first, BSD stat as fallback).
+bot_file_owner() {
+    stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null
+}
+
+# True when the path is a regular file (not a symlink) owned by the current user.
+bot_safe_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ "$(bot_file_owner "$1")" = "$(id -u)" ]
+}
+
+# Print the per-user state directory (created 700); fail if it is a symlink,
+# not a directory, or not owned by the current user.
+bot_state_dir() {
+    local base="${XDG_STATE_HOME:-}"
+    [ -z "$base" ] && [ -n "$HOME" ] && base="$HOME/.local/state"
+    [ -z "$base" ] && return 1
+    local dir="$base/t-pgsql"
+    [ -L "$dir" ] && return 1
+    if [ ! -e "$dir" ]; then
+        (umask 077; mkdir -p "$dir") 2>/dev/null || return 1
+    fi
+    [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(bot_file_owner "$dir")" = "$(id -u)" ] || return 1
+    chmod 700 "$dir" 2>/dev/null
+    echo "$dir"
+}
+
+# Print the integer stored in an offset file; print nothing and fail if it is not one.
+bot_read_offset() {
+    local v=""
+    read -r v < "$1" 2>/dev/null || true
+    [[ "$v" =~ ^[0-9]+$ ]] || return 1
+    echo "$v"
+}
+
+# Persist the poll offset atomically (temp file in the same directory, then rename).
+# No-op when no safe offset file is available.
+bot_save_offset() {
+    local f="$1" tmp
+    [ -n "$f" ] || return 0
+    tmp=$(umask 077; mktemp "${f}.XXXXXX" 2>/dev/null) || return 0
+    printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+}
+
+bot_valid_job_name() {
+    # Job names from chat or button data: the safe set YAML job keys use, and never
+    # a leading dash (the name is passed to --only).
+    [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]
+}
+
 bot_resolve_yaml() {
     local name="$1"
 
-    # Already a full path
-    if [[ "$name" == *"/"* ]]; then
-        echo "$name"
-        return
+    # The yaml the bot was started with is always addressable: by its base name, by the
+    # base name without ".yaml", or by the exact path it was started with.
+    if [ -n "$JOBS_FILE" ]; then
+        local own_base
+        own_base=$(basename "$JOBS_FILE")
+        if [ "$name" = "$JOBS_FILE" ] || [ "$name" = "$own_base" ] || [ "$name" = "${own_base%.yaml}" ]; then
+            echo "$JOBS_FILE"
+            return
+        fi
+    fi
+
+    # Chat input: only a plain file name inside SCRIPT_DIR is accepted. Paths,
+    # "..", leading dots/dashes and unusual characters resolve to nothing.
+    if [[ ! "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || [[ "$name" == *..* ]]; then
+        return 1
     fi
 
     # Add .yaml extension if missing
@@ -17,9 +133,21 @@ bot_resolve_yaml() {
 bot_check_cooldown() {
     local yaml_path="$1" job_name="$2" cooldown="$3"
 
+    # Use the same base name the dump code uses: ${DUMP_NAME:-$FROM_DATABASE}.
+    # The job name is only a last resort (it is not part of the dump file name).
     local dump_name
     dump_name=$(JOBS_FILE="$yaml_path" get_job_value "$job_name" "dump_name" 2>/dev/null) || true
+    if [ -z "$dump_name" ]; then
+        local profile
+        profile=$(JOBS_FILE="$yaml_path" get_job_field "$job_name" "from" "profile" 2>/dev/null) || true
+        dump_name=$(JOBS_FILE="$yaml_path" get_job_field "$job_name" "from" "database" 2>/dev/null) || true
+        if [ -z "$dump_name" ] && [ -n "$profile" ]; then
+            dump_name=$(JOBS_FILE="$yaml_path" get_profile_value "$profile" "database" 2>/dev/null) || true
+        fi
+    fi
     [ -z "$dump_name" ] && dump_name="$job_name"
+    # The name is used in a file glob: refuse anything that could widen or escape it.
+    [[ "$dump_name" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
 
     local output_dir
     output_dir=$(JOBS_FILE="$yaml_path" get_job_value "$job_name" "output" 2>/dev/null) || true
@@ -29,7 +157,7 @@ bot_check_cooldown() {
     [ ! -d "$output_dir" ] && return 0
 
     local latest
-    latest=$(ls -t "$output_dir"/${dump_name}_*.tar.gz "$output_dir"/${dump_name}_*.dump.zst "$output_dir"/${dump_name}_*.dump "$output_dir"/${dump_name}_*.dump.xz "$output_dir"/${dump_name}_*.dump.bz2 2>/dev/null | head -1) || true
+    latest=$(ls -t "$output_dir/${dump_name}"_*.tar.gz "$output_dir/${dump_name}"_*.dump.zst "$output_dir/${dump_name}"_*.dump "$output_dir/${dump_name}"_*.dump.xz "$output_dir/${dump_name}"_*.dump.bz2 2>/dev/null | head -1) || true
 
     [ -z "$latest" ] && return 0
 
@@ -57,7 +185,12 @@ bot_run_backup() {
         local start_time=$(date +%s)
         # Unique per-run temp log (a fixed /tmp path was symlink-clobberable: a
         # pre-placed symlink would redirect this truncating write to an arbitrary file).
-        local log_file; log_file=$(mktemp "${TMPDIR:-/tmp}/.t-pgsql-bot-$(id -u)-XXXXXX" 2>/dev/null) || log_file="${TMPDIR:-/tmp}/.t-pgsql-bot-$(id -u)-$$.log"
+        # Per-run log in its own private directory under the per-user state dir (not in the
+        # scratch dir, which the exit cleanup removes while the job may still be running).
+        # It is removed only after the job finished and its result was reported.
+        local run_dir log_file=/dev/null
+        run_dir=$(umask 077; mktemp -d "${_BOT_RUNS_DIR:-${TMPDIR:-/tmp}}/run-XXXXXX" 2>/dev/null) || run_dir=""
+        [ -n "$run_dir" ] && log_file="$run_dir/log"
 
         # Run with --skip-if-recent 0 to bypass YAML's skip_if_recent
         "$0" batch all --yaml "$yaml_path" --only "$job_name" --skip-if-recent 0 -y > "$log_file" 2>&1
@@ -91,6 +224,7 @@ bot_run_backup() {
         # raw log output, which routinely contains Markdown metacharacters -> parse_mode would
         # 400 and drop the alert; bot_send_message falls back to plain text.
         bot_send_message "$notify_token" "$notify_chat" "$notify_thread" "$result_text"
+        [ -n "$run_dir" ] && rm -rf "$run_dir"
     ) &
     log_info "Backup started in background (PID: $!)"
 }

@@ -134,6 +134,39 @@ cmd_doctor() {
         done <<< "$bases"
     fi
 
+    # ---- Shrink guard (newest vs previous dump per base) ------------------
+    if [ -n "$bases" ]; then
+        _dok_head "Shrink guard (newest vs previous dump)"
+        if [ "$MIN_SIZE_RATIO" -eq 0 ]; then
+            _dok_note "disabled (--min-size-ratio 0)"
+        else
+            _dok_note "active ratio: a new dump must be at least ${MIN_SIZE_RATIO}% of the previous one"
+            local pnew pprev pns pps psus sf
+            while IFS= read -r base; do
+                [ -z "$base" ] && continue
+                pnew=$(list_dumps_for_base "$OUTPUT_DIR" "$base" | sed -n 1p)
+                pprev=$(list_dumps_for_base "$OUTPUT_DIR" "$base" | sed -n 2p)
+                psus=0
+                for sf in "$OUTPUT_DIR"/"$base"_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]*.suspect; do
+                    [ -e "$sf" ] && psus=$((psus + 1))
+                done
+                [ "$psus" -gt 0 ] && _dok_warn "$base — ${psus} dump(s) set aside as .suspect by the shrink guard"
+                if [ -z "$pnew" ] || [ -z "$pprev" ]; then
+                    _dok_ok "$base — only one dump, nothing to compare"
+                    continue
+                fi
+                pns=$(file_size_bytes "$pnew") && pps=$(file_size_bytes "$pprev") || { _dok_note "$base — could not read the dump sizes"; continue; }
+                if [ "${#pns}" -gt 15 ] || [ "${#pps}" -gt 15 ] || [ "$pps" -eq 0 ]; then
+                    _dok_ok "$base — nothing to compare"
+                elif [ $((pns * 100)) -lt $((pps * MIN_SIZE_RATIO)) ]; then
+                    _dok_warn "$base — newest dump is ${pns} bytes, only $((pns * 100 / pps))% of the previous ${pps} bytes (minimum ${MIN_SIZE_RATIO}%)"
+                else
+                    _dok_ok "$base — newest dump is $((pns * 100 / pps))% of the previous one"
+                fi
+            done <<< "$bases"
+        fi
+    fi
+
     # ---- Jobs configuration ----------------------------------------------
     _dok_head "Jobs configuration"
     if [ -f "$JOBS_FILE" ]; then

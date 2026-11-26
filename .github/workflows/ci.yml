@@ -5,19 +5,57 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build-sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - name: t-pgsql matches src/ (generated file in sync)
         run: ./build.sh --check
       - name: Syntax check (bash -n)
+        shell: bash
         run: |
+          set -euo pipefail
           bash -n t-pgsql
           bash -n build.sh
-          for f in src/*.sh; do bash -n "$f" || echo "note: $f is a fragment, not standalone"; done || true
-      - name: ShellCheck (advisory)
+          bash -n install.sh
+          for f in scripts/*.sh; do bash -n "$f"; done
+          for f in src/*.sh; do bash -n "$f" || echo "note: $f is a fragment, not standalone"; done
+      - name: ShellCheck (blocking, errors only)
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update && sudo apt-get install -y shellcheck
-          shellcheck -S error t-pgsql || true
+          shellcheck -S error t-pgsql install.sh scripts/*.sh
+
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Regression tests (tests/regress/*.sh, when present)
+        run: bash scripts/run-tests.sh
+
+  # NOT a required check. Fails on any branch where the version numbers in the
+  # repository disagree (for example while the stale man page / example config
+  # are still waiting for the documentation changes to land). Keep it advisory
+  # until it is green on the default branch, then make it required.
+  version-consistency-advisory:
+    name: version-consistency (advisory, not required)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Version stamped identically everywhere
+        run: bash scripts/check-version.sh

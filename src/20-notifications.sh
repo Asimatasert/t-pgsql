@@ -22,8 +22,49 @@ json_escape() {
 # Usage: tg_api <token> <method> [curl args...]
 tg_api() {
     local token="$1" method="$2"; shift 2
-    printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$token" "$method" \
-        | curl -s -K - "$@"
+    printf 'url = "%s"\n' "$(_curl_cfg_quote "https://api.telegram.org/bot${token}/${method}")" \
+        | curl -s --connect-timeout 10 --max-time 30 -K - "$@"
+}
+
+# Escape a value for use inside a double-quoted string of a curl config (-K) file:
+# backslash and double quote are escaped, line breaks are dropped (they would end the line).
+_curl_cfg_quote() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//$'\n'/}"
+    v="${v//$'\r'/}"
+    printf '%s' "$v"
+}
+
+# Only plain http(s) URLs are accepted for webhook/slack channels.
+_notify_url_ok() {
+    [[ "$1" =~ ^https?://[^[:space:]]+$ ]]
+}
+
+# POST a JSON payload. The URL (often a secret) goes to curl through a config on stdin
+# (-K -), never on the command line; --fail turns an HTTP error into a non-zero status.
+# Prints curl's output (response body or error text); returns curl's status.
+# Usage: curl_post_json <url> <json-payload>
+curl_post_json() {
+    local url="$1" payload="$2"
+    printf 'url = "%s"\n' "$(_curl_cfg_quote "$url")" \
+        | curl -sS --fail --connect-timeout 10 --max-time 30 -K - \
+            -X POST -H "Content-Type: application/json" -d "$payload" 2>&1
+}
+
+# Mask a notification channel spec for logs: keep the channel name, hide everything after
+# it (the Telegram token, a Slack/webhook URL and an e-mail address are all secrets).
+mask_notify_spec() {
+    case "$1" in
+        *:*) printf '%s:***' "${1%%:*}" ;;
+        *)   printf '%s' "$1" ;;
+    esac
+}
+
+# Mask the value of every --notify option in an argument string (for debug logs).
+redact_notify_args() {
+    printf '%s' "$1" | sed -E "s/(--notify[[:space:]]+['\"]?[A-Za-z]+:)[^[:space:]'\"]*/\1***/g"
 }
 
 send_notification() {
@@ -31,9 +72,19 @@ send_notification() {
     local message="$2"     # Main message
     local details="$3"     # Additional details (optional)
 
-    [ ${#NOTIFY[@]} -eq 0 ] && return 0
-    [ "$QUIET" = true ] && return 0
+    # Remember that a failure was reported (even when no channel is configured), so the
+    # catch-all in main() does not announce the same failure a second time.
+    if [ "$status" = "failed" ] || [ "$status" = "error" ]; then
+        NOTIFY_FAILURE_SENT=true
+    fi
 
+    [ ${#NOTIFY[@]} -eq 0 ] && return 0
+    # A dry run must send nothing.
+    [ "$DRY_RUN" = true ] && return 0
+    # --quiet only reduces console output and success notifications; a failure is always sent.
+    if [ "$QUIET" = true ] && [ "$status" != "failed" ] && [ "$status" != "error" ]; then
+        return 0
+    fi
     # Only notify on error if --notify-on-error is set
     if [ "$NOTIFY_ON_ERROR" = true ] && [ "$status" = "success" ]; then
         return 0
@@ -42,6 +93,13 @@ send_notification() {
     local emoji="✅"
     [ "$status" = "failed" ] || [ "$status" = "error" ] && emoji="❌"
     [ "$status" = "warning" ] && emoji="⚠️"
+
+    # No escape codes in notification text (checked first so ordinary text, including the
+    # trailing newline of the details, is left exactly as it is)
+    if [[ "$message$details" == *$'\033'* || "$message$details" == *'\033['* ]]; then
+        message="$(strip_ansi "$message")"
+        details="$(strip_ansi "$details")"
+    fi
 
     local hostname=$(hostname)
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
@@ -61,9 +119,26 @@ send_notification() {
             webhook:*)  notify_webhook "$channel" "$status" "$message" "$details" "$timestamp" ;;
             slack:*)    notify_slack "$channel" "$emoji" "$message" "$details" "$timestamp" "$hostname" ;;
             email:*)    notify_email "$channel" "$status" "$message" "$details" ;;
-            *)          log_warn "Unknown notification channel: $channel" ;;
+            *)          log_warn "Unknown notification channel: $(mask_notify_spec "$channel")" ;;
         esac
     done
+
+    # A delivery problem is logged by the sender; it must never fail the operation.
+    return 0
+}
+
+# Catch-all for operations that returned a failure without sending their own failure
+# notification (a missing --from, an invalid connection string, a missing password, ...).
+# Passes the status through. Usage: notify_unreported_failure <rc> <operation>
+notify_unreported_failure() {
+    local rc="$1" op="$2"
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$NOTIFY_FAILURE_SENT" != true ]; then
+        local details
+        details="$(build_notify_details "$op" "Failed" "")"
+        send_notification "failed" "${op^} failed" "${details}Stopped before completion (exit code ${rc}); see the log for the reason."
+    fi
+    return "$rc"
 }
 
 # Resolve the "telegram:TOKEN:CHAT[:THREAD]" string for a bare "telegram"
@@ -103,7 +178,8 @@ ${details}
 🕐 ${timestamp}"
 
     # On a failure notification, attach an inline "re-run backup" button whose
-    # callback_data the running bot (t-pgsql bot) understands: backup:<yaml>:<job>.
+    # callback_data the running bot (t-pgsql bot) understands: backup:<yaml>:<job>, or the
+    # short form backup:<job> (the bot then uses the yaml it was started with).
     local callback_data=""
     if [ -n "$JOBS_FILE" ] && [ -n "$CURRENT_JOB_NAME" ]; then
         callback_data="backup:$(basename "$JOBS_FILE"):${CURRENT_JOB_NAME}"
@@ -111,28 +187,41 @@ ${details}
         callback_data="backup:$(basename "$JOBS_FILE"):all"
     fi
 
+    # Telegram rejects callback_data longer than 64 BYTES (the whole request fails with
+    # BUTTON_DATA_INVALID). Fall back to the short form, and send no button at all if even
+    # that is too long.
+    if [ -n "$callback_data" ] && [ "$(printf '%s' "$callback_data" | LC_ALL=C wc -c | tr -d ' ')" -gt 64 ]; then
+        callback_data=""
+        [ -n "$CURRENT_JOB_NAME" ] && callback_data="backup:${CURRENT_JOB_NAME}"
+        if [ "$(printf '%s' "$callback_data" | LC_ALL=C wc -c | tr -d ' ')" -gt 64 ]; then
+            callback_data=""
+        fi
+    fi
+
     local reply_markup=""
     if [[ "$emoji" == "❌" ]] && [ -n "$callback_data" ]; then
         reply_markup='{"inline_keyboard":[[{"text":"🔄 Re-run Backup","callback_data":"'"$(json_escape "${callback_data}")"'"}]]}'
     fi
 
-    # Base args WITHOUT parse_mode; parse_mode is added only to the first (Markdown) attempt
-    # so the plain-text retry can reuse the exact same base (no fragile array filtering).
+    # Base args WITHOUT parse_mode and WITHOUT the button: parse_mode and reply_markup are
+    # added only to the first (Markdown) attempt, so the plain-text retry cannot be sunk by
+    # either of them.
     local base_args=(-X POST
         --data-urlencode "chat_id=${chat_id}"
         --data-urlencode "text=${text}"
         -d "disable_web_page_preview=true")
     [ -n "$thread_id" ] && base_args+=(-d "message_thread_id=${thread_id}")
-    [ -n "$reply_markup" ] && base_args+=(-d "reply_markup=${reply_markup}")
+    local markup_args=()
+    [ -n "$reply_markup" ] && markup_args=(--data-urlencode "reply_markup=${reply_markup}")
 
-    local response=$(tg_api "$token" sendMessage "${base_args[@]}" -d "parse_mode=Markdown" 2>&1)
+    local response=$(tg_api "$token" sendMessage -S "${base_args[@]}" "${markup_args[@]}" -d "parse_mode=Markdown" 2>&1)
     if echo "$response" | grep -q '"ok":true'; then
         log_debug "Telegram notification sent"
         return 0
     fi
     # Markdown parsing fails with HTTP 400 when an interpolated db/host/error name contains a
     # Markdown metacharacter, which would silently drop the whole alert. Retry as PLAIN TEXT.
-    response=$(tg_api "$token" sendMessage "${base_args[@]}" 2>&1)
+    response=$(tg_api "$token" sendMessage -S "${base_args[@]}" 2>&1)
     if echo "$response" | grep -q '"ok":true'; then
         log_debug "Telegram notification sent (plain-text fallback)"
     else
@@ -148,7 +237,10 @@ notify_webhook() {
     local timestamp="$5"
 
     local url="${channel#webhook:}"
-
+    if ! _notify_url_ok "$url"; then
+        log_warn "Webhook notification skipped: the URL must start with http:// or https://"
+        return 1
+    fi
     local payload=$(cat <<EOF
 {
     "status": "$(json_escape "$status")",
@@ -161,9 +253,12 @@ notify_webhook() {
 EOF
 )
 
-    local response=$(curl -s -X POST "$url" \
-        -H "Content-Type: application/json" \
-        -d "$payload" 2>&1)
+    local response
+    response=$(curl_post_json "$url" "$payload")
+    if [ $? -ne 0 ]; then
+        log_warn "Webhook notification failed: $response"
+        return 1
+    fi
 
     log_debug "Webhook response: $response"
 }
@@ -177,7 +272,10 @@ notify_slack() {
     local hostname="$6"
 
     local webhook_url="${channel#slack:}"
-
+    if ! _notify_url_ok "$webhook_url"; then
+        log_warn "Slack notification skipped: the URL must start with http:// or https://"
+        return 1
+    fi
     local color="good"
     [[ "$emoji" == "❌" ]] && color="danger"
     [[ "$emoji" == "⚠️" ]] && color="warning"
@@ -194,9 +292,12 @@ notify_slack() {
 EOF
 )
 
-    curl -s -X POST "$webhook_url" \
-        -H "Content-Type: application/json" \
-        -d "$payload" >/dev/null 2>&1
+    local response
+    response=$(curl_post_json "$webhook_url" "$payload")
+    if [ $? -ne 0 ]; then
+        log_warn "Slack notification failed: $response"
+        return 1
+    fi
 
     log_debug "Slack notification sent"
 }
@@ -212,7 +313,12 @@ notify_email() {
     if command -v mail &>/dev/null; then
         echo -e "Status: $status\n\n$message\n\nDetails:\n$details" | \
             mail -s "[t-pgsql] $status: $message" "$email"
-        log_debug "Email notification sent to $email"
+        if [ $? -eq 0 ]; then
+            log_debug "Email notification sent to $email"
+        else
+            log_warn "Email notification to $email failed"
+            return 1
+        fi
     else
         log_warn "mail command not found, skipping email notification"
     fi

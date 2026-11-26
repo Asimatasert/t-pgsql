@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+### Added
+- **Shrink guard `--min-size-ratio <percent>`** (planned for 3.13.0; also `min_size_ratio`
+  in job YAML and `--config`): a new dump smaller than this percent (0-100, default 50,
+  0 disables) of the previous dump of the same name no longer rotates anything. The new
+  file is kept as `<name>.suspect`, keep-N, retention, archive and source-side cleanup are
+  skipped, the job fails and a failure notification with both sizes is sent. Also applies
+  to `clone`. Run once with `--min-size-ratio 0` if the shrink is expected.
+- `doctor` shows the active ratio, warns when a base's newest dump is below it and reports
+  `.suspect` files; `explain dump` / `explain retention` describe the guard.
+
+### Changed
+- Dump and clone notifications now use the job name instead of the raw database name
+  in their titles, so alerts identify the job unambiguously when several jobs share a
+  database name.
+
 ## [3.12.1] - 2026-07-31
 
 ### Fixed
@@ -28,6 +48,38 @@ All notable changes to this project will be documented in this file.
 - **Orphaned `.meta` files on cleanup**: `--keep`/GFS cleanup now also removes the
   matching `.meta` sidecar when a dump is deleted (previously only the dump itself
   was removed, leaving the metadata file behind).
+
+## [3.11.1] - 2026-07-16
+
+### Fixed
+- **`bwlimit` / `retries` ignored in YAML and config files**: both options existed only on
+  the command line, so a `bwlimit` or `retries` key in a jobs YAML or `--config` file was
+  silently ignored. They are now wired into the batch YAML runner, the config loader and
+  the job serializer, and pass through the existing strict validation.
+
+## [3.11.0] - 2026-07-16
+
+### Added
+- **`doctor` command**: local, read-only environment and backup health checks (required
+  and optional tools, output directory and free disk space, freshness of each database's
+  newest dump, readability of the newest archives, the jobs file, and optional
+  connectivity with `--from`/`--to`). Exits non-zero when it finds a problem.
+- **`explain` command**: built-in, offline reference for what each command is for and when
+  to use it, with key options and examples.
+- Completions for the `bot` command (bash, zsh, fish).
+
+## [3.10.0] - 2026-07-16
+
+### Added
+- **`--compress-where source|target`**: for SSH dumps with `zstd`/`xz`/`bzip2`, compress on
+  the source host before the transfer. Falls back to target-side compression with a
+  warning if the tool is missing on the source. Default `target` (previous behaviour).
+- **`--from-stale <time>`**: with `--from-keep 0`, purge this job's leftover staging dumps
+  from failed runs on the source before dumping (default `72h`, `0` disables).
+
+### Fixed
+- Retention and fetch globs for source staging dumps now also match compressed artifacts.
+- `compress_where` and `from_stale` keys in a jobs YAML were not passed to batch jobs.
 
 ## [3.9.0] - 2026-07-02
 
@@ -142,7 +194,7 @@ Audit remediation release. Hardening and correctness fixes across the tool plus 
 - Fish shell completion
 - man page
 
-## [3.3.0] - 2025-01-05
+## [3.3.0] - 2026-01-05
 
 ### Added
 - **Profile-based job configuration**: Define reusable connection profiles in `jobs.yaml` to reduce repetition
@@ -151,7 +203,7 @@ Audit remediation release. Hardening and correctness fixes across the tool plus 
 
 ### Changed
 - Remote dump files are now stored in `/tmp/t-pgsql/` instead of `/tmp/` for better organization
-- Updated all README documentation (EN, DE, ES, RU) with new jobs.yaml format examples
+- Updated all README documentation with new jobs.yaml format examples
 
 ### Fixed
 - Jobs list now correctly shows only jobs, not profiles or defaults sections

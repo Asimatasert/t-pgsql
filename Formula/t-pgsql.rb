@@ -12,6 +12,12 @@ class TPgsql < Formula
   depends_on "postgresql"
   depends_on "curl"
 
+  # Optional tools the script calls only for the matching feature: zstd, xz,
+  # bzip2 (compressed dumps), pv (progress), python3 (bot JSON parsing) and
+  # ssh/scp (remote hosts; ships with macOS). Homebrew cannot express
+  # "recommended" dependencies in a core-style formula, so install them
+  # yourself: brew install zstd xz pv
+
   def install
     bin.install "t-pgsql"
     zsh_completion.install "completions/_t-pgsql"

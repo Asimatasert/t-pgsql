@@ -19,29 +19,42 @@ cmd_fetch() {
 
     mkdir -p "$OUTPUT_DIR"
 
+    remote_stage_prepare "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" "/tmp/t-pgsql" || return 1
+
     # Determine which file to fetch
     local remote_file=""
 
     if [ -n "$FROM_FILE" ] && [ "$FROM_FILE" != "latest" ]; then
+        # Only a file name (or glob) inside the staging directory is valid.
+        case "$FROM_FILE" in
+            */*|-*)
+                log_error "--from-file must be a file name inside /tmp/t-pgsql on the source (no '/', not starting with '-'): $FROM_FILE"
+                return 1
+                ;;
+        esac
         # User specified file/pattern
-        if [[ "$FROM_FILE" == *"*"* ]]; then
-            # Glob pattern - find latest matching
+        if [[ "$FROM_FILE" == *"*"* || "$FROM_FILE" == *"?"* ]]; then
+            # Glob pattern - find latest matching. Quote the value, leaving only
+            # * and ? active as wildcards.
             log_info "Finding latest match for: $FROM_FILE"
-            remote_file=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-                "ls -t /tmp/t-pgsql/$FROM_FILE 2>/dev/null | head -1")
+            local from_glob sq="'"; from_glob=$(shq "$FROM_FILE")
+            from_glob="${from_glob//\*/${sq}*${sq}}"
+            from_glob="${from_glob//\?/${sq}?${sq}}"
+            local glob_name
+            glob_name=$(ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+                "cd /tmp/t-pgsql && ls -t -- $from_glob 2>/dev/null | head -1")
+            [ -n "$glob_name" ] && remote_file="/tmp/t-pgsql/$glob_name"
         else
-            # Exact filename - check if it has path
-            if [[ "$FROM_FILE" == /* ]]; then
-                remote_file="$FROM_FILE"
-            else
-                remote_file="/tmp/t-pgsql/$FROM_FILE"
-            fi
+            remote_file="/tmp/t-pgsql/$FROM_FILE"
         fi
     else
         # Auto-find latest dump for database (--from-file or --from-file latest)
         log_info "Finding latest dump for: $FROM_DATABASE"
-        remote_file=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-            "ls -t /tmp/t-pgsql/$(pq "$FROM_DATABASE")_*.dump* 2>/dev/null | head -1")
+        local latest_re latest_name
+        latest_re="^$(remote_dump_match_re "$FROM_DATABASE")"
+        latest_name=$(ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+            "cd /tmp/t-pgsql && ls -t -- $(shq "$FROM_DATABASE")_*.dump* 2>/dev/null | grep -E $(shq "$latest_re") | head -1")
+        [ -n "$latest_name" ] && remote_file="/tmp/t-pgsql/$latest_name"
     fi
 
     if [ -z "$remote_file" ]; then
@@ -50,8 +63,8 @@ cmd_fetch() {
     fi
 
     # Check file exists
-    local exists=$(ssh -p "$FROM_SSH_PORT" "${SSH_OPTS[@]}" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
-        "[ -f '$remote_file' ] && echo 'yes' || echo 'no'")
+    local exists=$(ssh_exec "$FROM_SSH_PORT" "${FROM_SSH_USER}@${FROM_SSH_HOST}" \
+        "[ -f $(shq "$remote_file") ] && echo yes || echo no")
 
     if [ "$exists" != "yes" ]; then
         log_error "File not found: $remote_file"

@@ -13,10 +13,13 @@ complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "clone" -d
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "upgrade" -d "Logical major-version migration"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "fetch" -d "Fetch existing dump from remote"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "batch" -d "Run multiple jobs"
+complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "bot" -d "Telegram bot (listen for commands)"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "jobs" -d "Manage saved jobs"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "list" -d "List dump files"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "meta" -d "Show metadata"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "clean" -d "Clean old dumps"
+complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "doctor" -d "Check environment and backup health"
+complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "explain" -d "Explain what a command is for"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "version" -d "Show version"
 complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "help" -d "Show help"
 
@@ -24,6 +27,9 @@ complete -c t-pgsql -n "not __fish_seen_subcommand_from $commands" -a "help" -d 
 complete -c t-pgsql -n "__fish_seen_subcommand_from jobs" -a "list" -d "List all jobs"
 complete -c t-pgsql -n "__fish_seen_subcommand_from jobs" -a "show" -d "Show job details"
 complete -c t-pgsql -n "__fish_seen_subcommand_from jobs" -a "remove" -d "Remove a job"
+
+# Explain topics
+complete -c t-pgsql -n "__fish_seen_subcommand_from explain" -a "dump restore clone stream upgrade fetch batch jobs bot list meta clean doctor masking retention" -d "Topic"
 
 # Connection options
 complete -c t-pgsql -l from -d "Source connection"
@@ -47,12 +53,17 @@ complete -c t-pgsql -l only-schema -d "Only these schemas"
 complete -c t-pgsql -l compress -d "Compression type" -xa "gzip zstd xz bzip2 none"
 complete -c t-pgsql -l compress-level -d "Compression level 1-9"
 complete -c t-pgsql -l pg-compress-level -d "pg_dump compression 0-9"
+complete -c t-pgsql -l compress-where -d "Where to compress SSH dumps" -xa "source target"
 
 # Storage options
 complete -c t-pgsql -l output -d "Output directory" -ra "(__fish_complete_directories)"
 complete -c t-pgsql -l dump-name -d "Custom dump filename"
 complete -c t-pgsql -l keep -d "Keep N local dumps"
 complete -c t-pgsql -l from-keep -d "Keep N on source"
+complete -c t-pgsql -l min-size-ratio -d "Fail if new dump is smaller than this percent of the previous" -xa "0 25 50 75 100"
+complete -c t-pgsql -l from-stale -d "Purge stale remote dumps older than"
+complete -c t-pgsql -l archive-output -d "Move aged-out dumps here" -ra "(__fish_complete_directories)"
+complete -c t-pgsql -l archive-keep -d "Keep N dumps in archive"
 complete -c t-pgsql -l skip-if-recent -d "Skip if recent dump exists" -xa "today 24h 12h 6h 1d"
 complete -c t-pgsql -l from-file -d "Fetch existing dump" -r
 complete -c t-pgsql -l file -d "Dump file" -r
@@ -87,6 +98,10 @@ complete -c t-pgsql -l stream-buffer -d "Buffer size MB"
 complete -c t-pgsql -l sudo -d "Use sudo"
 complete -c t-pgsql -l globals -d "Also migrate roles/tablespaces"
 complete -c t-pgsql -l pg-bindir -d "PostgreSQL client bin dir" -ra "(__fish_complete_directories)"
+complete -c t-pgsql -l bwlimit -d "Cap transfer bandwidth (e.g. 10m, 500k)"
+complete -c t-pgsql -l retries -d "Retry failed scp transfers"
+complete -c t-pgsql -l token -d "Telegram bot token"
+complete -c t-pgsql -l cooldown -d "Bot cooldown between backups"
 complete -c t-pgsql -l parallel -d "Parallel jobs"
 complete -c t-pgsql -l continue-on-error -d "Continue on error"
 complete -c t-pgsql -l only-jobs -d "Only run these batch jobs"

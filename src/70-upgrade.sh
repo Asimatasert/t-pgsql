@@ -23,12 +23,18 @@ server_version_num() {
         local pre; pre="$(remote_pgpass_preamble "${!uvar}" "${!wvar}")"
         local rcmd="${pre}psql -U $(pq "${!uvar}") -h $(pq "${!hvar}") -p $(pq "${!pvar}") -d postgres -tAc $(pq "SHOW server_version_num") 2>/dev/null"
         v=$(ssh_exec "${!spvar}" "${!suvar}@${!shvar}" "$rcmd" | tr -d '[:space:]')
-        printf '%s' "$v"
-        return 0
+    else
+        setup_local_pgpass "${!uvar}" "${!wvar}"
+        v=$(psql -U "${!uvar}" -h "${!hvar}" -p "${!pvar}" -d postgres -tAc "SHOW server_version_num" 2>/dev/null | tr -d '[:space:]')
+        cleanup_local_pgpass
     fi
-    setup_local_pgpass "${!uvar}" "${!wvar}"
-    v=$(psql -U "${!uvar}" -h "${!hvar}" -p "${!pvar}" -d postgres -tAc "SHOW server_version_num" 2>/dev/null | tr -d '[:space:]')
-    cleanup_local_pgpass
+    # The answer comes from a remote server: it is later used in $(( )), where bash
+    # evaluates array subscripts and command substitutions. Accept plain digits only
+    # (no leading zero: avoids octal parsing); anything else counts as "unknown".
+    if [ -n "$v" ] && ! [[ "$v" =~ ^[1-9][0-9]{0,8}$ ]]; then
+        log_warn "Ignoring non-numeric server_version_num answer from ${prefix} server" >&2
+        v=""
+    fi
     printf '%s' "$v"
 }
 
@@ -72,10 +78,20 @@ apply_globals_to_target() {
         fi
         # Feed the globals as a quoted here-doc appended to the command (which itself,
         # with the pgpass preamble, travels on ssh's stdin via ssh_exec — never argv).
-        # The delimiter is unquoted content: psql reads the here-doc, not ssh stdin.
-        rcmd+=" <<'__TPG_GLOBALS_EOF__'
+        # The terminator is random per call and verified not to occur as a line of the
+        # dump, so dump content (role names, comments) can never close the here-doc and
+        # reach the remote shell.
+        local term=""
+        for _ in 1 2 3 4 5; do
+            term="__TPG_GLOBALS_$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')__"
+            [ "${#term}" -gt 20 ] || { log_error "Cannot generate a random here-doc terminator"; return 1; }
+            grep -Fxq -- "$term" "$gfile" || break
+            term=""
+        done
+        [ -n "$term" ] || { log_error "Cannot find a here-doc terminator absent from the globals dump"; return 1; }
+        rcmd+=" <<'$term'
 $(cat "$gfile")
-__TPG_GLOBALS_EOF__"
+$term"
         errout=$(ssh_exec "$TO_SSH_PORT" "${TO_SSH_USER}@${TO_SSH_HOST}" "$rcmd" 2>&1 >/dev/null)
     else
         setup_local_pgpass "$TO_DB_USER" "$TO_DB_PASSWORD"

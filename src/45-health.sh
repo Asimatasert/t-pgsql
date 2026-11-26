@@ -114,6 +114,9 @@ run_health_checks() {
 
     if [ $failed -eq 1 ] && [ "$HEALTH_CHECK_FAIL" = true ]; then
         log_error "Health check failed, aborting (--health-check-fail)"
+        local _hc_details
+        _hc_details="$(build_notify_details "HEALTH" "Failed" "")"
+        send_notification "failed" "Health check failed: ${DUMP_NAME:-${FROM_DATABASE:-$TO_DATABASE}}" "${_hc_details}Aborted by --health-check-fail before the operation started."
         exit 1
     fi
 

@@ -2,8 +2,36 @@
 # MAIN
 # ==============================================================================
 main() {
+    # Dumps, archives, logs and job files hold database contents and credentials, so
+    # everything this tool creates is private (0600/0700) by default. Setups that share
+    # dumps through group permissions can relax it with T_PGSQL_UMASK (e.g. 027 or 007).
+    local _umask="${T_PGSQL_UMASK:-077}" _umask_warn=""
+    if [[ "$_umask" =~ ^[0-7]{1,4}$ ]]; then
+        umask "$_umask"
+        # "other" read bit (4) clear in the mask means new files are world-readable
+        if [ $(( 8#$_umask & 4 )) -eq 0 ]; then
+            _umask_warn="T_PGSQL_UMASK=$_umask leaves new files (dumps, logs) readable by every local user"
+        fi
+    else
+        umask 077
+        _umask_warn="Ignoring invalid T_PGSQL_UMASK '$_umask' (expected one to four octal digits such as 077, 027 or 22); using 077"
+    fi
+
     install_cleanup_trap
     parse_args "$@"
+    [ -n "$_umask_warn" ] && log_warn "$_umask_warn"
+
+    # Notification specs handed over by a parent job run (run_job sets T_PGSQL_NOTIFY_SPECS
+    # for its re-exec'd child). This is an INTERNAL variable, not a user option: it holds
+    # the bot token, so it travels in the environment rather than on argv. Consume and drop
+    # it so nothing we spawn (pg_dump, ssh, ...) inherits it.
+    if [ -n "${T_PGSQL_NOTIFY_SPECS:-}" ]; then
+        local _spec
+        while IFS= read -r _spec; do
+            [ -n "$_spec" ] && NOTIFY+=("$_spec")
+        done <<< "$T_PGSQL_NOTIFY_SPECS"
+    fi
+    unset T_PGSQL_NOTIFY_SPECS
 
     # Use a specific PostgreSQL client version if requested (affects all LOCAL
     # pg_dump/pg_restore/psql/createdb/pg_dumpall calls; not SSH-remote ones).
@@ -42,6 +70,12 @@ main() {
             exit 1
         fi
     done
+
+    # --min-size-ratio is a percentage: 0 (off) to 100.
+    if ! [[ "$MIN_SIZE_RATIO" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$MIN_SIZE_RATIO" -gt 100 ]; then
+        log_error "Invalid --min-size-ratio '${MIN_SIZE_RATIO}': expected an integer from 0 to 100 (0 disables the check)"
+        exit 1
+    fi
 
     # --cooldown (bot) is a time string; validate its format so it can't reach the
     # bot's $(( )) arithmetic as an injection payload.
@@ -105,11 +139,11 @@ main() {
     fi
 
     case "$COMMAND" in
-        dump)    cmd_dump ;;
-        restore) cmd_restore ;;
-        clone)   cmd_clone ;;
-        upgrade) cmd_upgrade ;;
-        fetch)   cmd_fetch ;;
+        dump)    cmd_dump;    notify_unreported_failure $? dump ;;
+        restore) cmd_restore; notify_unreported_failure $? restore ;;
+        clone)   cmd_clone;   notify_unreported_failure $? clone ;;
+        upgrade) cmd_upgrade; notify_unreported_failure $? upgrade ;;
+        fetch)   cmd_fetch;   notify_unreported_failure $? fetch ;;
         batch)   cmd_batch "$BATCH_JOB" ;;
         bot)     cmd_bot ;;
         list)    cmd_list ;;

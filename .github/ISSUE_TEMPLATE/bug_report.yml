@@ -1,0 +1,70 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please **remove passwords, tokens, real hostnames
+        and IP addresses** from everything you paste. Use placeholders such as
+        `example.com` and `192.0.2.10`.
+
+        Security problems must **not** be reported here; see the private
+        reporting link on the issue chooser page.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran, with credentials removed.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: t-pgsql version
+      description: Output of `t-pgsql --version`
+    validations:
+      required: true
+  - type: input
+    id: pg-client
+    attributes:
+      label: PostgreSQL client version
+      description: Output of `pg_dump --version` (and `psql --version` if different)
+    validations:
+      required: true
+  - type: input
+    id: pg-server
+    attributes:
+      label: PostgreSQL server version(s)
+      description: Source and target server versions, e.g. `16.4 -> 18.1`
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and Bash version
+      description: e.g. Debian 12, Bash 5.2 / macOS 14, Bash 5.2 from Homebrew
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `t-pgsql doctor`
+      description: Paste the output with hostnames and addresses replaced by placeholders.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Re-run with `-v` or `--log-level debug` if useful. Redact secrets.
+      render: shell

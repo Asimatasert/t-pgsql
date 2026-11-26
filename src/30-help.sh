@@ -93,6 +93,10 @@ STORAGE:
                                   (-1=keep all, 0=delete immediately; default: -1)
     --from-keep <N>               For SSH sources: how many dumps to keep in the remote
                                   /tmp staging dir (default: 1, -1=all, 0=delete)
+    --min-size-ratio <percent>    Shrink guard: fail when the new dump is smaller than
+                                  this percent of the previous dump of the same name
+                                  (0-100, default: 50, 0 disables). The new file is
+                                  kept as <name>.suspect and nothing is rotated.
     --from-stale <time>           With --from-keep 0: before dumping, purge this job's
                                   leftover dumps older than <time> from the remote
                                   staging dir — failed runs never reach the normal
@@ -122,7 +126,8 @@ NOTIFY:
                                   telegram|telegram:TOKEN:CHAT
                                   webhook:URL|email:ADDR|slack:URL
     --notify-on-error             Only notify on error
-    --quiet                       No notifications
+    -q, --quiet                   Minimal console output; success notifications are
+                                  suppressed, failures are still notified
 
 MASKING:
     --mask                        Enable data masking
@@ -141,8 +146,13 @@ BATCH:
     --only-jobs <j1,j2>           Run only these jobs   (alias: --only)
     --exclude-jobs <j1,j2>        Skip these jobs       (alias: --exclude)
     --notify-summary              Summary notification
+    --save <name>                 Save the current command line as job <name> in the
+                                  jobs file instead of running it
+    --batch <job|all>             Run saved job(s); same as: batch <job|all>
 
 MIGRATION / UPGRADE:
+    --sudo                        On SSH sources, run pg_dump via sudo -u <db user>
+                                  instead of password auth (peer authentication)
     --globals                     Also migrate cluster globals (roles, tablespaces)
                                   from source to every target (local/TCP or SSH)
     --pg-bindir <dir>             Use PostgreSQL client tools from <dir> for local
@@ -172,8 +182,11 @@ GENERAL:
     --log <file>                  Log file
     --log-level <level>           debug|info|warn|error
     -v, --verbose                 Verbose output
-    -q, --quiet                   Minimal output
+    -q, --quiet                   Minimal console output; success notifications are
+                                  suppressed, failures are still notified
     -y, --yes                     Skip confirmations
+    -f, --force                   Overwrite an existing target database (restore into a
+                                  temporary database, swapped in only on success)
     --dry-run                     Show actions without executing
     --no-meta                     Don't write .meta files
     -h, --help                    Show help

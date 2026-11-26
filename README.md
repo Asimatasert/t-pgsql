@@ -1,8 +1,12 @@
 # t-pgsql
 
+[![CI](https://github.com/Asimatasert/t-pgsql/actions/workflows/ci.yml/badge.svg)](https://github.com/Asimatasert/t-pgsql/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/Asimatasert/t-pgsql)](https://github.com/Asimatasert/t-pgsql/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/Asimatasert/t-pgsql)](LICENSE)
+
 Advanced CLI tool for backing up, restoring, and synchronizing PostgreSQL databases.
 
-**Documentation:** [Español](README_ES.md) | [Русский](README_RU.md) | [Deutsch](README_DE.md)
+See also: [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
 
 ## Features
 
@@ -303,6 +307,8 @@ The tar archive contains:
 - `database_YYYYMMDD_HHMMSS.dump` - PostgreSQL dump file (or custom name)
 - `metadata.yaml` - Operation information
 
+With `--compress zstd|xz|bzip2` the dump is kept as a standalone `database_YYYYMMDD_HHMMSS.dump.zst|xz|bz2` file and its metadata is written next to it as a `.meta` sidecar (disable with `--no-meta`).
+
 ---
 
 ### restore
@@ -325,7 +331,7 @@ Restores a dump file to a database.
   --to "postgres@localhost/mydb_copy" \
   --to-password-file .secrets/local.pass
 
-# Drop and recreate existing DB
+# Replace an existing target database (restores into a temporary database first, swapped in only on success)
 ./t-pgsql restore \
   --file ./dumps/prod_backup.tar.gz \
   --to "postgres@localhost/test_db" \
@@ -333,7 +339,7 @@ Restores a dump file to a database.
   --force
 ```
 
-> **Note:** If `--file` is not specified, automatically finds the latest `.tar.gz` file in the `--output` directory.
+> **Note:** If `--file` is not specified, automatically finds the newest dump file (`.tar.gz`, `.dump`, `.dump.zst`, `.dump.xz` or `.dump.bz2`) in the `--output` directory.
 
 ---
 
@@ -442,10 +448,10 @@ mydb_20251229_143022.tar.gz              15MiB 2025-12-29 14:30
 
 ### meta
 
-Displays metadata information from a dump archive.
+Displays metadata information for a dump (the newest one in `--output` if `--file` is omitted).
 
 ```bash
-./t-pgsql meta --file <archive.tar.gz>
+./t-pgsql meta [--file <archive>]
 ```
 
 **Example output:**
@@ -476,7 +482,7 @@ operation:
   exit_code: 0
 
 environment:
-  script_version: "3.10.0"
+  script_version: "3.12.1"
   executed_by: dbadmin
   executed_on: macbookair
   working_dir: /opt/t-pgsql/t-pgsql
@@ -486,10 +492,12 @@ environment:
 
 ### clean
 
-Cleans old dump files.
+Cleans old dump files for one database or dump name. A target is required (a positional database name, `--from <connection>` or `--dump-name`), together with `--keep <N>` or `--retention`. The newest dump is always kept; add `--dry-run` to preview.
 
 ```bash
-./t-pgsql clean [--output <directory>] [--keep <N>]
+./t-pgsql clean <db> [--output <directory>] --keep <N>
+./t-pgsql clean --from <connection> --keep <N>
+./t-pgsql clean --dump-name <name> --retention
 ```
 
 ---
@@ -722,9 +730,10 @@ jobs:
 
 | Option | Description |
 |--------|-------------|
-| `force` | Drop and recreate existing database |
+| `force` | Overwrite an existing database (restore into a temporary database, swapped in only on success) |
 | `verbose` | Show detailed output |
 | `from_keep` | Number of dumps to keep on source |
+| `min_size_ratio` | Shrink guard percent (0-100, default 50, 0 disables) |
 | `keep` | Number of local dumps to keep |
 | `dump_name` | Custom dump filename (without timestamp) |
 | `skip_if_recent` | Skip if dump exists within timeframe (e.g., `24h`, `1d`, `today`) |
@@ -769,6 +778,38 @@ jobs:
     retention_daily: 7
     retention_weekly: 4
 ```
+
+### Shrink guard
+
+A backup that suddenly comes out much smaller than the last one is usually broken
+(empty schema, wrong database, truncated output), and rotating it in would replace the
+last good copy. `--min-size-ratio <percent>` (0-100, default `50`, `0` disables) compares
+the size of the new dump, after compression, with the newest previous dump of the same
+name in the output directory (`prod` and `prod_v2` are separate). It also works as
+`min_size_ratio` in a jobs.yaml job or a `--config` file. A new dump passes when
+`new_size * 100 >= previous_size * percent`; the first dump of a name always passes.
+
+When the check fails:
+
+- the new dump is kept as `<name>.suspect` (never deleted; no keep, retention, restore,
+  list or fetch pattern matches it);
+- no older dump is rotated, archived or deleted, locally or on the SSH source
+  (`--from-keep`), and no metadata is written;
+- the command exits non-zero and a failure notification with both sizes is sent.
+
+```text
+[ERROR] Shrink guard: the new dump is much smaller than the previous one
+[ERROR]   new:      /backups/prod_20260301_020000.dump (1.2 MB, 1258291 bytes)
+[ERROR]   previous: /backups/prod_20260228_020000.dump (48.0 MB, 50331648 bytes)
+[ERROR]   ratio 2% is below the --min-size-ratio threshold of 50%
+[ERROR]   If the shrink is expected, run once with --min-size-ratio 0; the next dump then becomes the baseline
+```
+
+If the shrink is expected (data purge, a different `--compress`, an `--exclude-data`
+change), run once with `--min-size-ratio 0`; the next dump is then the baseline. Sizes
+are compared as stored, so switching `--compress` can trigger the guard once. `clone`
+uses the same dump step and is guarded too. `t-pgsql doctor` prints the active ratio,
+warns when the newest dump is below the threshold and reports `.suspect` files.
 
 ### Data Masking
 
@@ -1005,7 +1046,7 @@ notify: "telegram:TOKEN:CHAT"               # repeatable
 verbose: true
 ```
 
-Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_password`, `password_file`/`from_password_file`/`to_password_file`, `output`, `keep`, `from_keep`, `compress`, `exclude_table`/`exclude_data`/`exclude_schema`, `only_table`/`only_schema`, `notify` (repeatable), and booleans `verbose`/`force`/`sudo`. `~` is expanded only for path-type keys — never for passwords or connection strings.
+Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_password`, `password_file`/`from_password_file`/`to_password_file`, `output`, `keep`, `from_keep`, `min_size_ratio`, `from_stale`, `archive_output`, `archive_keep`, `compress`, `compress_where`, `bwlimit`, `retries`, `exclude_table`/`exclude_data`/`exclude_schema`, `only_table`/`only_schema`, `notify` (repeatable), and booleans `verbose`/`force`/`sudo`. Dashes work in place of underscores (e.g. `from-keep`). `~` is expanded only for path-type keys — never for passwords or connection strings.
 
 ---
 
@@ -1067,6 +1108,7 @@ Supported keys mirror the flags: `from`, `to`, `password`/`from_password`/`to_pa
 | `--archive-output <dir>` | When a dump ages out of `--keep`, move it here instead of deleting (a second, e.g. cheaper/less redundant, tier) | - | No | `/backups/archive` |
 | `--archive-keep <N>` | Number of dumps to keep in `--archive-output` | `-1` (all) | No | `23`, `0` (delete immediately), `-1` (all) |
 | `--from-keep <N>` | Number of dumps to keep on source | `1` | No | `3`, `0` (delete), `-1` (all) |
+| `--min-size-ratio <percent>` | Shrink guard: fail when the new dump is smaller than this percent of the previous dump of the same name; see [Shrink guard](#shrink-guard) | `50` | No | `0` (off), `30`, `100` |
 | `--from-stale <time>` | With `--from-keep 0`: purge this job's leftover dumps older than `<time>` from the source staging dir before dumping (failed runs never reach the normal cleanup) | `72h` | No | `48h`, `2d`, `0` (off) |
 | `--dump-name <name>` | Custom dump filename (without timestamp) | Database name | No | `myapp-backup` |
 | `--skip-if-recent <time>` | Skip if dump exists within timeframe | - | No | `24h`, `12h`, `1d`, `today` |
@@ -1161,12 +1203,12 @@ Apply to SSH/scp transfers (and the `--stream` pipe when `pv` is installed).
 
 | Parameter | Description | Default | Required | Example |
 |-----------|-------------|---------|----------|---------|
-| `-f, --force` | Drop and recreate existing database | `false` | No | - |
+| `-f, --force` | Overwrite an existing target database. The restore goes into a temporary database that is swapped in only on success; without `--force`, an existing target is an error | `false` | No | - |
 | `-v, --verbose` | Show detailed output | `false` | No | - |
-| `-q, --quiet` | Minimal output | `false` | No | - |
+| `-q, --quiet` | Minimal console output; success notifications are suppressed, failures are still notified | `false` | No | - |
 | `-y, --yes` | Skip all confirmations | `false` | No | - |
 | `--dry-run` | Show what would be done without executing | `false` | No | - |
-| `--sudo` | Use sudo for database operations | `false` | No | - |
+| `--sudo` | On SSH sources, run `pg_dump` (and `pg_dumpall` for `--globals`) via `sudo -u <db user>` instead of password auth (peer authentication) | `false` | No | - |
 | `--log <file>` | Write logs to file | - | No | `/var/log/t-pgsql.log` |
 | `--log-level <level>` | Log verbosity level | `info` | No | `debug`, `warn`, `error` |
 | `--no-meta` | Don't write metadata to archives | `false` | No | - |
@@ -1258,6 +1300,25 @@ Apply to SSH/scp transfers (and the `--stream` pipe when `pv` is installed).
 
 ---
 
+## Exit codes
+
+t-pgsql exits `0` on success and non-zero on failure (in practice `1`), so cron jobs and CI can rely on the status:
+
+| Situation | Exit status |
+|-----------|-------------|
+| Command completed | `0` |
+| Invalid option, missing value, unknown command or invalid numeric/time value | `1` |
+| A dump, restore, clone, fetch or upgrade step failed | non-zero (`1`) |
+| `batch` with at least one failed job | `1` (also with `--continue-on-error`) |
+| `doctor` found a problem | `1` (warnings alone give `0`) |
+| `--help`, `--version`, `explain` (known topic) | `0` |
+
+## Security
+
+t-pgsql handles database credentials, SSH access and, for notifications and the bot, a Telegram bot token. Prefer password files or environment variables over `--password`. To report a vulnerability, see [SECURITY.md](SECURITY.md) — please do not open a public issue.
+
+---
+
 ## File Structure
 
 ```
@@ -1300,7 +1361,7 @@ echo -n "password" > .secrets/db.pass
 ### Database Already Exists Error
 
 ```bash
-# Use --force to drop existing DB
+# Use --force to replace the existing DB (restored via a temporary database, swapped in only on success)
 ./t-pgsql restore --to "..." --force
 ```
 
@@ -1319,4 +1380,4 @@ MIT License
 
 ## Contributing
 
-Pull requests are welcome.
+Pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow (sources live in `src/`, the single-file `t-pgsql` is generated by `./build.sh`).

@@ -6,7 +6,7 @@ MANDIR ?= $(PREFIX)/share/man/man1
 ZSHDIR ?= $(PREFIX)/share/zsh/site-functions
 BASHDIR ?= $(PREFIX)/share/bash-completion/completions
 FISHDIR ?= $(PREFIX)/share/fish/vendor_completions.d
-VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo "3.9.0")
+VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo "3.12.1")
 
 # Debian package version: strip a leading "v" (v3.9.0 -> 3.9.0) and ensure the
 # version starts with a digit (a bare commit hash gets a "0~" prefix), as
@@ -72,7 +72,8 @@ deb:
 	@echo "Section: database" >> build/deb/DEBIAN/control
 	@echo "Priority: optional" >> build/deb/DEBIAN/control
 	@echo "Architecture: all" >> build/deb/DEBIAN/control
-	@echo "Depends: postgresql-client, openssh-client, bash (>= 4.0)" >> build/deb/DEBIAN/control
+	@echo "Depends: postgresql-client, openssh-client, curl, bash (>= 4.0)" >> build/deb/DEBIAN/control
+	@echo "Recommends: zstd, xz-utils, bzip2, pv, python3" >> build/deb/DEBIAN/control
 	@echo "Maintainer: Asim Atasert <asimatasert@outlook.com>" >> build/deb/DEBIAN/control
 	@echo "Description: PostgreSQL database sync and clone tool" >> build/deb/DEBIAN/control
 	@echo " Advanced CLI tool for backing up, restoring, and synchronizing" >> build/deb/DEBIAN/control

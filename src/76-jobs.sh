@@ -20,6 +20,7 @@ save_job() {
     [ -n "$OUTPUT_DIR" ] && args="$args --output $(pq "$OUTPUT_DIR")"
     [ "$KEEP" -ge 0 ] && args="$args --keep $KEEP"
     [ "$FROM_KEEP" -gt 0 ] && args="$args --from-keep $FROM_KEEP"
+    { [ "$MIN_SIZE_RATIO_SET" = true ] || [ "$MIN_SIZE_RATIO" != 50 ]; } && args="$args --min-size-ratio $MIN_SIZE_RATIO"
     [ -n "$EXCLUDE_TABLES" ] && args="$args --exclude-table $(pq "$EXCLUDE_TABLES")"
     [ -n "$EXCLUDE_SCHEMAS" ] && args="$args --exclude-schema $(pq "$EXCLUDE_SCHEMAS")"
     [ -n "$EXCLUDE_DATA" ] && args="$args --exclude-data $(pq "$EXCLUDE_DATA")"
@@ -75,6 +76,12 @@ save_job() {
     [ "$SUDO" = true ] && args="$args --sudo"
     [ "$FORCE" = true ] && args="$args --force"
     [ "$VERBOSE" = true ] && args="$args --verbose"
+
+    # A dry run must not write anything
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] Would save job '$job_name' to $JOBS_FILE"
+        return 0
+    fi
 
     # Create jobs file if not exists
     [ ! -f "$JOBS_FILE" ] && echo "jobs:" > "$JOBS_FILE"
@@ -210,7 +217,12 @@ remove_job() {
         return 1
     fi
 
-    # Remove job using awk
+    # Remove job using awk (a dry run only reports what would happen)
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] Would remove job '$job_name' from $JOBS_FILE"
+        return 0
+    fi
+
     local tmp_file=$(mktemp)
     awk -v name="$job_name" '
     BEGIN { skip=0 }
@@ -228,6 +240,37 @@ remove_job() {
 
     mv "$tmp_file" "$JOBS_FILE"
     log_success "Removed job: $job_name"
+}
+
+# Keys a job may carry in jobs.yaml (everything parse_job_to_args / run_job reads, plus the
+# command itself). Anything else is silently ignored by the parser, so run_job warns.
+_JOB_KNOWN_KEYS=" command args from to password from_password to_password from_password_file to_password_file
+ force verbose quiet dry_run no_meta sudo stream notify notify_on_error output dump_name keep from_keep min_size_ratio
+ archive_output archive_keep from_stale skip_if_recent exclude_table exclude_data exclude_schema
+ only_table only_schema compress compress_level pg_compress_level compress_where stream_buffer bwlimit
+ retries health_check health_check_after no_health_check health_check_fail retention retention_daily
+ retention_weekly retention_monthly retention_yearly mask mask_rules mask_tables log log_level "
+
+# Warn (once per key) about job keys the tool does not know, naming the closest valid key
+# when it is just a hyphen/underscore or case difference. Warning only, never an error.
+# Usage: warn_unknown_job_keys "job_name"
+warn_unknown_job_keys() {
+    local job="$1" key norm lower
+    [ -f "$JOBS_FILE" ] || return 0
+    while IFS= read -r key; do
+        [ -z "$key" ] && continue
+        [[ "$_JOB_KNOWN_KEYS" == *[[:space:]]"$key"[[:space:]]* ]] && continue
+        norm="${key//-/_}"
+        lower="$(printf '%s' "$norm" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$_JOB_KNOWN_KEYS" == *[[:space:]]"$lower"[[:space:]]* ]]; then
+            log_warn "Job '$job': unknown key '$key' is ignored (did you mean '$lower'?)"
+        else
+            log_warn "Job '$job': unknown key '$key' is ignored"
+        fi
+    done < <(JOB="$job" awk '
+        /^  [a-zA-Z0-9_-]+:/ { k=$1; sub(/:.*/, "", k); in_job = (k == ENVIRON["JOB"]); next }
+        in_job && /^    [a-zA-Z0-9_-]+:/ { k=$1; sub(/:.*/, "", k); if (!(k in seen)) { seen[k]=1; print k } }
+    ' "$JOBS_FILE")
 }
 
 run_job() {
@@ -253,6 +296,8 @@ run_job() {
         *) log_error "Job $(pq "$job_name") has an invalid command: $(pq "$job_cmd")"; return 1 ;;
     esac
 
+    warn_unknown_job_keys "$job_name"
+
     # Parse job args (supports both old and new format). Inline passwords are NOT in here
     # (parse_job_to_args deliberately omits them); they travel via the environment below.
     local job_args=$(parse_job_to_args "$job_name")
@@ -273,7 +318,12 @@ run_job() {
     _pw_to=$(get_job_field "$job_name" "to" "password");     [ -z "$_pw_to" ]   && _pw_to=$(get_job_value "$job_name" "to_password")
 
     log_info "Running job: $job_name"
-    log_debug "Command: $job_cmd $(redact_args "$job_args")"
+    log_debug "Command: $job_cmd $(redact_notify_args "$(redact_args "$job_args")")"
+
+    # Notification specs (they contain the bot token) travel via the environment, like the
+    # passwords: they must not appear in the argv of the re-exec'd process.
+    local _notify_specs
+    _notify_specs=$(get_job_notify_specs "$job_name")
 
     # Export so the re-exec'd child (which runs the dump and sends notifications)
     # can attach a job-specific "re-run" button to a failure notification.
@@ -283,6 +333,7 @@ run_job() {
     # Execute via bash -c. Job passwords are passed as scoped env assignments (not argv).
     # Fall back to any INHERITED T_PGSQL_*_PASSWORD when the job has none, so a passwordless
     # job does not get an empty assignment that would shadow the documented ambient env var.
+    T_PGSQL_NOTIFY_SPECS="$_notify_specs" \
     T_PGSQL_PASSWORD="${_pw_both:-$T_PGSQL_PASSWORD}" \
     T_PGSQL_FROM_PASSWORD="${_pw_from:-$T_PGSQL_FROM_PASSWORD}" \
     T_PGSQL_TO_PASSWORD="${_pw_to:-$T_PGSQL_TO_PASSWORD}" \

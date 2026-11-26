@@ -5,7 +5,7 @@ cmd_bot() {
     local bot_token=""
     local poll_interval=2
     local bot_cooldown="1h"
-    local offset=0
+    local offset=""
 
     # Get token from --token arg or from YAML defaults
     if [ -n "$BOT_TOKEN" ]; then
@@ -34,25 +34,96 @@ cmd_bot() {
         fi
     fi
 
+    # Optional allowlist of Telegram user ids (TELEGRAM_ALLOWED_USERS, comma separated, or
+    # "telegram_allowed_users" under defaults: in the YAML). Empty = chat-id check only.
+    local allowed_users
+    allowed_users=$(bot_allowed_users)
+
     log_info "🤖 t-pgsql bot started (cooldown: ${bot_cooldown})"
     log_info "Listening for commands and callbacks..."
     log_info "Press Ctrl+C to stop"
     # Fail-closed: without a configured chat_id the bot ignores every command/callback.
+    if [ -z "$allowed_users" ]; then
+        log_warn "No sender allowlist (TELEGRAM_ALLOWED_USERS): ANY member of the configured chat can run jobs, including restore/clone/upgrade jobs, via /backup and buttons."
+    elif [ "$allowed_users" = "," ]; then
+        log_error "Sender allowlist is set (TELEGRAM_ALLOWED_USERS or defaults.telegram_allowed_users) but contains no valid numeric user id: the bot will reject EVERY sender. Use a comma separated string, an inline list [111, 222] or a block list of numeric Telegram user ids."
+    fi
     [ -z "$default_chat_id" ] && log_warn "No chat_id configured (telegram config in YAML) — the bot will IGNORE all commands until an allowed chat is set."
 
-    # Per-user temp files, created 600 (the response holds Telegram message content,
-    # so it must not be world-readable on a shared host).
-    local offset_file="${TMPDIR:-/tmp}/.t-pgsql-bot-offset-$(id -u)"
-    local tmp_resp="${TMPDIR:-/tmp}/.t-pgsql-bot-resp-$(id -u).json"
-    (umask 077; : >> "$offset_file"; : >> "$tmp_resp") 2>/dev/null
-    chmod 600 "$offset_file" "$tmp_resp" 2>/dev/null
-    [ -f "$offset_file" ] && offset=$(cat "$offset_file" 2>/dev/null || echo 0)
+    # Scratch space for the raw API response: a private (700) mktemp directory that is
+    # removed on exit. The response holds Telegram message content.
+    local scratch
+    scratch=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/t-pgsql-bot.XXXXXX" 2>/dev/null) || {
+        log_error "Cannot create a private scratch directory under ${TMPDIR:-/tmp}"
+        return 1
+    }
+    chmod 700 "$scratch" 2>/dev/null
+    reg_tmp "$scratch"
+    _BOT_SCRATCH="$scratch"
+    # The tmp cleanup trap does not exit on INT/TERM; stop the loop so the scratch
+    # directory is not removed underneath it. (exit runs the EXIT trap.) Conventional
+    # statuses: 130 for INT, 143 for TERM. A job already started keeps running.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    local tmp_resp="$scratch/resp.json"
+
+    # Persistent poll offset in a per-user state directory (never in a shared dir).
+    local offset_file="" state_dir
+    state_dir=$(bot_state_dir) || state_dir=""
+    _BOT_RUNS_DIR=""
+    if [ -n "$state_dir" ] && [ ! -L "$state_dir/runs" ]; then
+        (umask 077; mkdir -p "$state_dir/runs") 2>/dev/null
+        if [ -d "$state_dir/runs" ] && [ "$(bot_file_owner "$state_dir/runs")" = "$(id -u)" ]; then
+            chmod 700 "$state_dir/runs" 2>/dev/null
+            _BOT_RUNS_DIR="$state_dir/runs"
+        fi
+    fi
+    if [ -n "$state_dir" ]; then
+        offset_file="$state_dir/bot-offset"
+        if [ -L "$offset_file" ] || { [ -e "$offset_file" ] && ! bot_safe_file "$offset_file"; }; then
+            log_warn "Ignoring unsafe offset file (symlink or not owned by you): $offset_file"
+            offset_file=""
+        fi
+    fi
+    if [ -z "$offset_file" ]; then
+        log_warn "No safe state directory: the poll offset is kept in memory only."
+    elif [ -f "$offset_file" ]; then
+        offset=$(bot_read_offset "$offset_file")
+    else
+        # First start with the new location: import the legacy offset once, but only
+        # from a regular file we own.
+        local legacy_file="${TMPDIR:-/tmp}/.t-pgsql-bot-offset-$(id -u)"
+        if bot_safe_file "$legacy_file"; then
+            offset=$(bot_read_offset "$legacy_file")
+            [ -n "$offset" ] && bot_save_offset "$offset_file" "$offset"
+        fi
+    fi
+    # No known offset: Telegram would redeliver up to 24 hours of old updates and every old
+    # /backup would run again. Skip the backlog on the first poll instead (see loop).
+    local skip_backlog=""
+    [ -z "$offset" ] && skip_backlog=1
 
     # Main polling loop (errexit already disabled globally)
     set +e
 
     while true; do
         local response
+        if [ -n "$skip_backlog" ]; then
+            response=$(tg_api "$bot_token" getUpdates --max-time 35 -X POST \
+                -d "offset=-1" -d "limit=1" -d "timeout=0" 2>&1)
+            if ! echo "$response" | grep -q '"ok":true' 2>/dev/null; then
+                log_warn "Telegram API error while skipping the backlog; retrying"
+                sleep "$poll_interval"
+                continue
+            fi
+            local newest
+            newest=$(echo "$response" | grep -o '"update_id":[0-9]*' | grep -o '[0-9]*' | sort -n | tail -1)
+            if [ -n "$newest" ]; then offset=$((newest + 1)); else offset=0; fi
+            bot_save_offset "$offset_file" "$offset"
+            skip_backlog=""
+            log_info "No stored poll offset: skipped the pending backlog (next update id: ${offset}); old commands were not executed."
+            continue
+        fi
         response=$(tg_api "$bot_token" getUpdates --max-time 35 -X POST \
             -d "offset=${offset}" \
             -d "timeout=30" \
@@ -78,7 +149,7 @@ cmd_bot() {
         if command -v python3 &>/dev/null; then
             update_ids=$(python3 -c "
 import json,sys
-data=json.load(open('$tmp_resp'))
+data=json.load(open(sys.argv[1]))
 def s(v):
     # CRITICAL: strip the field/record delimiters from EVERY user-controlled value so a
     # message text (or callback data / first_name) containing a newline or '|' cannot forge
@@ -92,13 +163,13 @@ for u in data.get('result',[]):
     if 'callback_query' in u:
         cb=u['callback_query']
         cb_chat=cb.get('message',{}).get('chat',{}).get('id','')
-        print(f\"{uid}|callback|{s(cb.get('id',''))}|{s(cb.get('data',''))}|{cb_chat}|{s(cb.get('from',{}).get('first_name',''))}\")
+        print(f\"{uid}|callback|{s(cb.get('id',''))}|{s(cb.get('data',''))}|{cb_chat}|{s(cb.get('from',{}).get('first_name',''))}|{s(cb.get('from',{}).get('id',''))}\")
     elif 'message' in u:
         m=u['message']
         chat_id=m['chat']['id']
         thread=m.get('message_thread_id','')
-        print(f\"{uid}|message|{chat_id}|{s(m.get('text',''))}|{thread}\")
-" 2>/dev/null)
+        print(f\"{uid}|message|{chat_id}|{s(m.get('text',''))}|{thread}|{s(m.get('from',{}).get('id',''))}\")
+" "$tmp_resp" 2>/dev/null)
         fi
 
         if [ -z "$update_ids" ]; then
@@ -107,31 +178,39 @@ for u in data.get('result',[]):
             max_uid=$(grep -o '"update_id":[0-9]*' "$tmp_resp" 2>/dev/null | grep -o '[0-9]*' 2>/dev/null | sort -n | tail -1)
             if [ -n "$max_uid" ]; then
                 offset=$((max_uid + 1))
-                echo "$offset" > "$offset_file"
+                bot_save_offset "$offset_file" "$offset"
             fi
             sleep "$poll_interval"
             continue
         fi
 
         # Process each update line
-        while IFS='|' read -r uid utype field1 field2 field3 field4; do
+        while IFS='|' read -r uid utype field1 field2 field3 field4 field5; do
             [ -z "$uid" ] && continue
 
             # Advance offset
             offset=$((uid + 1))
-            echo "$offset" > "$offset_file"
+            bot_save_offset "$offset_file" "$offset"
 
             if [ "$utype" = "callback" ]; then
                 local cb_id="$field1"
                 local cb_data="$field2"
                 local cb_chat="$field3"
                 local cb_user="$field4"
+                local cb_uid="$field5"
 
                 # Authorize the callback the same way messages are: only act on button
                 # presses coming from the configured chat. FAIL CLOSED — if no allowed chat
                 # is configured, reject everything rather than accepting any chat.
                 if [ -z "$default_chat_id" ] || [ "$cb_chat" != "$default_chat_id" ]; then
                     log_warn "Ignoring callback from unauthorized chat: ${cb_chat}"
+                    bot_answer_callback "$bot_token" "$cb_id" "⛔ Not authorized"
+                    continue
+                fi
+
+                # Optional sender allowlist (fail closed: an unknown sender is rejected).
+                if ! bot_user_allowed "$allowed_users" "$cb_uid"; then
+                    log_warn "Ignoring callback from unauthorized user: $(bot_user_label "$cb_uid")"
                     bot_answer_callback "$bot_token" "$cb_id" "⛔ Not authorized"
                     continue
                 fi
@@ -143,9 +222,23 @@ for u in data.get('result',[]):
                 cb_yaml=$(echo "$cb_data" | cut -d: -f2)
                 cb_job=$(echo "$cb_data" | cut -d: -f3)
 
-                if [ "$cb_action" = "backup" ]; then
+                # Tolerate the short form "backup:<job>" (a sender may drop the yaml name to
+                # stay within Telegram's 64-byte callback_data limit): use the bot's own yaml.
+                local cb_short=""
+                if [ "$cb_action" = "backup" ] && [[ "$cb_data" != *:*:* ]] && [ -n "$cb_yaml" ]; then
+                    cb_job="$cb_yaml"
+                    cb_yaml=$(basename "$JOBS_FILE")
+                    cb_short=1
+                fi
+                if [ "$cb_action" = "backup" ] && ! bot_valid_job_name "$cb_job"; then
+                    bot_answer_callback "$bot_token" "$cb_id" "❌ Invalid job name"
+                elif [ "$cb_action" = "backup" ]; then
                     local yaml_path
-                    yaml_path=$(bot_resolve_yaml "$cb_yaml")
+                    if [ -n "$cb_short" ]; then
+                        yaml_path="$JOBS_FILE"
+                    else
+                        yaml_path=$(bot_resolve_yaml "$cb_yaml")
+                    fi
                     if [ ! -f "$yaml_path" ]; then
                         bot_answer_callback "$bot_token" "$cb_id" "❌ YAML not found: ${cb_yaml}"
                     else
@@ -166,10 +259,17 @@ for u in data.get('result',[]):
                 local chat_id="$field1"
                 local msg_text="$field2"
                 local msg_thread="$field3"
+                local msg_uid="$field4"
 
                 # Only respond in the configured group chat. FAIL CLOSED — with no allowed
                 # chat configured, ignore all commands rather than answering any chat.
                 if [ -z "$default_chat_id" ] || [ "$chat_id" != "$default_chat_id" ]; then
+                    continue
+                fi
+
+                # Optional sender allowlist (fail closed: an unknown sender is rejected).
+                if ! bot_user_allowed "$allowed_users" "$msg_uid"; then
+                    [[ "$msg_text" == /* ]] && log_warn "Ignoring command from unauthorized user: $(bot_user_label "$msg_uid")"
                     continue
                 fi
 

@@ -44,8 +44,18 @@ _explain_dump() {
     echo "  --compress <type>      zstd | gzip | xz | bzip2 | none"
     echo "  --keep <N>             keep only the newest N dumps locally"
     echo "  --retention            GFS rotation (daily/weekly/monthly/yearly)"
+    echo "  --min-size-ratio <%>   shrink guard (default 50, 0 = off)"
     echo "  --exclude-table/-data  filter what is dumped"
     echo "  --skip-if-recent <t>   skip if a dump already exists within the window"
+    echo
+    _ex_sec "Shrink guard"
+    echo "  A new dump smaller than --min-size-ratio percent of the previous dump of"
+    echo "  the same database (default 50) is treated as suspect: nothing is rotated"
+    echo "  or deleted, the new file is kept as <name>.suspect (no keep/retention/"
+    echo "  restore/list pattern matches it), the job fails and a notification is sent."
+    echo "  If the shrink is expected, run once with --min-size-ratio 0; the next dump"
+    echo "  then becomes the baseline. Rename or remove the .suspect file when done."
+    echo "  Switching --compress can trigger the guard once. 'doctor' shows the ratio."
     echo
     _ex_sec "Examples"
     echo "  t-pgsql dump --from \"postgres@localhost/appdb\" --compress zstd --keep 7"
@@ -240,7 +250,8 @@ _explain_retention() {
     _ex_sec "What it does"
     echo "  With --retention, t-pgsql keeps the newest dump per day/week/month/year up"
     echo "  to the configured counts and prunes the rest. The single newest dump is"
-    echo "  always kept, so retention can never leave a base with nothing."
+    echo "  always kept, so retention can never leave a base with nothing. A new dump"
+    echo "  that fails the shrink guard (--min-size-ratio) stops retention from running."
     echo
     _ex_sec "Key options"
     echo "  --retention                 enable GFS"

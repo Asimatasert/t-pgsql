@@ -1,6 +1,45 @@
 # ==============================================================================
 # CLONE
 # ==============================================================================
+# Identity of the database a parsed connection (FROM or TO globals) points at, normalised so
+# that spellings of the same endpoint compare equal: loopback names/addresses/socket paths
+# collapse to one host, empty or zero-padded ports become the default, host case is
+# ignored. An ssh connection is identified by (ssh host, ssh port, db host, db port,
+# database); the ssh port matters because different machines are often reached through one
+# ssh host name on different ports (tunnels, containers). An ssh connection is only equal
+# to a direct connection when that is certain: the ssh host is a loopback name AND the ssh
+# port is 22 (it is this machine). Any other ssh connection never equals a direct one. The
+# database user is not part of the key. Names that merely resolve to the same address
+# (DNS aliases, ssh config aliases) cannot be detected without network access.
+_clone_endpoint_key() {
+    local p="$1" t v dbh port sshh sshp db
+    t="${p}_TYPE"; t="${!t}"
+    v="${p}_DB_HOST"; dbh="$(_clone_norm_host "${!v}")"
+    port="${p}_DB_PORT"; port="${!port}"
+    [[ "$port" =~ ^[0-9]+$ ]] && port=$((10#$port)) || port=5432
+    v="${p}_DATABASE"; db="${!v}"
+    if [ "$t" = "ssh" ]; then
+        v="${p}_SSH_HOST"; sshh="$(_clone_norm_host "${!v}")"
+        v="${p}_SSH_PORT"; sshp="${!v}"
+        [[ "$sshp" =~ ^[0-9]+$ ]] && sshp=$((10#$sshp)) || sshp=22
+        if [ "$sshh" != "loopback" ] || [ "$sshp" != 22 ]; then
+            v="${p}_SSH_HOST"; sshh="${!v}"
+            printf 'ssh|%s|%s|%s:%s/%s' "${sshh,,}" "$sshp" "$dbh" "$port" "$db"
+            return
+        fi
+    fi
+    printf 'direct|%s:%s/%s' "$dbh" "$port" "$db"
+}
+_clone_norm_host() {
+    local h="${1,,}"
+    if [ -z "$h" ] || [[ "$h" == /* ]] || [[ "$h" == localhost || "$h" == localhost.* ]] \
+       || [[ "$h" == "::1" || "$h" == "::" || "$h" == "0:0:0:0:0:0:0:1" || "$h" == "0.0.0.0" ]] \
+       || [[ "$h" =~ ^127\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        h="loopback"
+    fi
+    printf '%s' "$h"
+}
+
 cmd_clone() {
     log_info "Starting clone..."
 
@@ -22,13 +61,11 @@ cmd_clone() {
     # Refuse a source==target clone for ANY target (not just the first): clone_stream/restore
     # iterate every --to and, with --force, drop each before pg_dump finishes reading the
     # source, permanently destroying it. Capture the source identity, then check every target.
-    local _f_type="$FROM_TYPE" _f_ssh="$FROM_SSH_HOST" _f_db="${FROM_DB_HOST}:${FROM_DB_PORT}/${FROM_DATABASE}"
+    local _f_key; _f_key="$(_clone_endpoint_key FROM)"
     local _i
     for _i in "${!TO_CONNECTIONS[@]}"; do
         parse_connection "${TO_CONNECTIONS[$_i]}" "TO" || { log_error "Invalid target connection: ${TO_CONNECTIONS[$_i]}"; return 1; }
-        if [ "$_f_type" = "$TO_TYPE" ] \
-           && [ "${_f_ssh}" = "${TO_SSH_HOST}" ] \
-           && [ "${_f_db}" = "${TO_DB_HOST}:${TO_DB_PORT}/${TO_DATABASE}" ]; then
+        if [ "$_f_key" = "$(_clone_endpoint_key TO)" ]; then
             log_error "Source and target #$((_i+1)) are the same database — refusing (this would destroy it)"
             return 1
         fi

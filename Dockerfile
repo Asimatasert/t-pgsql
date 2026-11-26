@@ -10,6 +10,10 @@
 FROM debian:bookworm-slim
 
 ARG PG_MAJOR=18
+# Published fingerprint of the PostgreSQL Apt Repository signing key (ACCC4CF8).
+# Verify it against https://www.postgresql.org/download/linux/debian/ before
+# changing it; a mismatch fails the build.
+ARG PGDG_KEY_FPR=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
 
 # Runtime deps: PostgreSQL client (pg_dump/pg_restore/psql), ssh, external
 # compressors, pv (stream progress), python3 (bot JSON parsing), curl (notifications).
@@ -19,6 +23,11 @@ RUN set -eux; \
     install -d /usr/share/postgresql-common/pgdg; \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; \
+    actual_fpr="$(gpg --show-keys --with-colons /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc | awk -F: '/^fpr:/ {print $10; exit}')"; \
+    if [ "$actual_fpr" != "$PGDG_KEY_FPR" ]; then \
+        echo "PGDG signing key fingerprint mismatch: got '$actual_fpr', expected '$PGDG_KEY_FPR'" >&2; \
+        exit 1; \
+    fi; \
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list; \
     apt-get update; \

@@ -2,6 +2,12 @@
 # DEFAULT VALUES
 # ==============================================================================
 
+# Colours (defined in the header) are switched off when NO_COLOR is set to a non-empty value
+# (https://no-color.org) or when stdout is not a terminal (cron mail, pipes, redirected logs).
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
+fi
+
 # Command
 COMMAND=""
 
@@ -41,6 +47,8 @@ FROM_KEEP_SET=false           # true once --from-keep given on CLI
 COMPRESS_SET=false            # true once --compress given on CLI
 KEEP=-1
 FROM_KEEP=1  # 0=delete, N=keep last N, -1=keep all (default: 1)
+MIN_SIZE_RATIO=50             # shrink guard: new dump must be at least this % of the previous one (0=off)
+MIN_SIZE_RATIO_SET=false      # true once --min-size-ratio given on CLI (beats config)
 SKIP_IF_RECENT=""  # Skip if dump exists within timeframe (e.g., 24h, 12h, today)
 
 # Archive tier: when set, dumps aged out by --keep are MOVED here instead of
@@ -65,6 +73,7 @@ HEALTH_CHECK_FAIL=false
 # Notifications
 NOTIFY=()
 NOTIFY_ON_ERROR=false
+NOTIFY_FAILURE_SENT=false     # true once a failure notification was attempted in this run
 
 # Masking
 MASK=false

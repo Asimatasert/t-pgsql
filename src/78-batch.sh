@@ -1,3 +1,17 @@
+# Parallel jobs write to a per-job log in a temp dir that is deleted when the batch ends, so
+# print what a FAILED job said (the last 50 lines) before it is lost.
+# Usage: show_failed_job_output <log-file> <job-name>
+show_failed_job_output() {
+    local logfile="$1" name="$2"
+    if [ -s "$logfile" ]; then
+        echo "---- output of failed job '$name' (last 50 lines) ----" >&2
+        tail -n 50 "$logfile" >&2
+        echo "---- end of output of '$name' ----" >&2
+    else
+        log_error "Job '$name' produced no output"
+    fi
+}
+
 cmd_batch() {
     local target="$1"
 
@@ -136,7 +150,7 @@ cmd_batch() {
         local total=$(echo "$jobs" | wc -w | tr -d ' ')
         local current=0
         local failed=0
-
+        local finished=0
         if [ "$PARALLEL" -gt 1 ]; then
             # Parallel execution
             log_info "Running $total jobs with $PARALLEL parallel workers..."
@@ -170,6 +184,7 @@ cmd_batch() {
                                 log_success "[${completed}/${total}] Completed: ${job_names[$i]}"
                             else
                                 log_error "[${completed}/${total}] Failed: ${job_names[$i]}"
+                                show_failed_job_output "$temp_dir/${job_names[$i]}.log" "${job_names[$i]}"
                                 failed=$((failed + 1))
                                 [ "$CONTINUE_ON_ERROR" != true ] && stop_launching=true
                             fi
@@ -207,6 +222,7 @@ cmd_batch() {
                     log_success "[${completed}/${total}] Completed: ${job_names[$i]}"
                 else
                     log_error "[${completed}/${total}] Failed: ${job_names[$i]}"
+                    show_failed_job_output "$temp_dir/${job_names[$i]}.log" "${job_names[$i]}"
                     failed=$((failed + 1))
                 fi
             done
@@ -216,6 +232,7 @@ cmd_batch() {
             fi
 
             rm -rf "$temp_dir"
+            finished=$completed
         else
             # Sequential execution
             for job in $jobs; do
@@ -229,10 +246,13 @@ cmd_batch() {
                 else
                     log_error "[$current/$total] Failed: $job"
                     failed=$((failed + 1))
-                    [ "$CONTINUE_ON_ERROR" != true ] && { log_error "Stopping (use --continue-on-error to continue)"; return 1; }
+                    # Fail fast: stop starting jobs, but still fall through to the summary
+                    # (and the failure exit status) below.
+                    [ "$CONTINUE_ON_ERROR" != true ] && { log_error "Stopping (use --continue-on-error to continue)"; break; }
                 fi
                 echo ""
             done
+            finished=$current
         fi
 
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -242,13 +262,24 @@ cmd_batch() {
             log_warn "$failed of $total jobs failed"
         fi
 
-        # Send summary notification
-        if [ "$NOTIFY_SUMMARY" = true ] && [ ${#NOTIFY[@]} -gt 0 ]; then
-            local status="success"
-            [ $failed -gt 0 ] && status="failed"
-            local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
-            local summary="Completed: $((total - failed))/$total\nFailed: $failed\nDuration: $elapsed"
-            send_notification "$status" "Batch completed: $total jobs" "$summary"
+        # Send summary notification. With no --notify on the command line, use the same
+        # channel the jobs use when no channel is given (TELEGRAM_* env, defaults.notify.telegram).
+        if [ "$NOTIFY_SUMMARY" = true ]; then
+            local _saved_notify=("${NOTIFY[@]}")
+            if [ ${#NOTIFY[@]} -eq 0 ]; then
+                local _resolved; _resolved="$(resolve_bare_telegram)"
+                [ -n "$_resolved" ] && NOTIFY=("$_resolved")
+            fi
+            if [ ${#NOTIFY[@]} -gt 0 ]; then
+                local status="success"
+                [ $failed -gt 0 ] && status="failed"
+                local elapsed=$(format_elapsed $(($(date +%s) - META_START_EPOCH)))
+                local summary="Completed: $((finished - failed))/$total"$'\n'"Failed: $failed"
+                [ "$finished" -lt "$total" ] && summary+=$'\n'"Not run: $((total - finished))"
+                summary+=$'\n'"Duration: $elapsed"
+                send_notification "$status" "Batch completed: $total jobs" "$summary"
+            fi
+            NOTIFY=("${_saved_notify[@]}")
         fi
 
         # Propagate failure so cron/CI sees a nonzero exit when any job failed.

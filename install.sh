@@ -5,9 +5,20 @@
 #
 # Options:
 #   INSTALL_DIR=/path    - Installation directory (default: /usr/local/bin)
-#   VERSION=v3.9.0       - Specific version (default: latest)
+#   VERSION=v3.12.1      - Specific release tag (default: latest release)
 #   SKIP_COMPLETIONS=1   - Skip completion installation
 #   UNINSTALL=1          - Remove t-pgsql and all installed files
+#
+#   T_PGSQL_ALLOW_UNVERIFIED=1  (or the --allow-unverified flag)
+#                        - Install even when the release has no usable
+#                          SHA256SUMS entry, or from the unreleased master
+#                          branch (VERSION=master). Prints a warning. A
+#                          checksum MISMATCH always aborts.
+#                          With a pipe: ... | bash -s -- --allow-unverified
+#
+# The installer is fail-closed: the binary is verified against the SHA256SUMS
+# asset of the same release before anything is installed, and the man page and
+# completions are taken from the verified release tarball.
 #
 
 set -e
@@ -17,11 +28,13 @@ INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 VERSION="${VERSION:-latest}"
 SKIP_COMPLETIONS="${SKIP_COMPLETIONS:-0}"
 UNINSTALL="${UNINSTALL:-0}"
+ALLOW_UNVERIFIED="${T_PGSQL_ALLOW_UNVERIFIED:-0}"
 
 # Support --uninstall flag as well as UNINSTALL=1
 for arg in "$@"; do
     case "$arg" in
         --uninstall) UNINSTALL=1 ;;
+        --allow-unverified) ALLOW_UNVERIFIED=1 ;;
     esac
 done
 
@@ -29,7 +42,7 @@ done
 # When INSTALL_DIR is under $HOME we do a rootless install into user dirs
 # (no sudo); otherwise we use the system-wide /usr/local paths.
 HOME_DIR="${HOME:-$(eval echo ~"$USER")}"
-if [[ -n "$HOME_DIR" && "$INSTALL_DIR" == "$HOME_DIR"* ]]; then
+if [[ -n "$HOME_DIR" && ( "$INSTALL_DIR" == "$HOME_DIR" || "$INSTALL_DIR" == "$HOME_DIR"/* ) ]]; then
     ROOTLESS=1
     MANDIR="$HOME_DIR/.local/share/man/man1"
     ZSHDIR="$HOME_DIR/.local/share/zsh/site-functions"
@@ -51,7 +64,7 @@ NC='\033[0m'
 
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+error() { echo -e "${RED}[ERROR]${NC} $1" >&2; exit 1; }
 
 # Check dependencies
 check_deps() {
@@ -77,67 +90,142 @@ detect_os() {
     fi
 }
 
-# Get latest version
+# Download URL to a file: fail on HTTP errors, HTTPS only, TLS 1.2+.
+fetch() {
+    curl --fail --silent --show-error --location \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        "$1" -o "$2"
+}
+
+# Resolve the latest release tag. Never falls back to another ref.
 get_latest_version() {
     local v
-    # The trailing sed always exits 0, so a "|| echo master" on the pipe would
-    # never trigger on API failure. Capture the value and default it instead.
-    v=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | \
-        grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [[ -z "$v" ]]; then
-        v="master"
+    if ! fetch "https://api.github.com/repos/${REPO}/releases/latest" "$TMP_DIR/latest.json" 2>/dev/null; then
+        error "Could not query the latest release from GitHub (network error or API rate limit). Retry later or pin one with VERSION=vX.Y.Z"
     fi
+    v=$(grep '"tag_name"' "$TMP_DIR/latest.json" | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/' | head -n1)
+    [[ -n "$v" ]] || error "GitHub did not return a release tag (unexpected response). Pin one with VERSION=vX.Y.Z"
     echo "$v"
 }
 
-# Move a file into a destination, using sudo only when needed
+# Install a file with the given mode. sudo is used only here, for the final
+# install step, and only when the destination is not writable by this user.
 install_file() {
-    local src="$1" dst="$2" destdir
+    local src="$1" dst="$2" mode="${3:-0644}" destdir
     destdir="$(dirname "$dst")"
-    if [[ -w "$destdir" ]] 2>/dev/null || mkdir -p "$destdir" 2>/dev/null; then
-        mkdir -p "$destdir"
-        mv "$src" "$dst"
+    if mkdir -p "$destdir" 2>/dev/null && [[ -w "$destdir" ]]; then
+        install -m "$mode" "$src" "$dst"
     else
-        sudo mkdir -p "$destdir"
-        sudo mv "$src" "$dst"
+        sudo install -d -m 0755 "$destdir"
+        sudo install -m "$mode" "$src" "$dst"
     fi
 }
 
-# Verify the downloaded binary against a SHA256SUMS release asset, if present.
-verify_integrity() {
-    local bin="$1"
-    # master (raw) downloads have no published checksum asset
-    if [[ "$VERSION" == "master" ]]; then
-        warn "Binary integrity is NOT verified (installing from master/raw)."
-        return
-    fi
-
-    local sums_url="https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS"
-    if ! curl -fsSL "$sums_url" -o "$TMP_DIR/SHA256SUMS" 2>/dev/null; then
-        warn "No SHA256SUMS asset found for ${VERSION}; binary is UNVERIFIED."
-        return
-    fi
-
-    local expected actual
-    expected=$(grep -E '[[:space:]]\*?t-pgsql$' "$TMP_DIR/SHA256SUMS" | awk '{print $1}' | head -n1)
-    if [[ -z "$expected" ]]; then
-        warn "SHA256SUMS present but has no entry for t-pgsql; binary is UNVERIFIED."
-        return
-    fi
-
+# Print the SHA-256 of a file; return 1 when no hashing tool exists.
+sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
-        actual=$(sha256sum "$bin" | awk '{print $1}')
+        sha256sum "$1" | awk '{print $1}'
     elif command -v shasum >/dev/null 2>&1; then
-        actual=$(shasum -a 256 "$bin" | awk '{print $1}')
+        shasum -a 256 "$1" | awk '{print $1}'
     else
-        warn "No sha256sum/shasum available; binary is UNVERIFIED."
-        return
+        return 1
+    fi
+}
+
+# Abort unless the user explicitly opted in to unverified installs.
+require_unverified_optin() {
+    if [[ "$ALLOW_UNVERIFIED" == "1" ]]; then
+        warn "$1"
+        warn "Continuing UNVERIFIED because --allow-unverified / T_PGSQL_ALLOW_UNVERIFIED=1 was given."
+    else
+        error "$1 Refusing to install. To install an unverified build anyway, re-run with --allow-unverified or T_PGSQL_ALLOW_UNVERIFIED=1."
+    fi
+}
+
+# Verify a downloaded asset against $TMP_DIR/SHA256SUMS (exact file-name match).
+# A missing sums file is only reachable after the opt-in was accepted.
+verify_asset() {
+    local file="$1" name="$2" expected actual
+    [[ -f "$TMP_DIR/SHA256SUMS" ]] || return 0
+
+    expected=$(awk -v n="$name" '{f=$2; sub(/^\*/, "", f); if (f == n) {print $1; exit}}' "$TMP_DIR/SHA256SUMS")
+    if [[ -z "$expected" ]]; then
+        require_unverified_optin "SHA256SUMS has no entry for $name."
+        return 0
+    fi
+    if ! actual=$(sha256_of "$file"); then
+        require_unverified_optin "No sha256sum/shasum available to verify $name."
+        return 0
+    fi
+    if [[ "$actual" == "$expected" ]]; then
+        info "Checksum verified (SHA256): $name"
+    else
+        error "Checksum mismatch for $name! expected=$expected actual=$actual. Nothing was installed."
+    fi
+}
+
+# Normalise and validate the requested version (also keeps it URL-safe).
+check_version() {
+    [[ "$VERSION" == "master" ]] && return 0
+    [[ "$VERSION" =~ ^[0-9] ]] && VERSION="v$VERSION"
+    [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.+-]*)?$ ]] || \
+        error "Invalid VERSION '$VERSION' (expected vX.Y.Z)."
+}
+
+# Download the binary (and the sums + tarball for releases) and verify all
+# of it BEFORE anything is installed.
+download_and_verify() {
+    local num tarball d m
+    if [[ "$VERSION" == "master" ]]; then
+        require_unverified_optin "VERSION=master (unreleased branch) has no published checksums."
+        fetch "https://raw.githubusercontent.com/${REPO}/master/t-pgsql" "$TMP_DIR/t-pgsql" || \
+            error "Could not download t-pgsql from master."
+    else
+        local base="https://github.com/${REPO}/releases/download/${VERSION}"
+        fetch "$base/t-pgsql" "$TMP_DIR/t-pgsql" || \
+            error "Could not download t-pgsql ${VERSION} (no such release asset?). Not falling back to another version."
+        if ! fetch "$base/SHA256SUMS" "$TMP_DIR/SHA256SUMS" 2>/dev/null; then
+            rm -f "$TMP_DIR/SHA256SUMS"
+            require_unverified_optin "Release ${VERSION} has no SHA256SUMS asset."
+        fi
     fi
 
-    if [[ "$actual" == "$expected" ]]; then
-        info "Checksum verified (SHA256)."
-    else
-        error "Checksum mismatch! expected=$expected actual=$actual. Aborting."
+    # A GitHub HTML error page would not start with a shebang.
+    [[ "$(head -c 2 "$TMP_DIR/t-pgsql")" == '#!' ]] || \
+        error "Downloaded t-pgsql is not a script (HTML error page?). Nothing was installed."
+
+    verify_asset "$TMP_DIR/t-pgsql" "t-pgsql"
+    chmod +x "$TMP_DIR/t-pgsql"
+
+    # Man page and completions come from the same release tarball.
+    EXTRAS_DIR=""
+    if [[ "$SKIP_COMPLETIONS" != "1" && "$VERSION" != "master" ]]; then
+        num="${VERSION#v}"
+        tarball="t-pgsql-${num}.tar.gz"
+        if fetch "https://github.com/${REPO}/releases/download/${VERSION}/${tarball}" "$TMP_DIR/$tarball" 2>/dev/null; then
+            verify_asset "$TMP_DIR/$tarball" "$tarball"
+            EXTRAS_WORK="$(mktemp -d "$TMP_DIR/extras.XXXXXX")"
+            if tar -xzf "$TMP_DIR/$tarball" -C "$EXTRAS_WORK" \
+                "t-pgsql-${num}/man/t-pgsql.1" \
+                "t-pgsql-${num}/completions/_t-pgsql" \
+                "t-pgsql-${num}/completions/t-pgsql.bash" \
+                "t-pgsql-${num}/completions/t-pgsql.fish" 2>/dev/null; then
+                EXTRAS_DIR="$EXTRAS_WORK/t-pgsql-${num}"
+                # Only plain files may be installed: refuse symlinks (also as
+                # parent directories) and anything that is not a regular file.
+                for d in "$EXTRAS_DIR" "$EXTRAS_DIR/man" "$EXTRAS_DIR/completions"; do
+                    [[ -d "$d" && ! -L "$d" ]] || error "Release tarball has an unexpected directory layout. Nothing was installed."
+                done
+                for m in man/t-pgsql.1 completions/_t-pgsql completions/t-pgsql.bash completions/t-pgsql.fish; do
+                    [[ -f "$EXTRAS_DIR/$m" && ! -L "$EXTRAS_DIR/$m" ]] || \
+                        error "Release tarball member $m is not a regular file. Nothing was installed."
+                done
+            else
+                warn "Release tarball has no man page/completions; skipping them."
+            fi
+        else
+            warn "Release tarball ${tarball} not available; skipping man page and completions."
+        fi
     fi
 }
 
@@ -153,44 +241,23 @@ main() {
     OS=$(detect_os)
     info "Detected OS: $OS"
 
+    # Create temp directory (removed on exit)
+    TMP_DIR=$(mktemp -d)
+    trap 'rm -rf "$TMP_DIR"' EXIT
+
     # Get version
     if [[ "$VERSION" == "latest" ]]; then
         VERSION=$(get_latest_version)
     fi
+    check_version
     info "Version: $VERSION"
 
-    # Create temp directory
-    TMP_DIR=$(mktemp -d)
-    trap "rm -rf $TMP_DIR" EXIT
-
-    # Download
     info "Downloading t-pgsql..."
-    if [[ "$VERSION" == "master" ]]; then
-        DOWNLOAD_URL="https://raw.githubusercontent.com/${REPO}/master/t-pgsql"
-    else
-        DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/t-pgsql"
-    fi
-
-    if ! curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/t-pgsql"; then
-        if [[ "$VERSION" != "master" ]]; then
-            warn "======================================================================"
-            warn "Could not download the pinned asset for ${VERSION}."
-            warn "Falling back to the 'master' branch. This is NOT the requested"
-            warn "version and the binary and extras will come from master instead."
-            warn "======================================================================"
-            VERSION="master"
-        fi
-        curl -fsSL "https://raw.githubusercontent.com/${REPO}/master/t-pgsql" -o "$TMP_DIR/t-pgsql"
-    fi
-
-    chmod +x "$TMP_DIR/t-pgsql"
-
-    # Integrity check
-    verify_integrity "$TMP_DIR/t-pgsql"
+    download_and_verify
 
     # Install
     info "Installing to $INSTALL_DIR..."
-    install_file "$TMP_DIR/t-pgsql" "$INSTALL_DIR/t-pgsql"
+    install_file "$TMP_DIR/t-pgsql" "$INSTALL_DIR/t-pgsql" 0755
 
     # Verify
     if command -v t-pgsql >/dev/null 2>&1; then
@@ -214,54 +281,51 @@ main() {
     info "Man page: man t-pgsql"
 }
 
-# Install completions and man page
+# Install completions and man page (from the verified release tarball; for the
+# opt-in master install they come from the raw master branch).
 install_extras() {
+    local src="$EXTRAS_DIR" RAW_URL="https://raw.githubusercontent.com/${REPO}/master"
+
+    if [[ "$VERSION" == "master" ]]; then
+        mkdir -p "$TMP_DIR/extras/man" "$TMP_DIR/extras/completions"
+        src="$TMP_DIR/extras"
+        fetch "$RAW_URL/man/t-pgsql.1" "$src/man/t-pgsql.1" 2>/dev/null || true
+        fetch "$RAW_URL/completions/_t-pgsql" "$src/completions/_t-pgsql" 2>/dev/null || true
+        fetch "$RAW_URL/completions/t-pgsql.bash" "$src/completions/t-pgsql.bash" 2>/dev/null || true
+        fetch "$RAW_URL/completions/t-pgsql.fish" "$src/completions/t-pgsql.fish" 2>/dev/null || true
+    fi
+    [[ -n "$src" ]] || return 0
+
     info "Installing shell completions and man page..."
 
-    RAW_URL="https://raw.githubusercontent.com/${REPO}/${VERSION}"
-
     # Man page
-    info "Installing man page..."
-    curl -fsSL "$RAW_URL/man/t-pgsql.1" -o "$TMP_DIR/t-pgsql.1" 2>/dev/null || true
-    if [[ -f "$TMP_DIR/t-pgsql.1" ]]; then
-        install_file "$TMP_DIR/t-pgsql.1" "$MANDIR/t-pgsql.1"
+    if [[ -f "$src/man/t-pgsql.1" ]]; then
+        info "Installing man page..."
+        install_file "$src/man/t-pgsql.1" "$MANDIR/t-pgsql.1"
     fi
 
     # Zsh completion
-    if command -v zsh >/dev/null 2>&1; then
+    if command -v zsh >/dev/null 2>&1 && [[ -f "$src/completions/_t-pgsql" ]]; then
         info "Installing zsh completion..."
-        curl -fsSL "$RAW_URL/completions/_t-pgsql" -o "$TMP_DIR/_t-pgsql" 2>/dev/null || true
-        if [[ -f "$TMP_DIR/_t-pgsql" ]]; then
-            install_file "$TMP_DIR/_t-pgsql" "$ZSHDIR/_t-pgsql"
-        fi
+        install_file "$src/completions/_t-pgsql" "$ZSHDIR/_t-pgsql"
     fi
 
     # Bash completion
-    if command -v bash >/dev/null 2>&1; then
+    if command -v bash >/dev/null 2>&1 && [[ -f "$src/completions/t-pgsql.bash" ]]; then
         info "Installing bash completion..."
-        curl -fsSL "$RAW_URL/completions/t-pgsql.bash" -o "$TMP_DIR/t-pgsql.bash" 2>/dev/null || true
-        if [[ -f "$TMP_DIR/t-pgsql.bash" ]]; then
-            install_file "$TMP_DIR/t-pgsql.bash" "$BASHDIR/t-pgsql"
-        fi
+        install_file "$src/completions/t-pgsql.bash" "$BASHDIR/t-pgsql"
     fi
 
-    # Fish completion (always into the user config dir; no sudo needed)
-    if command -v fish >/dev/null 2>&1; then
+    # Fish completion (user config dir when possible, else system dir)
+    if command -v fish >/dev/null 2>&1 && [[ -f "$src/completions/t-pgsql.fish" ]]; then
         info "Installing fish completion..."
-        curl -fsSL "$RAW_URL/completions/t-pgsql.fish" -o "$TMP_DIR/t-pgsql.fish" 2>/dev/null || true
-        if [[ -f "$TMP_DIR/t-pgsql.fish" ]]; then
-            USER_FISHDIR="$HOME_DIR/.config/fish/completions"
-            if [[ -n "$USER_FISHDIR" ]] && mkdir -p "$USER_FISHDIR" 2>/dev/null; then
-                cp "$TMP_DIR/t-pgsql.fish" "$USER_FISHDIR/t-pgsql.fish"
-                info "Fish completion installed to $USER_FISHDIR"
-            elif [[ -w "$FISHDIR" ]] 2>/dev/null; then
-                mkdir -p "$FISHDIR"
-                mv "$TMP_DIR/t-pgsql.fish" "$FISHDIR/t-pgsql.fish"
-            else
-                sudo mkdir -p "$FISHDIR" 2>/dev/null && \
-                sudo mv "$TMP_DIR/t-pgsql.fish" "$FISHDIR/t-pgsql.fish" || \
-                warn "Could not install fish completion. Run: mkdir -p ~/.config/fish/completions && curl -fsSL $RAW_URL/completions/t-pgsql.fish -o ~/.config/fish/completions/t-pgsql.fish"
-            fi
+        local USER_FISHDIR="$HOME_DIR/.config/fish/completions"
+        if [[ -n "$HOME_DIR" ]] && mkdir -p "$USER_FISHDIR" 2>/dev/null; then
+            install -m 0644 "$src/completions/t-pgsql.fish" "$USER_FISHDIR/t-pgsql.fish"
+            info "Fish completion installed to $USER_FISHDIR"
+        else
+            install_file "$src/completions/t-pgsql.fish" "$FISHDIR/t-pgsql.fish" || \
+                warn "Could not install fish completion into $FISHDIR."
         fi
     fi
 }
