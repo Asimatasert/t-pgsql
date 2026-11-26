@@ -110,7 +110,10 @@ history_write() {
     dur=$(( now - HIST_START_EPOCH ))
     [ "$dur" -lt 0 ] && dur=0
 
-    if [ "$rc" -eq 0 ]; then
+    if [ "$rc" -eq 75 ]; then
+        # Exit 75 is only ever the run lock: another run holds the target (not a failure).
+        status="locked"; msg="skipped: another run holds the lock"
+    elif [ "$rc" -eq 0 ]; then
         if [ -n "$HIST_SKIPPED" ]; then
             status="skipped"; msg="$HIST_SKIPPED"
         else
@@ -217,7 +220,7 @@ status_history_file() {
 status_valid_lines() {
     awk 'BEGIN { FS = "\t"; OFS = "\037" }
     NF >= 8 && $1 ~ /^[0-9]+$/ && $4 != "" && $3 != "" &&
-    ($5 == "ok" || $5 == "failed" || $5 == "skipped" || $5 == "suspect") &&
+    ($5 == "ok" || $5 == "failed" || $5 == "skipped" || $5 == "suspect" || $5 == "locked") &&
     $6 ~ /^[0-9]+$/ && ($7 == "" || $7 ~ /^[0-9]+$/) && ($8 == "" || $8 ~ /^[0-9]+$/) {
         print $1, $2, $3, $4, $5, $6, $7, $8, $9
     }' "$1"
@@ -402,6 +405,7 @@ status_color_for() {
         failed)  printf '%s' "$RED" ;;
         suspect) printf '%s' "$YELLOW" ;;
         skipped) printf '%s' "$CYAN" ;;
+        locked)  printf '%s' "$MAGENTA" ;;
         *)       printf '%s' "$YELLOW" ;;
     esac
 }
@@ -417,7 +421,7 @@ status_print_table() {
         if [ -n "$e" ]; then t=$(status_age "$age"); else t="-"; fi
         note=""
         case "$r" in
-            failed|suspect)
+            failed|suspect|locked)
                 if [ -n "$okage" ]; then note="last ok $(status_age "$okage")"; else note="no success on record"; fi
                 [ -n "$m" ] && note="$note; $m"
                 ;;

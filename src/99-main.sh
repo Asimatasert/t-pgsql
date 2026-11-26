@@ -150,10 +150,11 @@ main() {
         fi
     fi
 
-    # Run lock: a run that targets what another run is writing is skipped (exit 75).
+    # Run lock: a run that targets what another run is writing is skipped (exit 75). The
+    # history is armed first so a skipped run leaves a "locked" line (no ping, no notice).
+    history_begin   # arms the run-history line (work commands only; see 74-status.sh)
     lock_acquire_command || exit $?
 
-    history_begin   # arms the run-history line (work commands only; see 74-status.sh)
     ping_begin
 
     case "$COMMAND" in

@@ -103,6 +103,8 @@ run PGD_SLEEP=0
 [ "$rc" -eq 75 ] && ok "lock-skipped run exits 75" || nok "lock-skipped run exits 75 (rc=$rc)"
 [ -z "$(pings)" ] && ok "lock-skipped run: no ping at all" || nok "lock-skipped run: pings: $(pings)"
 [ "$(nlocks)" -eq 1 ] && ok "lock-skipped run leaves the holder's lock alone" || nok "lock-skipped run leaves the holder's lock alone ($(nlocks))"
+line=$(hline locked)
+[ -n "$line" ] && [ "$(printf '%s' "$line" | awk -F'\t' '{print $6}')" = 75 ] && ok "lock-skipped run: history line with status locked, exit 75" || nok "lock-skipped run: history line: $(cat "$HF" 2>&1)"
 waitpid "$H" || nok "holder ended"
 wait "$H" 2>/dev/null
 [ "$(nlocks)" -eq 0 ] && ok "holder released its lock" || nok "holder released its lock"
