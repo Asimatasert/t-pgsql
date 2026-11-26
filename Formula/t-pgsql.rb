@@ -5,7 +5,7 @@ class TPgsql < Formula
   desc "PostgreSQL database sync, backup and clone tool with notifications"
   homepage "https://github.com/Asimatasert/t-pgsql"
   url "https://github.com/Asimatasert/t-pgsql/archive/refs/tags/v3.14.0.tar.gz"
-  sha256 "75992aec5ccb9510890bd5a949862c7f4d81a54ed645e4b2d41b37985cf88ac5"
+  sha256 "347a80416756e345910276b348312e4840084fd3303a0d257db1633a23f8bf5e"
   license "MIT"
   head "https://github.com/Asimatasert/t-pgsql.git", branch: "master"
 
