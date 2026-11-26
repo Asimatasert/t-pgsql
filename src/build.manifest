@@ -4,6 +4,7 @@
 15-security.sh
 20-notifications.sh
 25-metadata.sh
+27-heartbeat.sh
 30-help.sh
 35-connection.sh
 40-password.sh

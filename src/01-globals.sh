@@ -75,6 +75,11 @@ NOTIFY=()
 NOTIFY_ON_ERROR=false
 NOTIFY_FAILURE_SENT=false     # true once a failure notification was attempted in this run
 
+# Heartbeat ping (dead-man's switch), see src/27-heartbeat.sh
+PING_URL=""                   # base URL: <url>/start, <url> on success, <url>/fail
+PING_START_URL=""             # explicit override for the start ping
+PING_FAIL_URL=""              # explicit override for the failure ping
+
 # Masking
 MASK=false
 MASK_RULES=""

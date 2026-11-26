@@ -127,6 +127,9 @@ parse_args() {
             --notify-on-error) NOTIFY_ON_ERROR=true; shift ;;
             --token) BOT_TOKEN="$2"; shift 2 || _need_val "$1" ;;
             --cooldown) BOT_COOLDOWN="$2"; shift 2 || _need_val "$1" ;;
+            --ping) PING_URL="$2"; shift 2 || _need_val "$1" ;;
+            --ping-start) PING_START_URL="$2"; shift 2 || _need_val "$1" ;;
+            --ping-fail) PING_FAIL_URL="$2"; shift 2 || _need_val "$1" ;;
 
             --mask) MASK=true; shift ;;
             --mask-rules) MASK_RULES="$2"; shift 2 || _need_val "$1" ;;
