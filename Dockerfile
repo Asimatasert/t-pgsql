@@ -3,13 +3,14 @@
 # The PostgreSQL client major version is a build arg. Set it to the version of
 # your TARGET server so cross-version dumps are produced with the right tools
 # (e.g. dumping a PG16 server for restore into PG18 → build with PG_MAJOR=18).
+# Without the build arg the image defaults to the latest PostgreSQL major in PGDG.
 #
 #   docker build --build-arg PG_MAJOR=18 -t t-pgsql:18 .
 #   docker run --rm t-pgsql:18 --version
 #
 FROM debian:bookworm-slim
 
-ARG PG_MAJOR=18
+ARG PG_MAJOR=19
 # Published fingerprint of the PostgreSQL Apt Repository signing key (ACCC4CF8).
 # Verify it against https://www.postgresql.org/download/linux/debian/ before
 # changing it; a mismatch fails the build.

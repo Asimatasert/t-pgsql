@@ -125,6 +125,7 @@ man t-pgsql
 A `Dockerfile` is included. The PostgreSQL client major version is a build arg —
 set it to your **target** server's version so cross-version dumps use the right
 tools (e.g. dumping a PG16 server for restore into PG18 → build with `PG_MAJOR=18`).
+Without the build arg, the image defaults to the latest PostgreSQL major.
 
 ```bash
 # Build with the desired client version

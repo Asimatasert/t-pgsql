@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- Docker image: `PG_MAJOR` now defaults to the latest stable PostgreSQL major in PGDG (19);
+  override it with `--build-arg PG_MAJOR=<n>` to match an older target server.
+
 ## [3.14.0] - 2026-11-26
 
 ### Added
