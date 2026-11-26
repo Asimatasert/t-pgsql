@@ -193,8 +193,8 @@ cmd_batch() {
                                 [ "$CONTINUE_ON_ERROR" != true ] && stop_launching=true
                             fi
 
-                            unset pids[$i]
-                            unset job_names[$i]
+                            unset "pids[$i]"
+                            unset "job_names[$i]"
                             running=$((running - 1))
                         fi
                     done

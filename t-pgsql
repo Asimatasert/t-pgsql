@@ -45,6 +45,7 @@ NC='\033[0m'
 
 # Colours (defined in the header) are switched off when NO_COLOR is set to a non-empty value
 # (https://no-color.org) or when stdout is not a terminal (cron mail, pipes, redirected logs).
+# shellcheck disable=SC2034  # colour palette; not every colour is used
 if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
     RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
 fi
@@ -210,6 +211,7 @@ META_ENABLED=true
 META_START_TIME=""
 META_START_EPOCH=""
 META_STATUS="unknown"
+# shellcheck disable=SC2034  # reserved metadata field
 META_EXIT_CODE=0
 
 # ==============================================================================
@@ -242,6 +244,7 @@ source_module() {
     local module="$1"
     local module_path="${SCRIPT_DIR}/modules/${module}.sh"
     if [ -f "$module_path" ]; then
+        # shellcheck disable=SC1090  # module path is resolved at runtime
         source "$module_path"
     fi
 }
@@ -873,6 +876,7 @@ notify_email() {
 
 # Build notification details for operations
 build_notify_details() {
+    # shellcheck disable=SC2034  # kept for call-site compatibility
     local operation="$1"
     local status="$2"
     local elapsed="$3"
@@ -929,6 +933,7 @@ build_notify_details() {
 meta_start() {
     META_START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     META_START_EPOCH=$(date +%s)
+    # shellcheck disable=SC2034  # global metadata field
     META_STATUS="running"
 }
 
@@ -1055,6 +1060,7 @@ meta_update_target() {
     tar -xzf "$tar_file" -C "$temp_dir" 2>/dev/null || { rm -rf "$temp_dir"; return 0; }
 
     # Find the dump file (ignore macOS AppleDouble ._ sidecars, which sort first).
+    # shellcheck disable=SC2010  # filter drops macOS ._ files; names are plain dump files
     local dump_name=$(ls "$temp_dir"/*.dump 2>/dev/null | grep -vE '/\._' | head -1 | xargs basename 2>/dev/null)
     [ -z "$dump_name" ] && { rm -rf "$temp_dir"; return 0; }
 
@@ -4250,6 +4256,7 @@ cmd_clone() {
     local restore_elapsed=$(($(date +%s) - restore_start))
 
     # Update metadata with target info
+    # shellcheck disable=SC2046  # unquoted on purpose: empty elapsed must expand to nothing
     meta_update_target "$latest" $([ $r -eq 0 ] && echo "success" || echo "failed") $restore_elapsed
 
     # Cleanup
@@ -6837,8 +6844,8 @@ cmd_batch() {
                                 [ "$CONTINUE_ON_ERROR" != true ] && stop_launching=true
                             fi
 
-                            unset pids[$i]
-                            unset job_names[$i]
+                            unset "pids[$i]"
+                            unset "job_names[$i]"
                             running=$((running - 1))
                         fi
                     done

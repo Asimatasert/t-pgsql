@@ -4,6 +4,7 @@
 
 # Colours (defined in the header) are switched off when NO_COLOR is set to a non-empty value
 # (https://no-color.org) or when stdout is not a terminal (cron mail, pipes, redirected logs).
+# shellcheck disable=SC2034  # colour palette; not every colour is used
 if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
     RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
 fi
@@ -169,6 +170,7 @@ META_ENABLED=true
 META_START_TIME=""
 META_START_EPOCH=""
 META_STATUS="unknown"
+# shellcheck disable=SC2034  # reserved metadata field
 META_EXIT_CODE=0
 
 # ==============================================================================
@@ -201,6 +203,7 @@ source_module() {
     local module="$1"
     local module_path="${SCRIPT_DIR}/modules/${module}.sh"
     if [ -f "$module_path" ]; then
+        # shellcheck disable=SC1090  # module path is resolved at runtime
         source "$module_path"
     fi
 }
