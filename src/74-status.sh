@@ -93,6 +93,16 @@ history_clean() {
     printf '%s' "${s:0:$max}"
 }
 
+# Message text for the history file: no credential, user, host or URL may survive. Anything
+# after "password" (also PGPASSWORD=...) is dropped, URLs and every word that holds an "@"
+# (user:secret@host, user@host:port/db) become ***. The words around them stay readable.
+history_sanitize_msg() {
+    printf '%s' "$1" | sed -E \
+        -e 's/([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]).*/\1 ***/' \
+        -e 's#[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]]*#***#g' \
+        -e 's#[^[:space:]]*@[^[:space:]]*#***#g'
+}
+
 history_write() {
     local rc="$1" now dur status msg="" size="" name file="" dir f line
     [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
@@ -148,7 +158,7 @@ history_write() {
     fi
 
     name=$(history_clean "$name" 200)
-    msg=$(history_clean "$msg" 200)
+    msg=$(history_clean "$(history_sanitize_msg "$msg")" 200)
     line=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
         "$now" "$(date -u -r "$now" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$now" '+%Y-%m-%dT%H:%M:%SZ')" \
         "$COMMAND" "$name" "$status" "$rc" "$dur" "$size" "$msg")
