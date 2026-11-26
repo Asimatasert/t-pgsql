@@ -34,6 +34,7 @@ f=""
 while [ $# -gt 0 ]; do [ "$1" = "-f" ] && f="$2"; shift; done
 [ -n "$START_MARK" ] && echo $$ > "$START_MARK"
 echo "start $(date +%s)" >> "$REC/pg_dump.log"
+echo "locks@start: $(cd "$T_PGSQL_STATE_DIR/locks" 2>/dev/null && for d in *; do printf "%s[%s] " "$d" "$(tr "\n" "," < "$d/meta" 2>/dev/null | cut -c1-120)"; done) ppid=$PPID me=$$" >> "$REC/pg_dump.log"
 n=0; lim=$(( ${DUMP_SLEEP:-0} * 5 ))
 while [ "$n" -lt "$lim" ]; do sleep 0.2; n=$((n + 1)); done
 printf 'PGDMP\nfake dump\n' >> "$f"
@@ -269,7 +270,7 @@ for n in 1 2 3 4 5 6 7 8 9 10 11 12; do
     waitpid "$XP"; waitpid "$YP"; wait "$XP" "$YP" 2>/dev/null
     if [ "$(grep -c '^start' "$REC/pg_dump.log" 2>/dev/null)" -ne 1 ]; then
         raced=1
-        nok "simultaneous start $n: both runs held the lock | x: $(tr '\n' ' ' < "$TMP/x.out" | cut -c1-600) | y: $(tr '\n' ' ' < "$TMP/y.out" | cut -c1-600)"
+        nok "simultaneous start $n: both runs held the lock | log: $(tr '\n' ';' < "$REC/pg_dump.log" | cut -c1-900) | x: $(tr '\n' ' ' < "$TMP/x.out" | cut -c1-600) | y: $(tr '\n' ' ' < "$TMP/y.out" | cut -c1-600)"
         break
     fi
 done
